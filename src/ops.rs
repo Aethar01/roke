@@ -1,5 +1,5 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
-use crate::model::{parse_tags, Priority, Status, Task, TaskStore};
+use crate::model::{parse_tags, FileLock, Priority, Status, Task, TaskStore};
 use crate::sync::{merge_stores, sync_all_peers};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -159,6 +159,10 @@ fn matches_filter(task: &Task, filter: &TaskFilter, sync_cfg: &SyncConfig) -> bo
     true
 }
 
+fn acquire_lock(path: &Path) -> Result<FileLock, String> {
+    FileLock::acquire(path).map_err(|e| format!("failed to lock {}: {e}", path.display()))
+}
+
 fn load_store(path: &Path, cfg: &AppConfig) -> Result<TaskStore, String> {
     let mut store = TaskStore::load_or_empty(path)
         .map_err(|e| format!("failed to load {}: {e}", path.display()))?;
@@ -230,6 +234,7 @@ pub fn add_tasks_batch(
     if inputs.is_empty() {
         return Err("no tasks provided".into());
     }
+    let _lock = acquire_lock(path)?;
     let mut store = load_store(path, cfg)?;
     let default_origin = cfg.sync.effective_device_name();
     let mut created_ids = Vec::with_capacity(inputs.len());
@@ -279,6 +284,7 @@ pub fn update_task(
     if input.is_empty() {
         return Err("no fields specified to update".into());
     }
+    let _lock = acquire_lock(path)?;
     let mut store = load_store(path, cfg)?;
     let id = store
         .find_id(selector)
@@ -329,6 +335,7 @@ pub fn update_task(
 }
 
 pub fn delete_task(path: &Path, cfg: &AppConfig, selector: &str) -> Result<Task, String> {
+    let _lock = acquire_lock(path)?;
     let mut store = load_store(path, cfg)?;
     let id = store
         .find_id(selector)
@@ -362,7 +369,8 @@ pub fn sync_tasks(path: &Path, cfg: &AppConfig) -> Result<SyncReport, String> {
     let local_name = cfg.sync.effective_device_name();
     let outcome = sync_all_peers(store, cfg.sync.clone());
 
-    // Re-read disk in case another process edited the file while SSH ran
+    // Re-read disk under lock in case another process edited the file while SSH ran
+    let _lock = acquire_lock(path)?;
     let latest_disk = load_store(path, cfg)?;
     let merged = merge_stores(&latest_disk, &outcome.merged_store, &local_name, &local_name);
     save_store(&merged, path)?;
@@ -486,6 +494,37 @@ mod tests {
         let raw_store = TaskStore::load_or_empty(&path).unwrap();
         assert_eq!(raw_store.tasks.len(), 1);
         assert!(raw_store.tombstones.contains_key(&t2.uid));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn concurrent_writes_preserve_all_tasks() {
+        let path = temp_store_path("concurrent");
+        let cfg = AppConfig::default();
+
+        std::thread::scope(|s| {
+            for worker in 0..8 {
+                let p = path.clone();
+                let c = cfg.clone();
+                s.spawn(move || {
+                    for i in 0..5 {
+                        add_task(
+                            &p,
+                            &c,
+                            AddTaskInput {
+                                title: format!("worker-{worker}-task-{i}"),
+                                ..AddTaskInput::default()
+                            },
+                        )
+                        .expect("concurrent add_task should succeed");
+                    }
+                });
+            }
+        });
+
+        let tasks = list_tasks(&path, &cfg, &TaskFilter::default()).unwrap();
+        assert_eq!(tasks.len(), 40);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

@@ -1,14 +1,81 @@
 use crate::config::normalize_device_tag;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static UID_SEQ: AtomicU64 = AtomicU64::new(1);
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const STALE_LOCK_AGE: Duration = Duration::from_secs(10);
+
+/// Advisory cross-process lockfile guard (`create_new`) with stale-lock recovery.
+pub struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    pub fn acquire(target: &Path) -> io::Result<Self> {
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let lock_name = format!(
+            ".{}.lock",
+            target
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("todos.jsonl")
+        );
+        let lock_path = target.with_file_name(lock_name);
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(Self { path: lock_path });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified
+                                .elapsed()
+                                .is_ok_and(|age| age >= STALE_LOCK_AGE)
+                            {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("timed out waiting for lock {}", lock_path.display()),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileStamp {

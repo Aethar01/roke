@@ -1,7 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
-    file_stamp, format_tags, now_millis, parse_tags, FileStamp, Priority, Status, Task, TaskStore,
+    file_stamp, format_tags, now_millis, parse_tags, FileLock, FileStamp, Priority, Status, Task,
+    TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -587,6 +588,13 @@ impl App {
     fn persist_inner(&mut self, allow_auto_sync: bool) {
         self.dirty = true;
         if let Some(path) = self.storage_path.clone() {
+            let _lock = match FileLock::acquire(&path) {
+                Ok(lock) => lock,
+                Err(err) => {
+                    self.status_message = Some(format!("Save failed: {err}"));
+                    return;
+                }
+            };
             let current_stamp = file_stamp(&path);
             if current_stamp.is_some() && current_stamp != self.last_file_stamp {
                 if let Ok(mut disk_store) = TaskStore::load_or_empty(&path) {
