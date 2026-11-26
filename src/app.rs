@@ -1,4 +1,5 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
+use crate::editor::editor_display_name;
 use crate::model::{
     file_stamp, format_tags, parse_tags, FileStamp, Priority, Status, Task, TaskStore,
 };
@@ -352,6 +353,7 @@ pub struct App {
     pub storage_path: Option<PathBuf>,
     pub theme: Theme,
     pub editor_config: Option<String>,
+    pub editor_label: String,
     pub sync_config: SyncConfig,
     pub sync_requested: bool,
     pub syncing: bool,
@@ -389,12 +391,14 @@ impl App {
 
     pub fn with_config(store: TaskStore, storage_path: Option<PathBuf>, config: AppConfig) -> Self {
         let theme = config.resolved_theme();
+        let editor_label = editor_display_name(config.editor.as_deref());
         let last_file_stamp = storage_path.as_deref().and_then(file_stamp);
         Self {
             store,
             storage_path,
             theme,
             editor_config: config.editor,
+            editor_label,
             sync_config: config.sync,
             sync_requested: false,
             syncing: false,

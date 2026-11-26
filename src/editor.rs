@@ -1,5 +1,6 @@
 use crate::config::normalize_device_tag;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,6 +28,21 @@ pub fn resolve_editor(config_editor: Option<&str>) -> String {
     } else {
         "vi".to_string()
     }
+}
+
+/// Short display name for the resolved editor (e.g. `/opt/homebrew/bin/nvim -u NONE` -> `nvim`).
+pub fn editor_display_name(config_editor: Option<&str>) -> String {
+    let raw = resolve_editor(config_editor);
+    let program = split_editor_command(&raw)
+        .ok()
+        .and_then(|mut parts| (!parts.is_empty()).then(|| parts.remove(0)))
+        .unwrap_or(raw);
+    Path::new(&program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&program)
+        .to_string()
 }
 
 fn command_exists(program: &str) -> bool {
@@ -159,6 +175,11 @@ mod tests {
             split_editor_command(r#"nvim -c "set wrap" -u NONE"#).unwrap(),
             vec!["nvim", "-c", "set wrap", "-u", "NONE"]
         );
+        assert_eq!(
+            editor_display_name(Some("/opt/homebrew/bin/nvim -u NONE")),
+            "nvim"
+        );
+        assert_eq!(editor_display_name(Some("code --wait")), "code");
     }
 
     #[test]

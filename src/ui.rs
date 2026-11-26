@@ -1217,7 +1217,10 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("Notes", field_label_style(&theme, desc_active)),
-                Span::styled("  (Ctrl-E: $EDITOR)", Style::default().fg(theme.muted)),
+                Span::styled(
+                    format!("  (Ctrl-E: {})", app.editor_label),
+                    Style::default().fg(theme.muted),
+                ),
             ]),
             Line::from(Span::styled(
                 if desc_slice.is_empty() && !desc_active {
@@ -1534,7 +1537,11 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_section(&theme, "Tasks"),
         help_row(&theme, "a / o", "New task"),
         help_row(&theme, "e / i / Enter", "Edit task"),
-        help_row(&theme, "n", "Edit Markdown notes in $EDITOR"),
+        help_row(
+            &theme,
+            "n",
+            format!("Edit Markdown notes in {}", app.editor_label),
+        ),
         help_row(&theme, "Space", "Toggle done / cycle status"),
         help_row(&theme, "H / L  < / >", "Move column left / right"),
         help_row(&theme, "J / K", "Reorder down / up"),
@@ -1582,10 +1589,10 @@ fn help_section(theme: &Theme, title: &'static str) -> Line<'static> {
     ))
 }
 
-fn help_row(theme: &Theme, keys: &'static str, desc: &'static str) -> Line<'static> {
+fn help_row(theme: &Theme, keys: &'static str, desc: impl Into<String>) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{keys:<16}"), Style::default().fg(theme.accent)),
-        Span::styled(desc, Style::default().fg(theme.subtle)),
+        Span::styled(desc.into(), Style::default().fg(theme.subtle)),
     ])
 }
 
