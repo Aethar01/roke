@@ -138,6 +138,7 @@ impl McpServer {
                 | "update_task"
                 | "delete_task"
                 | "archive_done"
+                | "unarchive_task"
                 | "sync_tasks"
         );
         if self.read_only && is_mutating {
@@ -158,6 +159,8 @@ impl McpServer {
             "update_task" => self.tool_update_task(&args),
             "delete_task" => self.tool_delete_task(&args),
             "archive_done" => self.tool_archive_done(&args),
+            "list_archive" => self.tool_list_archive(),
+            "unarchive_task" => self.tool_unarchive_task(&args),
             "list_tags" => self.tool_list_tags(),
             "sync_tasks" => self.tool_sync_tasks(),
             other => {
@@ -334,6 +337,17 @@ impl McpServer {
             .unwrap_or(false);
         let report = ops::archive_done(&self.storage_path, &self.config, days, dry_run)?;
         serde_json::to_value(report).map_err(|e| e.to_string())
+    }
+
+    fn tool_list_archive(&self) -> Result<Value, String> {
+        let tasks = ops::list_archive(&self.storage_path, &self.config)?;
+        Ok(json!({ "total": tasks.len(), "tasks": tasks }))
+    }
+
+    fn tool_unarchive_task(&self, args: &Value) -> Result<Value, String> {
+        let selector = extract_selector(args)?;
+        let task = ops::unarchive_task(&self.storage_path, &self.config, &selector)?;
+        serde_json::to_value(task).map_err(|e| e.to_string())
     }
 
     fn tool_update_task(&self, args: &Value) -> Result<Value, String> {
@@ -587,6 +601,20 @@ fn tool_definitions(read_only: bool) -> Value {
                 "properties": {}
             }
         }),
+        json!({
+            "name": "list_archive",
+            "description": "List completed tasks stored in the sibling archive.jsonl file.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
     ];
 
     if !read_only {
@@ -770,6 +798,29 @@ fn tool_definitions(read_only: bool) -> Value {
                     "dry_run": {
                         "type": "boolean",
                         "description": "Preview which tasks would be archived without modifying files."
+                    }
+                }
+            }
+        }));
+        tools.push(json!({
+            "name": "unarchive_task",
+            "description": "Restore an archived task from archive.jsonl back onto the active board.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uid": {
+                        "type": "string",
+                        "description": "Stable task UID (preferred)."
+                    },
+                    "id": {
+                        "oneOf": [{ "type": "integer" }, { "type": "string" }],
+                        "description": "Numeric task ID (or UID string)."
                     }
                 }
             }
@@ -1029,7 +1080,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(ro_names, vec!["list_tasks", "get_task", "list_tags"]);
+        assert_eq!(ro_names, vec!["list_tasks", "get_task", "list_tags", "list_archive"]);
         assert_eq!(
             ro_tools["result"]["tools"][0]["annotations"]["readOnlyHint"],
             true

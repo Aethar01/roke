@@ -78,6 +78,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } = app.mode
     {
         render_notes_preview_modal(frame, app, task_id, scroll, selected_check);
+    } else if let Mode::Archive { tasks, selected } = &app.mode {
+        let tasks_clone = tasks.clone();
+        let sel = *selected;
+        render_archive_modal(frame, app, &tasks_clone, sel);
     } else if let Mode::Help(scroll) = app.mode {
         render_help_modal(frame, app, scroll);
     }
@@ -2068,6 +2072,104 @@ fn render_notes_preview_modal(
     );
 }
 
+fn render_archive_modal(frame: &mut Frame, app: &mut App, tasks: &[Task], selected: usize) {
+    if tasks.is_empty() {
+        return;
+    }
+    let theme = app.theme.clone();
+    let desired_h = (tasks.len() as u16 + 4).clamp(7, 20);
+    let area = centered_rect(68, desired_h, frame.area());
+    frame.render_widget(Clear, area);
+    app.regions.archive_modal = Some(area);
+
+    let list_h = area.height.saturating_sub(3);
+    let visible_rows = list_h as usize;
+    let clamped_sel = selected.min(tasks.len().saturating_sub(1));
+    let scroll = if visible_rows == 0 || clamped_sel < visible_rows {
+        0
+    } else {
+        (clamped_sel + 1 - visible_rows).min(tasks.len().saturating_sub(visible_rows))
+    };
+    let above = scroll;
+    let below = tasks.len().saturating_sub(scroll + visible_rows);
+
+    let mut outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.muted))
+        .title(Span::styled(
+            format!(" Archive ({}) ", tasks.len()),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ));
+    if let Some(ind) = overflow_indicator(above, below) {
+        outer = outer.title_bottom(
+            Line::from(Span::styled(
+                format!(" {ind} "),
+                Style::default().fg(theme.muted),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    if inner.width < 8 || inner.height < 2 {
+        return;
+    }
+
+    for (row_offset, (idx, task)) in tasks
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let y = inner.y + row_offset as u16;
+        let row_rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1);
+        let is_cur = idx == clamped_sel;
+        let pointer = if is_cur {
+            Span::styled("▸ ", Style::default().fg(theme.accent))
+        } else {
+            Span::raw("  ")
+        };
+        let mut spans = vec![
+            pointer,
+            Span::styled("✓ ", Style::default().fg(theme.done)),
+            Span::styled(
+                task.title.clone(),
+                if is_cur {
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.subtle)
+                },
+            ),
+        ];
+        if !task.tags.is_empty() {
+            let tag_str = task
+                .tags
+                .iter()
+                .map(|t| format!("#{t}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            spans.push(Span::styled(
+                format!("  {tag_str}"),
+                Style::default().fg(theme.muted),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+        app.regions.archive_rows.push((idx, row_rect));
+    }
+
+    let footer_y = inner.bottom().saturating_sub(1);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "j/k nav · enter / r / click restore · esc close",
+            Style::default().fg(theme.muted),
+        )),
+        Rect::new(inner.x + 1, footer_y, inner.width.saturating_sub(2), 1),
+    );
+}
+
 fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
     let theme = app.theme.clone();
     let lines = vec![
@@ -2096,6 +2198,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(&theme, "S", "Sync via SSH"),
         help_row(&theme, "d / x", "Delete task"),
         help_row(&theme, "A", "Archive all Done tasks"),
+        help_row(&theme, "V", "Browse & restore archived tasks"),
         help_row(&theme, "y / Y", "Yank title (or notes) / full task"),
         help_row(&theme, "u / Ctrl-R", "Undo / Redo"),
         help_row(&theme, "/   Esc", "Search   Clear filter"),

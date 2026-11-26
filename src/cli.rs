@@ -205,8 +205,12 @@ pub enum SubCommand {
         days: u64,
     },
 
-    /// Move completed (done) tasks into a sibling archive.jsonl file
+    /// Move completed (done) tasks into archive.jsonl, or browse archived tasks with --list
     Archive {
+        /// List tasks currently stored in archive.jsonl instead of archiving
+        #[arg(short = 'l', long = "list")]
+        list: bool,
+
         /// Only archive done tasks older than this many days
         #[arg(long = "days")]
         days: Option<u64>,
@@ -214,6 +218,14 @@ pub enum SubCommand {
         /// Preview which tasks would be archived without modifying files
         #[arg(long = "dry-run")]
         dry_run: bool,
+    },
+
+    /// Restore one or more archived tasks from archive.jsonl back onto the active board
+    #[command(alias = "restore")]
+    Unarchive {
+        /// One or more archived task IDs or stable UIDs
+        #[arg(value_name = "SELECTOR", required = true, num_args = 1..)]
+        selectors: Vec<String>,
     },
 
     /// Create a project-local .roke.jsonl board in the current directory
@@ -869,25 +881,71 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 );
             }
         }
-        SubCommand::Archive { days, dry_run } => {
-            let report = ops::archive_done(&path, cfg, *days, *dry_run)?;
-            if json {
-                print_json(&report)?;
-            } else if report.archived == 0 {
-                println!("{}", painter.muted("No done tasks to archive."));
-            } else {
-                let verb = if report.dry_run {
-                    "Would archive"
+        SubCommand::Archive {
+            list,
+            days,
+            dry_run,
+        } => {
+            if *list {
+                let tasks = ops::list_archive(&path, cfg)?;
+                if json {
+                    print_json(&tasks)?;
+                } else if tasks.is_empty() {
+                    println!("{}", painter.muted("Archive is empty."));
                 } else {
-                    "Archived"
-                };
-                println!(
-                    "{} {verb} {} done task{} → {}",
-                    painter.badge("✓", painter.theme.done),
-                    report.archived,
-                    if report.archived == 1 { "" } else { "s" },
-                    painter.muted(&report.archive_path)
-                );
+                    let id_width = tasks
+                        .iter()
+                        .map(|t| t.id.to_string().len() + 1)
+                        .max()
+                        .unwrap_or(2);
+                    for task in &tasks {
+                        let eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                        println!("{}", painter.format_task_line(task, &eff_tags, id_width));
+                    }
+                }
+            } else {
+                let report = ops::archive_done(&path, cfg, *days, *dry_run)?;
+                if json {
+                    print_json(&report)?;
+                } else if report.archived == 0 {
+                    println!("{}", painter.muted("No done tasks to archive."));
+                } else {
+                    let verb = if report.dry_run {
+                        "Would archive"
+                    } else {
+                        "Archived"
+                    };
+                    println!(
+                        "{} {verb} {} done task{} → {}",
+                        painter.badge("✓", painter.theme.done),
+                        report.archived,
+                        if report.archived == 1 { "" } else { "s" },
+                        painter.muted(&report.archive_path)
+                    );
+                }
+            }
+        }
+        SubCommand::Unarchive { selectors } => {
+            let mut restored_tasks = Vec::with_capacity(selectors.len());
+            for selector in selectors {
+                let restored = ops::unarchive_task(&path, cfg, selector)?;
+                restored_tasks.push(restored);
+            }
+            if json {
+                if restored_tasks.len() == 1 {
+                    print_json(&restored_tasks[0])?;
+                } else {
+                    print_json(&restored_tasks)?;
+                }
+            } else {
+                for task in &restored_tasks {
+                    let eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                    println!(
+                        "{} {}",
+                        painter.badge("↩", painter.theme.accent),
+                        painter.format_task_line(task, &eff_tags, 0)
+                    );
+                }
             }
         }
         SubCommand::Init => {

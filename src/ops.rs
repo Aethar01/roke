@@ -531,6 +531,47 @@ pub fn archive_done(
     })
 }
 
+pub fn list_archive(path: &Path, cfg: &AppConfig) -> Result<Vec<Task>, String> {
+    let archive_path = archive_path_for(path);
+    let store = load_store(&archive_path, cfg)?;
+    Ok(store.tasks)
+}
+
+pub fn unarchive_task(path: &Path, cfg: &AppConfig, selector: &str) -> Result<Task, String> {
+    let archive_path = archive_path_for(path);
+    let _main_lock = acquire_lock(path)?;
+    let _arch_lock = acquire_lock(&archive_path)?;
+
+    let mut archive_store = load_store(&archive_path, cfg)?;
+    let arch_id = archive_store
+        .find_id(selector)
+        .ok_or_else(|| format!("archived task not found: '{selector}'"))?;
+    let pos = archive_store
+        .tasks
+        .iter()
+        .position(|t| t.id == arch_id)
+        .ok_or_else(|| format!("archived task not found: '{selector}'"))?;
+    let mut restored = archive_store.tasks.remove(pos);
+
+    let mut active_store = load_store(path, cfg)?;
+    let tomb_ts = active_store.tombstones.remove(&restored.uid).unwrap_or(0);
+    restored.updated_at = now_millis()
+        .max(restored.updated_at.saturating_add(1))
+        .max(tomb_ts.saturating_add(1));
+    if restored.id == 0 || active_store.tasks.iter().any(|t| t.id == restored.id) {
+        restored.id = active_store.next_id;
+        active_store.next_id += 1;
+    } else if restored.id >= active_store.next_id {
+        active_store.next_id = restored.id + 1;
+    }
+    let out = restored.clone();
+    active_store.tasks.push(restored);
+
+    save_store(&active_store, path)?;
+    save_store(&archive_store, &archive_path)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,6 +799,19 @@ mod tests {
         let archive_store = TaskStore::load_or_empty(Path::new(&report.archive_path)).unwrap();
         assert_eq!(archive_store.tasks.len(), 1);
         assert_eq!(archive_store.tasks[0].uid, done.uid);
+
+        // Browse and restore from archive
+        let archived_list = list_archive(&path, &cfg).unwrap();
+        assert_eq!(archived_list.len(), 1);
+        assert_eq!(archived_list[0].uid, done.uid);
+
+        let restored = unarchive_task(&path, &cfg, &done.uid).unwrap();
+        assert_eq!(restored.uid, done.uid);
+        assert!(list_archive(&path, &cfg).unwrap().is_empty());
+
+        let active_after = TaskStore::load_or_empty(&path).unwrap();
+        assert_eq!(active_after.tasks.len(), 2);
+        assert!(!active_after.tombstones.contains_key(&done.uid));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

@@ -357,6 +357,10 @@ pub enum Mode {
         scroll: u16,
         selected_check: usize,
     },
+    Archive {
+        tasks: Vec<Task>,
+        selected: usize,
+    },
     Help(u16),
 }
 
@@ -419,6 +423,8 @@ pub struct LayoutRegions {
     pub tag_modal: Option<TagModalRegions>,
     pub notes_modal: Option<Rect>,
     pub notes_check_rows: Vec<(usize, Rect)>,
+    pub archive_modal: Option<Rect>,
+    pub archive_rows: Vec<(usize, Rect)>,
     pub help_modal: Option<Rect>,
 }
 
@@ -442,6 +448,8 @@ impl LayoutRegions {
         self.tag_modal = None;
         self.notes_modal = None;
         self.notes_check_rows.clear();
+        self.archive_modal = None;
+        self.archive_rows.clear();
         self.help_modal = None;
     }
 }
@@ -931,6 +939,7 @@ impl App {
             Mode::TaskModal(_) => self.handle_modal_key(key),
             Mode::TagFilter(_) => self.handle_tag_filter_key(key),
             Mode::NotesPreview { .. } => self.handle_notes_preview_key(key),
+            Mode::Archive { .. } => self.handle_archive_key(key),
             Mode::Help(_) => self.handle_help_key(key),
         }
     }
@@ -1037,6 +1046,105 @@ impl App {
             scroll,
             selected_check,
         };
+    }
+
+    pub fn open_archive_modal(&mut self) {
+        let Some(path) = &self.storage_path else {
+            self.set_message("Archive requires a backing storage file");
+            return;
+        };
+        let arch_path = archive_path_for(path);
+        let Ok(store) = TaskStore::load_or_empty(&arch_path) else {
+            self.set_message("Could not read archive.jsonl");
+            return;
+        };
+        if store.tasks.is_empty() {
+            self.set_message("Archive is empty");
+            return;
+        }
+        self.mode = Mode::Archive {
+            tasks: store.tasks,
+            selected: 0,
+        };
+    }
+
+    fn restore_archived_at(&mut self, tasks: &mut Vec<Task>, idx: usize) {
+        if idx >= tasks.len() {
+            return;
+        }
+        let mut restored = tasks.remove(idx);
+        let title = restored.title.clone();
+        if let Some(path) = &self.storage_path {
+            let arch_path = archive_path_for(path);
+            let mut arch_store = TaskStore::new_empty();
+            arch_store.tasks = tasks.clone();
+            if let Ok(_lock) = FileLock::acquire(&arch_path) {
+                let _ = arch_store.save(&arch_path);
+            }
+        }
+        self.push_undo();
+        let tomb_ts = self.store.tombstones.remove(&restored.uid).unwrap_or(0);
+        restored.updated_at = now_millis()
+            .max(restored.updated_at.saturating_add(1))
+            .max(tomb_ts.saturating_add(1));
+        if restored.id == 0 || self.store.tasks.iter().any(|t| t.id == restored.id) {
+            restored.id = self.store.next_id;
+            self.store.next_id += 1;
+        } else if restored.id >= self.store.next_id {
+            self.store.next_id = restored.id + 1;
+        }
+        let restored_id = restored.id;
+        self.store.tasks.push(restored);
+        self.persist();
+        self.clamp_selections();
+        self.select_task_by_id(restored_id);
+        self.set_message(format!("Restored \"{title}\""));
+    }
+
+    fn handle_archive_key(&mut self, key: KeyEvent) {
+        let Mode::Archive {
+            mut tasks,
+            mut selected,
+        } = std::mem::replace(&mut self.mode, Mode::Normal)
+        else {
+            return;
+        };
+        if tasks.is_empty() {
+            return;
+        }
+        if selected >= tasks.len() {
+            selected = tasks.len() - 1;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('V') => {
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if selected + 1 < tasks.len() {
+                    selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                selected = 0;
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                selected = tasks.len().saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char('r') => {
+                self.restore_archived_at(&mut tasks, selected);
+                if tasks.is_empty() {
+                    return;
+                }
+                if selected >= tasks.len() {
+                    selected = tasks.len() - 1;
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Archive { tasks, selected };
     }
 
     fn handle_tag_filter_key(&mut self, key: KeyEvent) {
@@ -1568,6 +1676,9 @@ impl App {
             }
             KeyCode::Char('A') => {
                 self.archive_done_tasks();
+            }
+            KeyCode::Char('V') => {
+                self.open_archive_modal();
             }
             KeyCode::Char('y') => {
                 self.yank_selected(false);
@@ -2199,6 +2310,51 @@ impl App {
                     }
                     _ => {}
                 }
+                return;
+            }
+            Mode::Archive { .. } => {
+                let Mode::Archive {
+                    mut tasks,
+                    mut selected,
+                } = std::mem::replace(&mut self.mode, Mode::Normal)
+                else {
+                    return;
+                };
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(area) = self.regions.archive_modal {
+                            if !rect_contains(area, x, y) {
+                                return;
+                            }
+                            let rows = self.regions.archive_rows.clone();
+                            for (idx, rect) in rows {
+                                if rect_contains(rect, x, y) {
+                                    selected = idx;
+                                    self.restore_archived_at(&mut tasks, idx);
+                                    if tasks.is_empty() {
+                                        return;
+                                    }
+                                    if selected >= tasks.len() {
+                                        selected = tasks.len() - 1;
+                                    }
+                                    break;
+                                }
+                            }
+                        } else {
+                            return;
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if !tasks.is_empty() && selected + 1 < tasks.len() {
+                            selected += 1;
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                self.mode = Mode::Archive { tasks, selected };
                 return;
             }
             Mode::QuickAdd { .. } => {
@@ -3024,6 +3180,37 @@ default_sort = "priority"
         assert!(app.reload_config_if_changed());
         assert_eq!(app.theme, Theme::preset("gruvbox").unwrap());
         assert_eq!(app.editor_label, "helix");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tui_archive_modal_browses_and_restores_tasks() {
+        let dir = std::env::temp_dir().join(format!("roke_arch_tui_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("todos.jsonl");
+
+        let mut store = TaskStore::new_empty();
+        store.add("Open".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
+        store.add("Finished".into(), String::new(), Status::Done, Priority::Low, vec!["ship".into()]);
+        store.save(&path).unwrap();
+
+        let mut app = App::with_config(store, Some(path.clone()), AppConfig::default());
+        app.handle_key(key(KeyCode::Char('A')));
+        assert_eq!(app.store.tasks.len(), 1);
+
+        // Open archive browser with 'V'
+        app.handle_key(key(KeyCode::Char('V')));
+        assert!(matches!(app.mode, Mode::Archive { ref tasks, selected: 0 } if tasks.len() == 1));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        // Press Enter to restore "Finished"
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.store.tasks.len(), 2);
+        assert!(app.store.tasks.iter().any(|t| t.title == "Finished"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
