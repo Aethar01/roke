@@ -169,27 +169,27 @@ pub enum SubCommand {
     #[command(alias = "note")]
     Notes(NotesArgs),
 
-    /// Move a task to todo, in-progress, or done
+    /// Move one or more tasks to todo, in-progress, or done (e.g. `roke move 1 2 in-progress`)
     #[command(alias = "mv")]
     Move {
-        /// Task numeric ID or stable UID
-        selector: String,
-        /// Target status (todo, in-progress, done)
-        #[arg(value_parser = Status::parse)]
-        status: Status,
+        /// Task ID(s)/UID(s) followed by target status (todo, in-progress, done)
+        #[arg(value_name = "SELECTOR... STATUS", required = true, num_args = 2..)]
+        args: Vec<String>,
     },
 
-    /// Mark a task as done
+    /// Mark one or more tasks as done (e.g. `roke done 1 2 3`)
     Done {
-        /// Task numeric ID or stable UID
-        selector: String,
+        /// One or more task numeric IDs or stable UIDs
+        #[arg(value_name = "SELECTOR", required = true, num_args = 1..)]
+        selectors: Vec<String>,
     },
 
-    /// Delete a task and record a sync tombstone
+    /// Delete one or more tasks and record sync tombstones (e.g. `roke rm 1 2 3`)
     #[command(aliases = ["delete", "del"])]
     Rm {
-        /// Task numeric ID or stable UID
-        selector: String,
+        /// One or more task numeric IDs or stable UIDs
+        #[arg(value_name = "SELECTOR", required = true, num_args = 1..)]
+        selectors: Vec<String>,
     },
 
     /// List all tags and their task counts
@@ -717,59 +717,93 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 );
             }
         }
-        SubCommand::Move { selector, status } => {
-            let task = ops::update_task(
-                &path,
-                cfg,
-                selector,
-                UpdateTaskInput {
-                    status: Some(*status),
-                    ..UpdateTaskInput::default()
-                },
-            )?;
+        SubCommand::Move { args } => {
+            let (status_raw, selectors) = args
+                .split_last()
+                .ok_or_else(|| "usage: roke move <ID>... <STATUS>".to_string())?;
+            let status = Status::parse(status_raw)?;
+            let mut updated_tasks = Vec::with_capacity(selectors.len());
+            for selector in selectors {
+                let task = ops::update_task(
+                    &path,
+                    cfg,
+                    selector,
+                    UpdateTaskInput {
+                        status: Some(status),
+                        ..UpdateTaskInput::default()
+                    },
+                )?;
+                updated_tasks.push(task);
+            }
             if json {
-                print_json(&task)?;
+                if updated_tasks.len() == 1 {
+                    print_json(&updated_tasks[0])?;
+                } else {
+                    print_json(&updated_tasks)?;
+                }
             } else {
-                let eff_tags = ops::effective_tags_for(&task, &cfg.sync);
-                println!(
-                    "{} {}",
-                    painter.badge("→", painter.status_color(task.status)),
-                    painter.format_task_line(&task, &eff_tags, 0)
-                );
+                for task in &updated_tasks {
+                    let eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                    println!(
+                        "{} {}",
+                        painter.badge("→", painter.status_color(task.status)),
+                        painter.format_task_line(task, &eff_tags, 0)
+                    );
+                }
             }
         }
-        SubCommand::Done { selector } => {
-            let task = ops::update_task(
-                &path,
-                cfg,
-                selector,
-                UpdateTaskInput {
-                    status: Some(Status::Done),
-                    ..UpdateTaskInput::default()
-                },
-            )?;
+        SubCommand::Done { selectors } => {
+            let mut updated_tasks = Vec::with_capacity(selectors.len());
+            for selector in selectors {
+                let task = ops::update_task(
+                    &path,
+                    cfg,
+                    selector,
+                    UpdateTaskInput {
+                        status: Some(Status::Done),
+                        ..UpdateTaskInput::default()
+                    },
+                )?;
+                updated_tasks.push(task);
+            }
             if json {
-                print_json(&task)?;
+                if updated_tasks.len() == 1 {
+                    print_json(&updated_tasks[0])?;
+                } else {
+                    print_json(&updated_tasks)?;
+                }
             } else {
-                let eff_tags = ops::effective_tags_for(&task, &cfg.sync);
-                println!(
-                    "{} {}",
-                    painter.badge("✓", painter.theme.done),
-                    painter.format_task_line(&task, &eff_tags, 0)
-                );
+                for task in &updated_tasks {
+                    let eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                    println!(
+                        "{} {}",
+                        painter.badge("✓", painter.theme.done),
+                        painter.format_task_line(task, &eff_tags, 0)
+                    );
+                }
             }
         }
-        SubCommand::Rm { selector } => {
-            let removed = ops::delete_task(&path, cfg, selector)?;
+        SubCommand::Rm { selectors } => {
+            let mut removed_tasks = Vec::with_capacity(selectors.len());
+            for selector in selectors {
+                let removed = ops::delete_task(&path, cfg, selector)?;
+                removed_tasks.push(removed);
+            }
             if json {
-                print_json(&removed)?;
+                if removed_tasks.len() == 1 {
+                    print_json(&removed_tasks[0])?;
+                } else {
+                    print_json(&removed_tasks)?;
+                }
             } else {
-                println!(
-                    "{} {} {}",
-                    painter.badge("✕", painter.theme.error),
-                    painter.muted(&format!("#{}", removed.id)),
-                    painter.strikethrough(&removed.title)
-                );
+                for removed in &removed_tasks {
+                    println!(
+                        "{} {} {}",
+                        painter.badge("✕", painter.theme.error),
+                        painter.muted(&format!("#{}", removed.id)),
+                        painter.strikethrough(&removed.title)
+                    );
+                }
             }
         }
         SubCommand::Tags => {
@@ -1310,6 +1344,20 @@ mod tests {
         assert_eq!(updated.tags, vec!["docs", "urgent"]);
 
         run(&["roke", "-f", &file_str, "rm", "1"]);
+        assert!(ops::list_tasks(&file, &cfg, &TaskFilter::default())
+            .unwrap()
+            .is_empty());
+
+        // Multi-ID batch move, done, and rm
+        run(&["roke", "-f", &file_str, "add", "Batch A"]);
+        run(&["roke", "-f", &file_str, "add", "Batch B"]);
+        run(&["roke", "-f", &file_str, "move", "1", "2", "in-progress"]);
+        assert_eq!(ops::get_task(&file, &cfg, "1").unwrap().status, Status::InProgress);
+        assert_eq!(ops::get_task(&file, &cfg, "2").unwrap().status, Status::InProgress);
+        run(&["roke", "-f", &file_str, "done", "1", "2"]);
+        assert_eq!(ops::get_task(&file, &cfg, "1").unwrap().status, Status::Done);
+        assert_eq!(ops::get_task(&file, &cfg, "2").unwrap().status, Status::Done);
+        run(&["roke", "-f", &file_str, "rm", "1", "2"]);
         assert!(ops::list_tasks(&file, &cfg, &TaskFilter::default())
             .unwrap()
             .is_empty());
