@@ -11,13 +11,19 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024
 pub struct McpServer {
     storage_path: PathBuf,
     config: AppConfig,
+    read_only: bool,
 }
 
 impl McpServer {
     pub fn new(storage_path: PathBuf, config: AppConfig) -> Self {
+        Self::with_options(storage_path, config, false)
+    }
+
+    pub fn with_options(storage_path: PathBuf, config: AppConfig, read_only: bool) -> Self {
         Self {
             storage_path,
             config,
+            read_only,
         }
     }
 
@@ -70,9 +76,17 @@ impl McpServer {
         let resp = match method {
             "initialize" => self.handle_initialize(id, &params),
             "ping" => json_rpc_result(id, json!({})),
-            "tools/list" => json_rpc_result(id, json!({ "tools": tool_definitions() })),
+            "tools/list" => {
+                json_rpc_result(id, json!({ "tools": tool_definitions(self.read_only) }))
+            }
             "tools/call" => self.handle_tool_call(id, &params),
-            "resources/list" => json_rpc_result(id, json!({ "resources": resource_definitions() })),
+            "resources/list" => {
+                json_rpc_result(id, json!({ "resources": resource_definitions() }))
+            }
+            "resources/templates/list" => json_rpc_result(
+                id,
+                json!({ "resourceTemplates": resource_template_definitions() }),
+            ),
             "resources/read" => self.handle_resource_read(id, &params),
             "prompts/list" => json_rpc_result(id, json!({ "prompts": [] })),
             other => json_rpc_error(id, -32601, format!("Method not found: {other}")),
@@ -118,12 +132,28 @@ impl McpServer {
             .cloned()
             .unwrap_or_else(|| json!({}));
 
+        let is_mutating = matches!(
+            name,
+            "add_task" | "add_tasks" | "update_task" | "delete_task" | "archive_done" | "sync_tasks"
+        );
+        if self.read_only && is_mutating {
+            return json_rpc_result(
+                id,
+                json!({
+                    "content": [{ "type": "text", "text": format!("tool '{name}' is disabled in --read-only mode") }],
+                    "isError": true
+                }),
+            );
+        }
+
         let outcome = match name {
             "list_tasks" => self.tool_list_tasks(&args),
             "get_task" => self.tool_get_task(&args),
             "add_task" => self.tool_add_task(&args),
+            "add_tasks" => self.tool_add_tasks(&args),
             "update_task" => self.tool_update_task(&args),
             "delete_task" => self.tool_delete_task(&args),
+            "archive_done" => self.tool_archive_done(&args),
             "list_tags" => self.tool_list_tags(),
             "sync_tasks" => self.tool_sync_tasks(),
             other => {
@@ -165,6 +195,11 @@ impl McpServer {
             .and_then(|snap| serde_json::to_string_pretty(&snap).map_err(|e| e.to_string())),
             "roke://tags" => ops::list_tags(&self.storage_path, &self.config)
                 .and_then(|tags| serde_json::to_string_pretty(&tags).map_err(|e| e.to_string())),
+            other if other.starts_with("roke://task/") => {
+                let selector = other.trim_start_matches("roke://task/");
+                ops::get_task(&self.storage_path, &self.config, selector)
+                    .and_then(|task| serde_json::to_string_pretty(&task).map_err(|e| e.to_string()))
+            }
             other => {
                 return json_rpc_error(id, -32602, format!("Unknown resource URI: '{other}'"));
             }
@@ -233,7 +268,7 @@ impl McpServer {
         serde_json::to_value(task).map_err(|e| e.to_string())
     }
 
-    fn tool_add_task(&self, args: &Value) -> Result<Value, String> {
+    fn parse_add_input(args: &Value) -> Result<AddTaskInput, String> {
         let title = args
             .get("title")
             .and_then(Value::as_str)
@@ -251,21 +286,50 @@ impl McpServer {
         let tags = optional_tags(args, "tags")?;
         let due = optional_str(args, "due")?.map(str::to_string);
         let origin = optional_str(args, "origin")?.map(str::to_string);
+        Ok(AddTaskInput {
+            title,
+            description,
+            status,
+            priority,
+            tags,
+            due,
+            origin,
+        })
+    }
 
-        let task = ops::add_task(
-            &self.storage_path,
-            &self.config,
-            AddTaskInput {
-                title,
-                description,
-                status,
-                priority,
-                tags,
-                due,
-                origin,
-            },
-        )?;
+    fn tool_add_task(&self, args: &Value) -> Result<Value, String> {
+        let input = Self::parse_add_input(args)?;
+        let task = ops::add_task(&self.storage_path, &self.config, input)?;
         serde_json::to_value(task).map_err(|e| e.to_string())
+    }
+
+    fn tool_add_tasks(&self, args: &Value) -> Result<Value, String> {
+        let items = args
+            .get("tasks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "missing required array argument 'tasks'".to_string())?;
+        let mut inputs = Vec::with_capacity(items.len());
+        for item in items {
+            inputs.push(Self::parse_add_input(item)?);
+        }
+        let created = ops::add_tasks_batch(&self.storage_path, &self.config, inputs)?;
+        Ok(json!({ "added": created.len(), "tasks": created }))
+    }
+
+    fn tool_archive_done(&self, args: &Value) -> Result<Value, String> {
+        let days = match args.get("days") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| "argument 'days' must be a non-negative integer".to_string())?,
+            ),
+        };
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let report = ops::archive_done(&self.storage_path, &self.config, days, dry_run)?;
+        serde_json::to_value(report).map_err(|e| e.to_string())
     }
 
     fn tool_update_task(&self, args: &Value) -> Result<Value, String> {
@@ -413,11 +477,28 @@ fn resource_definitions() -> Value {
     ])
 }
 
-fn tool_definitions() -> Value {
+fn resource_template_definitions() -> Value {
     json!([
         {
+            "uriTemplate": "roke://task/{selector}",
+            "name": "Task",
+            "description": "Single roke task fetched by stable uid or numeric id",
+            "mimeType": "application/json"
+        }
+    ])
+}
+
+fn tool_definitions(read_only: bool) -> Value {
+    let mut tools = vec![
+        json!({
             "name": "list_tasks",
-            "description": "List tasks from the roke board with optional filtering by status, priority, tags, and search text.",
+            "description": "List tasks from the roke board with optional filtering by status, priority, tags, overdue state, search text, and sort order.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -456,10 +537,16 @@ fn tool_definitions() -> Value {
                     }
                 }
             }
-        },
-        {
+        }),
+        json!({
             "name": "get_task",
             "description": "Fetch a single task by its stable uid or numeric id.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -473,51 +560,103 @@ fn tool_definitions() -> Value {
                     }
                 }
             }
-        },
-        {
-            "name": "add_task",
-            "description": "Add a new task to the roke board.",
+        }),
+        json!({
+            "name": "list_tags",
+            "description": "List all tags currently used on the board along with task counts.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
-                "required": ["title"],
+                "properties": {}
+            }
+        }),
+    ];
+
+    if !read_only {
+        let task_item_schema = json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short task title (required)."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional Markdown notes (supports headings, checklists, links, code blocks)."
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["todo", "in-progress", "done"],
+                    "description": "Initial status column (default: todo)."
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Task priority (default: medium)."
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of tags (normalized to lowercase)."
+                },
+                "due": {
+                    "type": "string",
+                    "description": "Optional due date (YYYY-MM-DD, 'today', or 'tomorrow')."
+                },
+                "origin": {
+                    "type": "string",
+                    "description": "Optional origin label (defaults to local device name)."
+                }
+            }
+        });
+
+        tools.push(json!({
+            "name": "add_task",
+            "description": "Add a new task to the roke board.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": task_item_schema
+        }));
+        tools.push(json!({
+            "name": "add_tasks",
+            "description": "Add multiple tasks to the roke board in a single atomic batch.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "required": ["tasks"],
                 "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Short task title (required)."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Optional Markdown notes (supports headings, checklists, links, code blocks)."
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["todo", "in-progress", "done"],
-                        "description": "Initial status column (default: todo)."
-                    },
-                    "priority": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "description": "Task priority (default: medium)."
-                    },
-                    "tags": {
+                    "tasks": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional list of tags (normalized to lowercase)."
-                    },
-                    "due": {
-                        "type": "string",
-                        "description": "Optional due date (YYYY-MM-DD, 'today', or 'tomorrow')."
-                    },
-                    "origin": {
-                        "type": "string",
-                        "description": "Optional origin label (defaults to local device name)."
+                        "items": task_item_schema,
+                        "description": "List of tasks to add."
                     }
                 }
             }
-        },
-        {
+        }));
+        tools.push(json!({
             "name": "update_task",
-            "description": "Update an existing task's title, description, status, priority, or tags.",
+            "description": "Update an existing task's title, description, status, priority, tags, or due date.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -568,10 +707,16 @@ fn tool_definitions() -> Value {
                     }
                 }
             }
-        },
-        {
+        }));
+        tools.push(json!({
             "name": "delete_task",
             "description": "Delete a task by uid or id and record a sync tombstone.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -585,24 +730,47 @@ fn tool_definitions() -> Value {
                     }
                 }
             }
-        },
-        {
-            "name": "list_tags",
-            "description": "List all tags currently used on the board along with task counts.",
+        }));
+        tools.push(json!({
+            "name": "archive_done",
+            "description": "Move completed (done) tasks into the sibling archive.jsonl file.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Only archive done tasks older than this many days."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview which tasks would be archived without modifying files."
+                    }
+                }
             }
-        },
-        {
+        }));
+        tools.push(json!({
             "name": "sync_tasks",
             "description": "Trigger two-way SSH sync with peers configured in roke's config.toml.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {}
             }
-        }
-    ])
+        }));
+    }
+
+    Value::Array(tools)
 }
 
 #[cfg(test)]
@@ -764,6 +932,93 @@ mod tests {
         let line = String::from_utf8(out).unwrap();
         let del_resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert!(del_resp["result"]["isError"].is_null());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_batch_add_archive_task_resource_and_readonly_mode() {
+        let (server, dir) = temp_server("batch_ro");
+
+        // Batch add
+        let batch = call(
+            &server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_tasks",
+                    "arguments": {
+                        "tasks": [
+                            { "title": "Task One", "status": "done" },
+                            { "title": "Task Two", "priority": "high", "due": "2026-12-31" }
+                        ]
+                    }
+                }
+            }),
+        );
+        let batch_data: Value =
+            serde_json::from_str(batch["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(batch_data["added"], 2);
+        let uid2 = batch_data["tasks"][1]["uid"].as_str().unwrap().to_string();
+
+        // Read single task via resource template URI
+        let task_res = call(
+            &server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": { "uri": format!("roke://task/{uid2}") }
+            }),
+        );
+        let fetched: Value = serde_json::from_str(
+            task_res["result"]["contents"][0]["text"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fetched["title"], "Task Two");
+        assert_eq!(fetched["due"], "2026-12-31");
+
+        // Archive done tasks
+        let arch = call(
+            &server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "archive_done", "arguments": {} }
+            }),
+        );
+        let arch_data: Value =
+            serde_json::from_str(arch["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(arch_data["archived"], 1);
+
+        // Read-only server hides and rejects mutating tools
+        let ro_server = McpServer::with_options(dir.join("todos.jsonl"), AppConfig::default(), true);
+        let ro_tools = call(
+            &ro_server,
+            json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" }),
+        );
+        let ro_names: Vec<&str> = ro_tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(ro_names, vec!["list_tasks", "get_task", "list_tags"]);
+        assert_eq!(ro_tools["result"]["tools"][0]["annotations"]["readOnlyHint"], true);
+
+        let blocked = call(
+            &ro_server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": { "name": "add_task", "arguments": { "title": "Nope" } }
+            }),
+        );
+        assert_eq!(blocked["result"]["isError"], true);
 
         let _ = fs::remove_dir_all(&dir);
     }

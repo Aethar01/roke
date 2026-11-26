@@ -225,7 +225,11 @@ pub enum SubCommand {
     },
 
     /// Run built-in Model Context Protocol (MCP) server over stdio
-    Mcp,
+    Mcp {
+        /// Restrict the MCP server to read-only tools and resources
+        #[arg(long = "read-only")]
+        read_only: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -837,8 +841,8 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
             let mut cmd = Cli::command();
             generate(*shell, &mut cmd, "roke", &mut io::stdout());
         }
-        SubCommand::Mcp => {
-            let server = McpServer::new(path, cfg.clone());
+        SubCommand::Mcp { read_only } => {
+            let server = McpServer::with_options(path, cfg.clone(), *read_only);
             server
                 .serve_stdio()
                 .map_err(|e| format!("MCP server I/O error: {e}"))?;
