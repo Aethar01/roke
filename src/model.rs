@@ -956,6 +956,40 @@ impl TaskStore {
     }
 }
 
+pub fn archive_path_for(storage_path: &Path) -> PathBuf {
+    let file_name = storage_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("todos.jsonl");
+    if let Some(stem) = file_name.strip_suffix(".jsonl") {
+        if stem.starts_with('.') {
+            return storage_path.with_file_name(format!("{stem}.archive.jsonl"));
+        }
+    }
+    storage_path.with_file_name("archive.jsonl")
+}
+
+pub fn append_tasks_to_archive(archive_path: &Path, tasks: &[Task]) -> io::Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let _lock = FileLock::acquire(archive_path)?;
+    if let Some(parent) = archive_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(archive_path)?;
+    for task in tasks {
+        let line = serde_json::to_string(task).map_err(io::Error::other)?;
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
+}
+
 pub fn default_storage_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.trim().is_empty() {

@@ -1,8 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
-    file_stamp, format_tags, now_millis, parse_due_date, parse_tags, sort_task_refs, FileLock,
-    FileStamp, Priority, SortOrder, Status, Task, TaskStore,
+    append_tasks_to_archive, archive_path_for, file_stamp, format_tags, now_millis, parse_due_date,
+    parse_tags, sort_task_refs, FileLock, FileStamp, Priority, SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -1340,6 +1340,9 @@ impl App {
             KeyCode::Char('O') => {
                 self.cycle_sort_order();
             }
+            KeyCode::Char('A') => {
+                self.archive_done_tasks();
+            }
             KeyCode::Char('t') => {
                 self.open_tag_filter_modal();
             }
@@ -1678,6 +1681,42 @@ impl App {
             self.clamp_selections();
             self.set_message(format!("Deleted \"{}\" (press u to undo)", removed.title));
         }
+    }
+
+    pub fn archive_done_tasks(&mut self) {
+        let done_ids: Vec<u64> = self
+            .store
+            .tasks
+            .iter()
+            .filter(|t| t.status == Status::Done)
+            .map(|t| t.id)
+            .collect();
+        if done_ids.is_empty() {
+            self.set_message("No done tasks to archive");
+            return;
+        }
+        let done_tasks: Vec<Task> = done_ids
+            .iter()
+            .filter_map(|&id| self.store.get(id).cloned())
+            .collect();
+
+        if let Some(path) = &self.storage_path {
+            let archive_path = archive_path_for(path);
+            if let Err(err) = append_tasks_to_archive(&archive_path, &done_tasks) {
+                self.set_message(format!("Archive failed: {err}"));
+                return;
+            }
+        }
+
+        self.push_undo();
+        for id in &done_ids {
+            self.store.remove(*id);
+        }
+        self.persist();
+        self.clamp_selections();
+        let n = done_ids.len();
+        let noun = if n == 1 { "task" } else { "tasks" };
+        self.set_message(format!("Archived {n} done {noun} (press u to undo)"));
     }
 
     fn reconcile_restored_store(current: &TaskStore, mut restored: TaskStore) -> TaskStore {

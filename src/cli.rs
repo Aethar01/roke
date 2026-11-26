@@ -182,6 +182,17 @@ pub enum SubCommand {
         days: u64,
     },
 
+    /// Move completed (done) tasks into a sibling archive.jsonl file
+    Archive {
+        /// Only archive done tasks older than this many days
+        #[arg(long = "days")]
+        days: Option<u64>,
+
+        /// Preview which tasks would be archived without modifying files
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
     /// Run built-in Model Context Protocol (MCP) server over stdio
     Mcp,
 }
@@ -729,6 +740,27 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                         "({} remaining, {} tasks)",
                         report.remaining_tombstones, report.total_tasks
                     ))
+                );
+            }
+        }
+        SubCommand::Archive { days, dry_run } => {
+            let report = ops::archive_done(&path, cfg, *days, *dry_run)?;
+            if json {
+                print_json(&report)?;
+            } else if report.archived == 0 {
+                println!("{}", painter.muted("No done tasks to archive."));
+            } else {
+                let verb = if report.dry_run {
+                    "Would archive"
+                } else {
+                    "Archived"
+                };
+                println!(
+                    "{} {verb} {} done task{} → {}",
+                    painter.badge("✓", painter.theme.done),
+                    report.archived,
+                    if report.archived == 1 { "" } else { "s" },
+                    painter.muted(&report.archive_path)
                 );
             }
         }

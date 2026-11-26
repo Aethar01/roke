@@ -1,7 +1,7 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::model::{
-    now_millis, parse_due_date, parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority,
-    SortOrder, Status, Task, TaskStore,
+    append_tasks_to_archive, archive_path_for, now_millis, parse_due_date, parse_tags, sort_tasks,
+    today_ymd, DueState, FileLock, Priority, SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, sync_all_peers};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,14 @@ pub struct GcReport {
     pub pruned_tombstones: usize,
     pub remaining_tombstones: usize,
     pub total_tasks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReport {
+    pub archived: usize,
+    pub archive_path: String,
+    pub dry_run: bool,
+    pub tasks: Vec<Task>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +449,49 @@ pub fn prune_tombstones(
     })
 }
 
+pub fn archive_done(
+    path: &Path,
+    cfg: &AppConfig,
+    older_than_days: Option<u64>,
+    dry_run: bool,
+) -> Result<ArchiveReport, String> {
+    let _lock = acquire_lock(path)?;
+    let mut store = load_store(path, cfg)?;
+    let cutoff = older_than_days
+        .map(|d| now_millis().saturating_sub(d.saturating_mul(24 * 60 * 60 * 1000)));
+    let archive_path = archive_path_for(path);
+
+    let target_ids: Vec<u64> = store
+        .tasks
+        .iter()
+        .filter(|t| {
+            t.status == Status::Done && cutoff.is_none_or(|c| t.updated_at <= c)
+        })
+        .map(|t| t.id)
+        .collect();
+
+    let tasks: Vec<Task> = target_ids
+        .iter()
+        .filter_map(|&id| store.get(id).cloned())
+        .collect();
+
+    if !dry_run && !tasks.is_empty() {
+        append_tasks_to_archive(&archive_path, &tasks)
+            .map_err(|e| format!("failed to write archive {}: {e}", archive_path.display()))?;
+        for id in &target_ids {
+            store.remove(*id);
+        }
+        save_store(&store, path)?;
+    }
+
+    Ok(ArchiveReport {
+        archived: tasks.len(),
+        archive_path: archive_path.display().to_string(),
+        dry_run,
+        tasks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +663,51 @@ mod tests {
         let reloaded = TaskStore::load_or_empty(&path).unwrap();
         assert!(!reloaded.tombstones.contains_key("old-uid"));
         assert!(reloaded.tombstones.contains_key("fresh-uid"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn archive_done_moves_completed_tasks_and_records_tombstones() {
+        let path = temp_store_path("archive");
+        let cfg = AppConfig::default();
+
+        add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Open task".into(),
+                status: Status::Todo,
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+        let done = add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Finished task".into(),
+                status: Status::Done,
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+
+        let dry = archive_done(&path, &cfg, None, true).unwrap();
+        assert_eq!(dry.archived, 1);
+        assert_eq!(list_tasks(&path, &cfg, &TaskFilter::default()).unwrap().len(), 2);
+
+        let report = archive_done(&path, &cfg, None, false).unwrap();
+        assert_eq!(report.archived, 1);
+        assert_eq!(report.tasks[0].uid, done.uid);
+
+        let remaining = TaskStore::load_or_empty(&path).unwrap();
+        assert_eq!(remaining.tasks.len(), 1);
+        assert!(remaining.tombstones.contains_key(&done.uid));
+
+        let archive_store = TaskStore::load_or_empty(Path::new(&report.archive_path)).unwrap();
+        assert_eq!(archive_store.tasks.len(), 1);
+        assert_eq!(archive_store.tasks[0].uid, done.uid);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

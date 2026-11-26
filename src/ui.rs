@@ -1836,7 +1836,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
 
 fn render_help_modal(frame: &mut Frame, app: &mut App) {
     let theme = app.theme.clone();
-    let area = centered_rect(58, 26, frame.area());
+    let area = centered_rect(58, 27, frame.area());
     frame.render_widget(Clear, area);
     app.regions.help_modal = Some(area);
 
@@ -1864,6 +1864,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_row(&theme, "t / T", "Filter tags / edit tags"),
         help_row(&theme, "S", "Sync via SSH"),
         help_row(&theme, "d / x", "Delete task"),
+        help_row(&theme, "A", "Archive all Done tasks"),
         help_row(&theme, "u / Ctrl-R", "Undo / Redo"),
         help_row(&theme, "/   Esc", "Search   Clear filter"),
         Line::raw(""),
