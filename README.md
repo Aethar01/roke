@@ -19,12 +19,12 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 ## Features
 
 - **Two views, one store** — Switch seamlessly between a **Todo List** (`All`, `To Do`, `In Progress`, `Done`) and a three-column **Kanban Board** (`Tab`, `gt`, `1`/`2`, or click the header tabs).
-- **Vim-first, mouse-friendly** — Navigate with `h`/`j`/`k`/`l`, `gg`/`G`, move cards across columns with `H`/`L` or `<`/`>`, reorder with `J`/`K`, sort with `O`, undo/redo with `u`/`Ctrl-R`, archive completed tasks with `A`, and search live with `/`. Click tabs, filters, checkboxes (`○`/`◐`/`✓`), double-click cards to edit, scroll with the wheel, and drag-and-drop cards to reorder or move across Kanban columns.
-- **Zero-clutter multi-tag filtering & due dates** — Tag tasks (`work, personal`), set optional due dates (`YYYY-MM-DD`, `today`, `tomorrow`) with overdue highlighting, filter by multiple tags at once via clicks or the scrollable `t` picker, and toggle between `and` (match all) and `or` (match any). Tags and due dates tuck quietly into card bottom borders and disappear completely when unused.
-- **Plain JSONL storage, project-local boards & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), or auto-discovered from a project-local `.roke.jsonl` (`roke init`), one compact JSON object per line with atomic locked saves. The TUI watches for external changes and reloads live, merging safely on save.
-- **Markdown notes & checklists** — Task notes support full Markdown, show `[done/total]` checklist progress on cards, preview cleanly in-app with `v`, and open directly in `nvim` / `$VISUAL` / `$EDITOR` (or a configured `editor` in `config.toml`) via `n` in the TUI, `Ctrl-E` in the edit modal, or `roke notes <id>`.
-- **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`notes`/`move`/`done`/`rm`/`tags`/`archive`/`gc`/`sync`/`init`/`completions` (with `--json` and theme-aware colours), or connect any MCP client directly with `roke mcp` (supports `--read-only`).
-- **TOML config & theming** — Customize startup defaults (`default_view`, `default_filter`, `default_sort`), editor, and any colour in `$XDG_CONFIG_HOME/roke/config.toml` using ANSI-16 names (`blue`, `dark_gray`, `reset`), 256-color indices, or `#rrggbb` hex values.
+- **Vim-first, mouse-friendly** — Navigate with `h`/`j`/`k`/`l`, `gg`/`G`, quick-add with `Q`, move cards across columns with `H`/`L` or `<`/`>`, reorder with `J`/`K`, sort with `O`, yank with `y`/`Y`, undo/redo with `u`/`Ctrl-R`, archive/restore with `A`/`V`, and search live with `/`. Click tabs, filters, checkboxes (`○`/`◐`/`✓`), double-click cards to edit, scroll with the wheel, and drag-and-drop cards to reorder or move across Kanban columns.
+- **Zero-clutter multi-tag filtering, natural due dates & recurrence** — Tag tasks (`work, personal`), set due dates (`YYYY-MM-DD`, `today`, `tomorrow`, `+3d`, `+2w`, `fri`, `eow`, `eom`) with local-time overdue highlighting and recurrence (`daily`, `weekdays`, `weekly`, `monthly`, `every 3d`), filter by multiple tags via clicks or the scrollable `t` picker, and toggle between `and` and `or`. Tags, due dates, and repeat rules tuck quietly into card bottom borders.
+- **Plain JSONL storage, project-local boards & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), or auto-discovered from a project-local `.roke.jsonl` (`roke init`), one compact JSON object per line with atomic locked saves. The TUI watches both `todos.jsonl` and `config.toml` and reloads live.
+- **Interactive Markdown notes & checklists** — Task notes support full Markdown, show `[done/total]` checklist progress on cards, preview cleanly in-app with `v` (where you can toggle `- [ ]` / `- [x]` items directly with `Tab`/`Space` or click), and open in `nvim` / `$VISUAL` / `$EDITOR` via `n` in the TUI, `Ctrl-E` in the edit modal, or `roke notes <id>`.
+- **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`notes`/`move`/`done`/`rm`/`tags`/`stats`/`archive`/`unarchive`/`gc`/`sync`/`init`/`completions` (supporting multi-ID batch `move`/`done`/`rm`, `--json`, and theme-aware colours), or connect any MCP client directly with `roke mcp` (supports `--read-only`).
+- **TOML config, built-in theme presets & live reload** — Choose a built-in `[theme]` preset (`default`, `catppuccin`, `tokyo-night`, `gruvbox`, `nord`, `minimal`) or override any colour using ANSI-16 names, 256-color indices, or `#rrggbb` hex values, plus startup defaults (`default_view`, `default_filter`, `default_sort`). Edits to `config.toml` hot-reload in any open TUI.
 - **Conflict-free parallel SSH sync** — Two-way parallel background sync over system `ssh` (`BatchMode=yes`, honoring `~/.ssh/config`) using last-write-wins timestamps, syncable card order, and tombstones (prunable via `roke gc`). Works across `bash`, `zsh`, `sh`, and `fish` login shells, with an optional `inject_device_tag` setting to dynamically tag tasks with the machine they came from.
 
 ## Installation
@@ -63,17 +63,21 @@ All subcommands accept `--file`, `--local`, `--global`, `--config`, `--json`, an
 ```bash
 roke list --status todo --tag work --sort priority --verbose
 roke list --overdue --json
-roke add "Ship release" -d "Tag release and publish" -p high -t work,release --due tomorrow --json
-roke edit 1 --add-tag urgent --priority high --due 2026-12-01
+roke add "Ship release" -d "Tag release and publish" -p high -t work,release --due +3d --repeat weekly --json
+roke add -Q "Weekly retro #team !med @fri ~weekly"   # quick-add shorthand
+roke edit 1 --add-tag urgent --priority high --due eow
 roke notes 1                             # open task Markdown notes in $EDITOR / nvim
 roke notes 1 --print                     # print raw Markdown notes to stdout
 cat spec.md | roke notes 1 --stdin       # set Markdown notes from stdin
-roke move 1 in-progress
-roke done 1
-roke rm 1
+roke move 1 2 in-progress                # move one or more tasks
+roke done 1 2 3                          # mark one or more tasks done
+roke rm 4 5                              # delete one or more tasks
 roke tags
+roke stats                               # compact board summary & 7-day velocity
 roke archive --dry-run                   # preview archiving Done tasks into archive.jsonl
 roke archive                             # move Done tasks to archive.jsonl
+roke archive --list                      # browse archived tasks
+roke unarchive 1                         # restore archived task(s) back to the active board
 roke gc --days 90                        # prune sync tombstones older than 90 days
 roke sync --json
 
@@ -96,7 +100,7 @@ echo '[{"title":"Task A","priority":"high","due":"today"},{"title":"Task B","tag
 }
 ```
 
-Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-specific board, or `["mcp", "--read-only"]` to restrict an agent to read-only tools. Exposed tools (with MCP tool annotations): `list_tasks`, `get_task`, `add_task`, `add_tasks`, `update_task`, `delete_task`, `archive_done`, `list_tags`, and `sync_tasks`, plus `roke://tasks`, `roke://tags`, and `roke://task/{selector}` resources.
+Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-specific board, or `["mcp", "--read-only"]` to restrict an agent to read-only tools. Exposed tools (with MCP tool annotations): `list_tasks`, `get_task`, `add_task`, `add_tasks`, `update_task`, `delete_task`, `archive_done`, `list_archive`, `unarchive_task`, `list_tags`, `board_stats`, and `sync_tasks`, plus `roke://tasks`, `roke://tags`, and `roke://task/{selector}` resources.
 
 ### Keybindings
 
@@ -107,8 +111,9 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 | `gg` / `G` | Jump to first / last task |
 | `Tab` / `gt` / `1` / `2` | Switch between Todo List and Kanban Board |
 | `a` / `o` | New task |
+| `Q` | Quick-add bar (`title #tag !high @due ~repeat`) |
 | `e` / `i` / `Enter` | Edit selected task |
-| `v` | Preview task & Markdown notes (read-only scrollable modal) |
+| `v` | Preview task & interactive Markdown checklists (`Tab`/`Space` or click to toggle) |
 | `n` | Edit task's Markdown notes in `$EDITOR` (`Ctrl-E` inside modal) |
 | `Space` | Toggle done (Todos) or cycle status (Kanban) |
 | `H` / `L` or `<` / `>` | Move task to previous / next column |
@@ -118,7 +123,8 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 | `t` / `T` | Multi-tag filter picker / edit tags on selected task |
 | `S` | Sync now via SSH |
 | `d` / `x` | Delete selected task |
-| `A` | Archive all Done tasks to `archive.jsonl` |
+| `A` / `V` | Archive all Done tasks / Browse & restore archive |
+| `y` / `Y` | Yank title (or notes in preview) / Yank full task as Markdown |
 | `u` / `Ctrl-R` | Undo / Redo last change (up to 50 steps) |
 | `f` | Cycle status filter (Todos) |
 | `/` / `Esc` | Live search / clear search or tag filters |
@@ -143,7 +149,8 @@ default_filter = "all"     # "all", "todo", "in-progress", or "done"
 default_sort = "manual"    # "manual", "priority", "due", or "updated"
 
 [theme]
-accent = "blue"            # ANSI-16 name ("blue", "dark_gray", "reset"), 0-255 index, or "#rrggbb"
+preset = "catppuccin"      # optional: "default", "catppuccin", "tokyo-night", "gruvbox", "nord", "minimal"
+accent = "blue"            # override any key with ANSI-16 name, 0-255 index, or "#rrggbb"
 
 [sync]
 device_name = "macbook"    # optional; defaults to local hostname
