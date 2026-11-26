@@ -1765,6 +1765,8 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
                 .or_else(|| trimmed.strip_prefix("- [X] "))
                 .or_else(|| trimmed.strip_prefix("* [x] "))
                 .or_else(|| trimmed.strip_prefix("* [X] "))
+                .or_else(|| trimmed.strip_prefix("+ [x] "))
+                .or_else(|| trimmed.strip_prefix("+ [X] "))
             {
                 let indent = &raw_line[..raw_line.len() - trimmed.len()];
                 lines.push(Line::from(vec![
@@ -1780,6 +1782,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
             } else if let Some(rest) = trimmed
                 .strip_prefix("- [ ] ")
                 .or_else(|| trimmed.strip_prefix("* [ ] "))
+                .or_else(|| trimmed.strip_prefix("+ [ ] "))
             {
                 let indent = &raw_line[..raw_line.len() - trimmed.len()];
                 lines.push(Line::from(vec![
@@ -1800,6 +1803,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
             } else if let Some(rest) = trimmed
                 .strip_prefix("- ")
                 .or_else(|| trimmed.strip_prefix("* "))
+                .or_else(|| trimmed.strip_prefix("+ "))
             {
                 let indent = &raw_line[..raw_line.len() - trimmed.len()];
                 lines.push(Line::from(vec![
@@ -1817,7 +1821,12 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
     }
 
     let body_h = inner.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(body_h);
+    let body_rect = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), body_h);
+    let total_visual: u16 = lines
+        .iter()
+        .map(|l| visual_line_rows(l, body_rect.width))
+        .sum();
+    let max_scroll = total_visual.saturating_sub(body_h);
     let clamped_scroll = scroll.min(max_scroll);
     if clamped_scroll != scroll {
         app.mode = Mode::NotesPreview {
@@ -1826,7 +1835,6 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
         };
     }
 
-    let body_rect = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), body_h);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1951,9 +1959,36 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
 }
 
 fn visual_line_rows(line: &Line<'_>, width: u16) -> u16 {
-    let w = width.max(1) as usize;
-    let line_w: usize = line.spans.iter().map(|s| s.content.width()).sum();
-    line_w.max(1).div_ceil(w) as u16
+    let max_w = width.max(1) as usize;
+    let mut full = String::new();
+    for span in &line.spans {
+        full.push_str(span.content.as_ref());
+    }
+    if full.is_empty() {
+        return 1;
+    }
+    let mut rows: u16 = 1;
+    let mut col: usize = 0;
+    for word in full.split_inclusive(char::is_whitespace) {
+        let w = word.width();
+        if col > 0 && col + w > max_w {
+            rows = rows.saturating_add(1);
+            col = 0;
+        }
+        if w > max_w {
+            for ch in word.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if col > 0 && col + cw > max_w {
+                    rows = rows.saturating_add(1);
+                    col = 0;
+                }
+                col += cw;
+            }
+        } else {
+            col += w;
+        }
+    }
+    rows
 }
 
 fn help_section(theme: &Theme, title: &'static str) -> Line<'static> {
@@ -2165,5 +2200,40 @@ mod tests {
         assert_eq!(cursor_col, 6);
 
         assert_eq!(truncate_to_width("日本語", 5), "日本");
+    }
+
+    #[test]
+    fn notes_preview_scrolls_wrapped_paragraphs_and_plus_checklists() {
+        use crate::model::TaskStore;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut store = TaskStore::new_empty();
+        let long_para = "word ".repeat(300);
+        let id = store.add(
+            "Long note".into(),
+            format!("+ [ ] Plus item\n+ [x] Done plus\n\n{long_para}"),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+        );
+        let mut app = App::new(store, None);
+        app.mode = Mode::NotesPreview {
+            task_id: id,
+            scroll: u16::MAX,
+        };
+
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        if let Mode::NotesPreview { scroll, .. } = app.mode {
+            assert!(
+                scroll > 10,
+                "wrapped paragraph should allow scrolling past logical line count, got {scroll}"
+            );
+        } else {
+            panic!("expected NotesPreview mode");
+        }
     }
 }
