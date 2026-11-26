@@ -283,7 +283,7 @@ pub struct ModalRegions {
 #[derive(Debug, Default, Clone)]
 pub struct TagModalRegions {
     pub area: Rect,
-    pub rows: Vec<(String, Rect)>,
+    pub rows: Vec<(usize, String, Rect)>,
     pub mode_btn: Rect,
     pub clear_btn: Rect,
 }
@@ -745,6 +745,12 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 sel = sel.saturating_sub(1);
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                sel = 0;
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                sel = tags.len().saturating_sub(1);
             }
             KeyCode::Char(' ') => {
                 self.toggle_tag_filter(tags[sel].clone());
@@ -1580,9 +1586,21 @@ impl App {
                 }
                 return;
             }
-            Mode::TagFilter(_) => {
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                    self.handle_tag_modal_click(x, y);
+            Mode::TagFilter(sel) => {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.handle_tag_modal_click(x, y);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let len = self.all_tags().len();
+                        if len > 0 && sel + 1 < len {
+                            self.mode = Mode::TagFilter(sel + 1);
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.mode = Mode::TagFilter(sel.saturating_sub(1));
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -1624,7 +1642,7 @@ impl App {
             self.clear_tag_filters();
             return;
         }
-        for (idx, (tag, rect)) in regions.rows.into_iter().enumerate() {
+        for (idx, tag, rect) in regions.rows {
             if rect_contains(rect, x, y) {
                 self.toggle_tag_filter(tag);
                 self.mode = Mode::TagFilter(idx);
@@ -1968,6 +1986,41 @@ mod tests {
         // Esc clears remaining tag filters
         app.handle_key(key(KeyCode::Esc));
         assert!(app.tag_filters.is_empty());
+    }
+
+    #[test]
+    fn tag_filter_modal_scrolls_when_many_tags() {
+        let mut store = TaskStore::new_empty();
+        let tags: Vec<String> = (1..=20).map(|i| format!("tag{i:02}")).collect();
+        store.add("Many tags".into(), String::new(), Status::Todo, Priority::Medium, tags);
+        let mut app = App::new(store, None);
+
+        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('G'))); // Jump to last tag (#tag20, index 19)
+        assert!(matches!(app.mode, Mode::TagFilter(19)));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        let modal = app.regions.tag_modal.clone().expect("tag modal rendered");
+        let last_row = modal
+            .rows
+            .iter()
+            .find(|(_, t, _)| t == "tag20")
+            .cloned()
+            .expect("scrolled modal must render #tag20");
+        assert_eq!(last_row.0, 19);
+
+        // Clicking #tag20 toggles it and preserves real index 19
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: last_row.2.x + 1,
+            row: last_row.2.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tag_filters, vec!["tag20"]);
+        assert!(matches!(app.mode, Mode::TagFilter(19)));
     }
 
     #[test]

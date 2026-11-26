@@ -1429,13 +1429,26 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
     }
 
     let list_h = inner.height.saturating_sub(1);
+    let visible_rows = list_h as usize;
     let footer_y = inner.bottom().saturating_sub(1);
     let mut rows_regions = Vec::new();
+    let clamped_sel = selected.min(all_tags.len().saturating_sub(1));
+    let scroll = if visible_rows == 0 || clamped_sel < visible_rows {
+        0
+    } else {
+        (clamped_sel + 1 - visible_rows).min(all_tags.len().saturating_sub(visible_rows))
+    };
 
-    for (idx, tag) in all_tags.iter().enumerate().take(list_h as usize) {
-        let y = inner.y + idx as u16;
+    for (row_offset, (idx, tag)) in all_tags
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let y = inner.y + row_offset as u16;
         let row_rect = Rect::new(inner.x + 1, y, inner.width.saturating_sub(2), 1);
-        let is_cursor = idx == selected.min(all_tags.len().saturating_sub(1));
+        let is_cursor = idx == clamped_sel;
         let is_active = app.is_tag_active(tag);
         let count = app
             .store
@@ -1478,7 +1491,7 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
             );
         }
 
-        rows_regions.push((tag.clone(), row_rect));
+        rows_regions.push((idx, tag.clone(), row_rect));
     }
 
     let mode_label = format!("m {}", app.tag_match_mode.label());
