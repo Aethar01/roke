@@ -2,6 +2,7 @@ use crate::theme::{Theme, ThemeConfig};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -113,6 +114,11 @@ pub fn normalize_device_tag(raw: &str) -> String {
 }
 
 pub fn detect_hostname() -> String {
+    static CACHED_HOSTNAME: OnceLock<String> = OnceLock::new();
+    CACHED_HOSTNAME.get_or_init(detect_hostname_uncached).clone()
+}
+
+fn detect_hostname_uncached() -> String {
     if let Ok(name) = std::env::var("HOSTNAME") {
         let slug = normalize_device_tag(&name);
         if !slug.is_empty() {
