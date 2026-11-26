@@ -13,7 +13,9 @@ use app::App;
 use clap::Parser;
 use cli::{format_error, Cli};
 use config::AppConfig;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -117,6 +119,7 @@ fn run_loop(
     sync_mgr: &mut SyncManager,
 ) -> io::Result<()> {
     let mut last_reload_check = Instant::now();
+    let mut needs_draw = true;
 
     loop {
         if let Some(target) = app.pending_editor.take() {
@@ -129,11 +132,14 @@ fn run_loop(
                 );
                 resume_terminal(terminal)?;
                 app.apply_editor_result(target, edit_res);
+                needs_draw = true;
             }
         }
 
         if last_reload_check.elapsed() >= LIVE_RELOAD_INTERVAL {
-            app.reload_if_changed();
+            if app.reload_if_changed() {
+                needs_draw = true;
+            }
             last_reload_check = Instant::now();
         }
 
@@ -141,15 +147,20 @@ fn run_loop(
             app.sync_requested = false;
             if sync_mgr.trigger(app.store.clone(), app.sync_config.clone()) {
                 app.syncing = true;
+                needs_draw = true;
             }
         }
 
         if let Some(outcome) = sync_mgr.poll() {
             app.syncing = false;
             app.apply_sync_outcome(outcome);
+            needs_draw = true;
         }
 
-        terminal.draw(|frame| ui::render(frame, app))?;
+        if needs_draw {
+            terminal.draw(|frame| ui::render(frame, app))?;
+            needs_draw = false;
+        }
 
         if app.should_quit {
             break;
@@ -159,9 +170,16 @@ fn run_loop(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
+                    needs_draw = true;
                 }
                 Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse);
+                    if !matches!(mouse.kind, MouseEventKind::Moved) {
+                        app.handle_mouse(mouse);
+                        needs_draw = true;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    needs_draw = true;
                 }
                 _ => {}
             }
