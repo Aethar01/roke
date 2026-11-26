@@ -169,6 +169,36 @@ fn format_ssh_stderr(output: &std::process::Output) -> String {
     }
 }
 
+/// Compute POSIX `cksum` (`"<crc> <byte_len>"`) matching `cksum < file` on macOS, Linux, and BSD.
+fn posix_cksum(bytes: &[u8]) -> String {
+    let mut crc: u32 = 0;
+    for &b in bytes {
+        crc ^= (b as u32) << 24;
+        for _ in 0..8 {
+            if (crc & 0x8000_0000) != 0 {
+                crc = (crc << 1) ^ 0x04c1_1db7;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    let mut len = bytes.len();
+    while len > 0 {
+        let b = (len & 0xff) as u32;
+        crc ^= b << 24;
+        for _ in 0..8 {
+            if (crc & 0x8000_0000) != 0 {
+                crc = (crc << 1) ^ 0x04c1_1db7;
+            } else {
+                crc <<= 1;
+            }
+        }
+        len >>= 8;
+    }
+    crc = !crc;
+    format!("{crc} {}", bytes.len())
+}
+
 /// Runs a POSIX sh snippet via `sh -c '...'` with zero backslashes or single quotes inside the
 /// body so it works regardless of whether the remote login shell is bash, zsh, sh, or fish.
 fn build_pull_command(remote_path: Option<&str>) -> String {
@@ -177,15 +207,39 @@ fn build_pull_command(remote_path: Option<&str>) -> String {
     format!(r#"sh -c '{resolve}; [ -f "$p" ] && cat "$p" || true' _{arg}"#)
 }
 
+#[cfg(test)]
 fn build_push_command(remote_path: Option<&str>) -> String {
+    build_push_command_cas(remote_path, None)
+}
+
+fn build_push_command_cas(remote_path: Option<&str>, expected_cksum: Option<&str>) -> String {
     let (encoded, arg) = remote_path_arg(remote_path);
     let resolve = resolve_path_snippet(encoded);
+    let cas_check = match expected_cksum {
+        Some("missing") => r#"if [ -f "$p" ]; then exit 42; fi;"#.to_string(),
+        Some(exp) => format!(
+            r#"if [ ! -f "$p" ]; then exit 42; fi; set -- $(cksum < "$p"); if [ "$1 $2" != "{exp}" ]; then exit 42; fi;"#
+        ),
+        None => String::new(),
+    };
     format!(
-        r#"sh -c '{resolve}; mkdir -p "$(dirname "$p")" && tmp="$p.tmp.$$" && cat > "$tmp" && mv "$tmp" "$p"' _{arg}"#
+        r#"sh -c '{resolve}; mkdir -p "$(dirname "$p")" || exit 1; tmp="$p.tmp.$$"; cleanup() {{ rm -f "$tmp"; }}; trap cleanup EXIT HUP INT TERM; cat > "$tmp" || exit 1; {cas_check} mv "$tmp" "$p"' _{arg}"#
     )
 }
 
-fn pull_peer_store(peer: &PeerConfig) -> Result<Option<TaskStore>, String> {
+#[derive(Debug)]
+struct PulledPeer {
+    store: Option<TaskStore>,
+    cksum: String,
+}
+
+#[derive(Debug)]
+enum PushError {
+    Conflict,
+    Other(String),
+}
+
+fn pull_peer_store(peer: &PeerConfig) -> Result<PulledPeer, String> {
     let script = build_pull_command(peer.remote_path.as_deref());
 
     let mut cmd = Command::new("ssh");
@@ -198,19 +252,35 @@ fn pull_peer_store(peer: &PeerConfig) -> Result<Option<TaskStore>, String> {
         return Err(format_ssh_stderr(&output));
     }
 
+    if output.stdout.is_empty() {
+        return Ok(PulledPeer {
+            store: None,
+            cksum: "missing".to_string(),
+        });
+    }
+    let cksum = posix_cksum(&output.stdout);
     let raw = String::from_utf8_lossy(&output.stdout);
     if raw.trim().is_empty() {
-        return Ok(None);
+        return Ok(PulledPeer { store: None, cksum });
     }
     let mut store =
         TaskStore::from_str_auto(&raw).map_err(|e| format!("invalid remote task file: {e}"))?;
     store.ensure_sync_metadata(&peer.name);
-    Ok(Some(store))
+    Ok(PulledPeer {
+        store: Some(store),
+        cksum,
+    })
 }
 
-fn push_peer_store(peer: &PeerConfig, store: &TaskStore) -> Result<(), String> {
-    let payload = store.to_jsonl().map_err(|e| e.to_string())?;
-    let script = build_push_command(peer.remote_path.as_deref());
+fn push_peer_store(
+    peer: &PeerConfig,
+    store: &TaskStore,
+    expected_cksum: Option<&str>,
+) -> Result<(), PushError> {
+    let payload = store
+        .to_jsonl()
+        .map_err(|e| PushError::Other(e.to_string()))?;
+    let script = build_push_command_cas(peer.remote_path.as_deref(), expected_cksum);
 
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_base_args(peer))
@@ -220,17 +290,22 @@ fn push_peer_store(peer: &PeerConfig, store: &TaskStore) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("failed to run ssh: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| PushError::Other(format!("failed to run ssh: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(payload.as_bytes())
-            .map_err(|e| format!("failed writing payload: {e}"))?;
+            .map_err(|e| PushError::Other(format!("failed writing payload: {e}")))?;
     }
     let output = child
         .wait_with_output()
-        .map_err(|e| format!("ssh wait error: {e}"))?;
+        .map_err(|e| PushError::Other(format!("ssh wait error: {e}")))?;
+    if output.status.code() == Some(42) {
+        return Err(PushError::Conflict);
+    }
     if !output.status.success() {
-        return Err(format_ssh_stderr(&output));
+        return Err(PushError::Other(format_ssh_stderr(&output)));
     }
     Ok(())
 }
@@ -263,10 +338,10 @@ pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome
 
     let mut synced_peers = 0;
     let mut errors = Vec::new();
-    let mut reachable_peers: Vec<(&PeerConfig, Option<TaskStore>)> = Vec::new();
+    let mut reachable_peers: Vec<(&PeerConfig, PulledPeer)> = Vec::new();
 
     // Pass 1: Pull from all peers in parallel
-    let pull_results: Vec<(&PeerConfig, Result<Option<TaskStore>, String>)> =
+    let pull_results: Vec<(&PeerConfig, Result<PulledPeer, String>)> =
         std::thread::scope(|scope| {
             let handles: Vec<_> = config
                 .peers
@@ -281,12 +356,11 @@ pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome
 
     for (peer, result) in pull_results {
         match result {
-            Ok(Some(remote_store)) => {
-                working = merge_stores(&working, &remote_store, &local_name, &peer.name);
-                reachable_peers.push((peer, Some(remote_store)));
-            }
-            Ok(None) => {
-                reachable_peers.push((peer, None));
+            Ok(pulled) => {
+                if let Some(ref remote_store) = pulled.store {
+                    working = merge_stores(&working, remote_store, &local_name, &peer.name);
+                }
+                reachable_peers.push((peer, pulled));
             }
             Err(err) => {
                 errors.push(format!("{}: {err}", peer.name));
@@ -294,25 +368,27 @@ pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome
         }
     }
 
-    // Pass 2: Push merged store back in parallel, skipping peers already up to date
-    let mut peers_to_push: Vec<&PeerConfig> = Vec::new();
-    for (peer, remote_opt) in reachable_peers {
-        let up_to_date = match remote_opt {
+    // Pass 2: Push merged store back in parallel with CAS, skipping peers already up to date
+    let mut peers_to_push: Vec<(&PeerConfig, String)> = Vec::new();
+    for (peer, pulled) in reachable_peers {
+        let up_to_date = match pulled.store {
             Some(ref remote) => stores_semantically_equal(&working, remote),
             None => working.tasks.is_empty() && working.tombstones.is_empty(),
         };
         if up_to_date {
             synced_peers += 1;
         } else {
-            peers_to_push.push(peer);
+            peers_to_push.push((peer, pulled.cksum));
         }
     }
 
     let working_ref = &working;
-    let push_results: Vec<(&PeerConfig, Result<(), String>)> = std::thread::scope(|scope| {
+    let push_results: Vec<(&PeerConfig, Result<(), PushError>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = peers_to_push
             .into_iter()
-            .map(|peer| scope.spawn(move || (peer, push_peer_store(peer, working_ref))))
+            .map(|(peer, cksum)| {
+                scope.spawn(move || (peer, push_peer_store(peer, working_ref, Some(&cksum))))
+            })
             .collect();
         handles
             .into_iter()
@@ -323,7 +399,28 @@ pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome
     for (peer, result) in push_results {
         match result {
             Ok(()) => synced_peers += 1,
-            Err(err) => errors.push(format!("{}: {err}", peer.name)),
+            Err(PushError::Conflict) => {
+                // Peer modified its file during sync: re-pull, re-merge, and retry CAS once
+                match pull_peer_store(peer) {
+                    Ok(latest) => {
+                        if let Some(ref remote_store) = latest.store {
+                            working =
+                                merge_stores(&working, remote_store, &local_name, &peer.name);
+                        }
+                        match push_peer_store(peer, &working, Some(&latest.cksum)) {
+                            Ok(()) => synced_peers += 1,
+                            Err(PushError::Conflict) => {
+                                errors.push(format!("{}: remote file changed concurrently", peer.name));
+                            }
+                            Err(PushError::Other(err)) => {
+                                errors.push(format!("{}: {err}", peer.name));
+                            }
+                        }
+                    }
+                    Err(err) => errors.push(format!("{}: {err}", peer.name)),
+                }
+            }
+            Err(PushError::Other(err)) => errors.push(format!("{}: {err}", peer.name)),
         }
     }
 
@@ -581,6 +678,67 @@ mod tests {
                 "{\"title\":\"quoted\"}\n"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cas_push_detects_concurrent_change_and_cleans_temp_file() {
+        let dir = std::env::temp_dir().join(format!("roke_sync_cas_{}", std::process::id()));
+        let file = dir.join("todos.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let initial = b"{\"title\":\"initial\"}\n";
+        std::fs::write(&file, initial).unwrap();
+        let expected = posix_cksum(initial);
+        let file_str = file.to_string_lossy().to_string();
+
+        // Matching cksum succeeds
+        let ok_cmd = build_push_command_cas(Some(&file_str), Some(&expected));
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&ok_cmd)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"title\":\"updated\"}\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"title\":\"updated\"}\n"
+        );
+
+        // Stale cksum fails with exit 42 and leaves no orphan .tmp files behind
+        let conflict_cmd = build_push_command_cas(Some(&file_str), Some(&expected));
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&conflict_cmd)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"title\":\"clobber\"}\n")
+            .unwrap();
+        let conflict_out = child.wait_with_output().unwrap();
+        assert_eq!(conflict_out.status.code(), Some(42));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"title\":\"updated\"}\n"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1, "temp file must be cleaned up on CAS conflict");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
