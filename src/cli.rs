@@ -197,7 +197,11 @@ pub enum SubCommand {
 
     /// Show a compact summary of board counts, due dates, velocity, and top tags
     #[command(alias = "summary")]
-    Stats,
+    Stats {
+        /// Output a single-line status segment for tmux or shell prompts (e.g. `○3 ◐1 !1`)
+        #[arg(long = "oneline")]
+        oneline: bool,
+    },
 
     /// Sync tasks over SSH with peers configured in config.toml
     Sync,
@@ -840,10 +844,12 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 }
             }
         }
-        SubCommand::Stats => {
+        SubCommand::Stats { oneline } => {
             let stats = ops::board_stats(&path, cfg)?;
             if json {
                 print_json(&stats)?;
+            } else if *oneline {
+                println!("{}", painter.format_stats_oneline(&stats));
             } else {
                 println!(
                     "{}  {} {}  {} {}  {} {}",
@@ -1158,6 +1164,33 @@ impl Painter {
         }
     }
 
+    pub fn format_stats_oneline(&self, stats: &ops::BoardStats) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if stats.todo > 0 {
+            parts.push(self.colored(&format!("○{}", stats.todo), self.theme.todo));
+        }
+        if stats.in_progress > 0 {
+            parts.push(self.colored(&format!("◐{}", stats.in_progress), self.theme.in_progress));
+        }
+        if stats.overdue > 0 {
+            parts.push(self.style(
+                &format!("!{}", stats.overdue),
+                self.theme.error,
+                true,
+                false,
+                false,
+            ));
+        }
+        if stats.due_today > 0 {
+            parts.push(self.colored(&format!("@{}", stats.due_today), self.theme.in_progress));
+        }
+        if parts.is_empty() {
+            self.badge("✓", self.theme.done)
+        } else {
+            parts.join(" ")
+        }
+    }
+
     pub fn format_task_line(&self, task: &Task, eff_tags: &[String], id_width: usize) -> String {
         let raw_id = format!("#{}", task.id);
         let id_str = if id_width > raw_id.len() {
@@ -1380,6 +1413,37 @@ mod tests {
         assert!(line_colored.contains('\x1b'));
         assert!(line_colored.contains("Review server details"));
         assert!(line_colored.contains("#work"));
+
+        let stats = ops::BoardStats {
+            total: 5,
+            open: 4,
+            todo: 3,
+            in_progress: 1,
+            done: 1,
+            archived: 0,
+            overdue: 2,
+            due_today: 1,
+            recurring: 0,
+            high_priority_open: 1,
+            completed_last_7_days: 1,
+            top_tags: Vec::new(),
+        };
+        assert_eq!(plain.format_stats_oneline(&stats), "○3 ◐1 !2 @1");
+        let clear = ops::BoardStats {
+            total: 1,
+            open: 0,
+            todo: 0,
+            in_progress: 0,
+            done: 1,
+            archived: 0,
+            overdue: 0,
+            due_today: 0,
+            recurring: 0,
+            high_priority_open: 0,
+            completed_last_7_days: 1,
+            top_tags: Vec::new(),
+        };
+        assert_eq!(plain.format_stats_oneline(&clear), "✓");
     }
 
     #[test]
