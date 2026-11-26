@@ -1,5 +1,5 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
-use crate::model::{parse_tags, FileLock, Priority, Status, Task, TaskStore};
+use crate::model::{now_millis, parse_tags, FileLock, Priority, Status, Task, TaskStore};
 use crate::sync::{merge_stores, sync_all_peers};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -83,6 +83,13 @@ pub struct SyncReport {
     pub synced_peers: usize,
     pub total_tasks: usize,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    pub pruned_tombstones: usize,
+    pub remaining_tombstones: usize,
+    pub total_tasks: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +389,25 @@ pub fn sync_tasks(path: &Path, cfg: &AppConfig) -> Result<SyncReport, String> {
     })
 }
 
+pub fn prune_tombstones(
+    path: &Path,
+    cfg: &AppConfig,
+    max_age_days: u64,
+) -> Result<GcReport, String> {
+    let _lock = acquire_lock(path)?;
+    let mut store = load_store(path, cfg)?;
+    let max_age_ms = max_age_days.saturating_mul(24 * 60 * 60 * 1000);
+    let pruned = store.prune_tombstones(now_millis(), max_age_ms);
+    if pruned > 0 {
+        save_store(&store, path)?;
+    }
+    Ok(GcReport {
+        pruned_tombstones: pruned,
+        remaining_tombstones: store.tombstones.len(),
+        total_tasks: store.tasks.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +551,31 @@ mod tests {
 
         let tasks = list_tasks(&path, &cfg, &TaskFilter::default()).unwrap();
         assert_eq!(tasks.len(), 40);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn prune_tombstones_respects_age_cutoff() {
+        let path = temp_store_path("gc");
+        let cfg = AppConfig::default();
+
+        let mut store = TaskStore::new_empty();
+        store.add("Keep".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
+        let now = now_millis();
+        let old_ts = now.saturating_sub(120 * 24 * 60 * 60 * 1000);
+        let fresh_ts = now.saturating_sub(2 * 24 * 60 * 60 * 1000);
+        store.tombstones.insert("old-uid".into(), old_ts);
+        store.tombstones.insert("fresh-uid".into(), fresh_ts);
+        store.save(&path).unwrap();
+
+        let rep = prune_tombstones(&path, &cfg, 90).unwrap();
+        assert_eq!(rep.pruned_tombstones, 1);
+        assert_eq!(rep.remaining_tombstones, 1);
+
+        let reloaded = TaskStore::load_or_empty(&path).unwrap();
+        assert!(!reloaded.tombstones.contains_key("old-uid"));
+        assert!(reloaded.tombstones.contains_key("fresh-uid"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

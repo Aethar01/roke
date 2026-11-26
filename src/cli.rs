@@ -172,6 +172,13 @@ pub enum SubCommand {
     /// Sync tasks over SSH with peers configured in config.toml
     Sync,
 
+    /// Prune old sync tombstones from the JSONL file
+    Gc {
+        /// Remove tombstones older than this many days (0 removes all)
+        #[arg(long = "days", default_value_t = 90)]
+        days: u64,
+    },
+
     /// Run built-in Model Context Protocol (MCP) server over stdio
     Mcp,
 }
@@ -668,6 +675,23 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
             }
             if !report.errors.is_empty() && report.synced_peers == 0 {
                 return Err(report.errors.join("; "));
+            }
+        }
+        SubCommand::Gc { days } => {
+            let report = ops::prune_tombstones(&path, cfg, *days)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} Pruned {} tombstone{} {}",
+                    painter.badge("✓", painter.theme.done),
+                    report.pruned_tombstones,
+                    if report.pruned_tombstones == 1 { "" } else { "s" },
+                    painter.muted(&format!(
+                        "({} remaining, {} tasks)",
+                        report.remaining_tombstones, report.total_tasks
+                    ))
+                );
             }
         }
         SubCommand::Mcp => {

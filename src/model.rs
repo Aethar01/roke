@@ -461,6 +461,15 @@ impl TaskStore {
         Some(removed)
     }
 
+    /// Remove tombstones older than `max_age_ms` relative to `now_ms`.
+    /// Returns the number of pruned tombstones.
+    pub fn prune_tombstones(&mut self, now_ms: u64, max_age_ms: u64) -> usize {
+        let cutoff = now_ms.saturating_sub(max_age_ms);
+        let before = self.tombstones.len();
+        self.tombstones.retain(|_, &mut ts| ts > cutoff);
+        before - self.tombstones.len()
+    }
+
     pub fn from_str_auto(raw: &str) -> io::Result<Self> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
