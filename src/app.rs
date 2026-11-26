@@ -355,6 +355,7 @@ pub struct DragState {
     pub current_y: u16,
     pub active: bool,
     pub hover_status: Option<Status>,
+    pub hover_before_id: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2076,6 +2077,7 @@ impl App {
                             current_y: y,
                             active: false,
                             hover_status: Some(status),
+                            hover_before_id: None,
                         });
                         return;
                     }
@@ -2100,8 +2102,55 @@ impl App {
             .map(|(status, _)| *status)
     }
 
+    fn drop_before_task_in_column(&self, target_status: Status, drag_task_id: u64, y: u16) -> Option<u64> {
+        self.regions
+            .kanban_cards
+            .iter()
+            .filter(|(id, s, _)| *s == target_status && *id != drag_task_id)
+            .find(|(_, _, rect)| y < rect.y.saturating_add(rect.height / 2))
+            .map(|(id, _, _)| *id)
+    }
+
+    fn compute_store_insert_index(
+        &self,
+        from_pos: usize,
+        target_status: Status,
+        before_id: Option<u64>,
+        drag_task_id: u64,
+    ) -> usize {
+        if let Some(bid) = before_id {
+            if let Some(bpos) = self.store.tasks.iter().position(|t| t.id == bid) {
+                return if from_pos < bpos {
+                    bpos.saturating_sub(1)
+                } else {
+                    bpos
+                };
+            }
+        }
+        // Insert after the last task in `target_status` (or at end of store)
+        if let Some(last_pos) = self
+            .store
+            .tasks
+            .iter()
+            .rposition(|t| t.status == target_status && t.id != drag_task_id)
+        {
+            if from_pos < last_pos {
+                last_pos
+            } else {
+                (last_pos + 1).min(self.store.tasks.len().saturating_sub(1))
+            }
+        } else {
+            from_pos
+        }
+    }
+
     fn handle_left_drag(&mut self, x: u16, y: u16) {
         let hover = self.column_at(x, y);
+        let drag_task_id = self.drag.as_ref().map(|d| d.task_id);
+        let before_id = match (hover, drag_task_id) {
+            (Some(status), Some(tid)) => self.drop_before_task_in_column(status, tid, y),
+            _ => None,
+        };
         if let Some(drag) = self.drag.as_mut() {
             drag.current_x = x;
             drag.current_y = y;
@@ -2110,6 +2159,7 @@ impl App {
                 drag.active = true;
             }
             drag.hover_status = hover;
+            drag.hover_before_id = before_id;
         }
     }
 
@@ -2119,8 +2169,49 @@ impl App {
         };
         if drag.active {
             if let Some(target) = self.column_at(x, y) {
+                let before_id = self.drop_before_task_in_column(target, drag.task_id, y);
                 if target != drag.origin_status {
-                    self.move_task_to_status(drag.task_id, target, true);
+                    self.push_undo();
+                    if let Some(task) = self.store.get_mut(drag.task_id) {
+                        task.status = target;
+                        task.touch();
+                    }
+                    if self.sort_order == SortOrder::Manual {
+                        if let Some(from_pos) =
+                            self.store.tasks.iter().position(|t| t.id == drag.task_id)
+                        {
+                            let to_pos = self.compute_store_insert_index(
+                                from_pos,
+                                target,
+                                before_id,
+                                drag.task_id,
+                            );
+                            self.store.move_to_position(from_pos, to_pos);
+                        }
+                    }
+                    self.persist();
+                    self.clamp_selections();
+                    self.select_task_by_id(drag.task_id);
+                    self.set_message(format!("Moved to {}", target.label()));
+                } else if self.sort_order != SortOrder::Manual {
+                    self.set_message("Switch to manual sort (O) to reorder");
+                } else if let Some(from_pos) =
+                    self.store.tasks.iter().position(|t| t.id == drag.task_id)
+                {
+                    let to_pos = self.compute_store_insert_index(
+                        from_pos,
+                        target,
+                        before_id,
+                        drag.task_id,
+                    );
+                    if to_pos != from_pos {
+                        self.push_undo();
+                        self.store.move_to_position(from_pos, to_pos);
+                        self.persist();
+                        self.clamp_selections();
+                        self.select_task_by_id(drag.task_id);
+                        self.set_message("Reordered task");
+                    }
                 }
             }
             self.last_click = None;
@@ -2663,6 +2754,54 @@ default_sort = "priority"
         });
 
         assert_eq!(app.store.get(card_id).unwrap().status, Status::Done);
+    }
+
+    #[test]
+    fn kanban_vertical_drag_reorders_cards_within_column() {
+        let mut app = sample_app();
+        app.view = View::Kanban;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        // Initially Todo column has [1 (Alpha), 2 (Beta)]
+        assert_eq!(app.column_task_ids(Status::Todo), vec![1, 2]);
+        let (_, _, rect1) = app
+            .regions
+            .kanban_cards
+            .iter()
+            .copied()
+            .find(|(id, _, _)| *id == 1)
+            .unwrap();
+        let (_, _, rect2) = app
+            .regions
+            .kanban_cards
+            .iter()
+            .copied()
+            .find(|(id, _, _)| *id == 2)
+            .unwrap();
+
+        // Drag card 1 down past the bottom of card 2 in the same column
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect1.x + 1,
+            row: rect1.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: rect2.x + 1,
+            row: rect2.y + rect2.height,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: rect2.x + 1,
+            row: rect2.y + rect2.height,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.column_task_ids(Status::Todo), vec![2, 1]);
     }
 
     #[test]

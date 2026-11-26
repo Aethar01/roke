@@ -875,6 +875,12 @@ fn render_kanban_view(frame: &mut Frame, app: &mut App, area: Rect) {
             .drag
             .as_ref()
             .is_some_and(|d| d.active && d.hover_status == Some(status) && d.origin_status != status);
+        let is_same_col_reorder = app.drag.as_ref().is_some_and(|d| {
+            d.active
+                && d.hover_status == Some(status)
+                && d.origin_status == status
+                && app.sort_order == SortOrder::Manual
+        });
 
         let ids = app.column_task_ids(status);
         let col_accent = status_color(&theme, status);
@@ -910,6 +916,8 @@ fn render_kanban_view(frame: &mut Frame, app: &mut App, area: Rect) {
         ];
         if is_drag_target {
             header_spans.push(Span::styled("  ↓ drop", Style::default().fg(theme.drop)));
+        } else if is_same_col_reorder {
+            header_spans.push(Span::styled("  ↕ reorder", Style::default().fg(theme.drag)));
         }
 
         frame.render_widget(
@@ -1135,8 +1143,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
     let left_text = if let Some(drag) = &app.drag {
         if drag.active {
-            let dest = drag.hover_status.map(|s| s.label()).unwrap_or("...");
-            format!("moving → {dest}")
+            if drag.hover_status == Some(drag.origin_status) {
+                "reordering…".to_string()
+            } else {
+                let dest = drag.hover_status.map(|s| s.label()).unwrap_or("...");
+                format!("moving → {dest}")
+            }
         } else {
             app.status_message.clone().unwrap_or_default()
         }
@@ -1871,7 +1883,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_section(&theme, "Mouse"),
         help_row(&theme, "Click", "Tabs, filters, #tags, status, cards"),
         help_row(&theme, "Double-click", "Edit task"),
-        help_row(&theme, "Drag card", "Move between Kanban columns"),
+        help_row(&theme, "Drag card", "Reorder or move between Kanban columns"),
     ];
 
     let block = Block::default()
