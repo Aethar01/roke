@@ -1065,12 +1065,16 @@ impl App {
             }
             Ok(Some(markdown)) => match target {
                 PendingEditor::Task(id) => {
-                    self.push_undo();
-                    if let Some(task) = self.store.get_mut(id) {
-                        task.description = markdown;
-                        task.touch();
+                    if self.store.get(id).is_some() {
+                        self.push_undo();
+                        if let Some(task) = self.store.get_mut(id) {
+                            task.description = markdown;
+                            task.touch();
+                        }
                         self.persist();
                         self.set_message("Notes updated");
+                    } else {
+                        self.set_message("Task no longer exists");
                     }
                 }
                 PendingEditor::Modal => {
