@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     app.regions.clear();
@@ -159,7 +160,7 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if !app.sync_config.peers.is_empty() {
         let sync_label = if app.syncing { "↻ syncing" } else { "↻ sync" };
-        let sync_w = sync_label.chars().count() as u16;
+        let sync_w = sync_label.width() as u16;
         if right_edge > x + sync_w + 1 {
             right_edge -= sync_w + 2;
             let rect = Rect::new(right_edge, y, sync_w, 1);
@@ -267,7 +268,7 @@ fn tag_pills_total_width(app: &App, all_tags: &[String], show_all_pill: bool) ->
         if !first {
             w = w.saturating_add(2);
         }
-        w = w.saturating_add((tag.chars().count() + 1) as u16); // "#tag"
+        w = w.saturating_add((tag.width() + 1) as u16); // "#tag"
         first = false;
     }
     if app.tag_filters.len() >= 2 {
@@ -307,7 +308,7 @@ fn tag_pills_rows_needed(
         place(3);
     }
     for tag in all_tags {
-        place((tag.chars().count() + 1) as u16);
+        place((tag.width() + 1) as u16);
     }
     if app.tag_filters.len() >= 2 {
         place((app.tag_match_mode.label().len() + 2) as u16);
@@ -460,7 +461,7 @@ fn render_tag_pills_wrapped(
 
     for (idx, tag) in all_tags.iter().enumerate() {
         let label = format!("#{tag}");
-        let w = label.chars().count() as u16;
+        let w = label.width() as u16;
         let remaining_after = all_tags.len().saturating_sub(idx + 1);
 
         // On the last row, reserve space for `+N` if more tags follow, plus `[and]` if active
@@ -576,7 +577,7 @@ fn todo_card_height(task: &Task) -> u16 {
 
 fn kanban_card_height(task: &Task, card_width: u16) -> u16 {
     let inner_w = card_width.saturating_sub(4).max(1) as usize;
-    let title_lines = task.title.chars().count().div_ceil(inner_w).clamp(1, 2) as u16;
+    let title_lines = task.title.width().div_ceil(inner_w).clamp(1, 2) as u16;
     let desc_lines = if task.description.is_empty() { 0 } else { 1 };
     2 + title_lines + desc_lines
 }
@@ -1098,8 +1099,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         View::Kanban => "hjkl nav · H/L move · a add · t tags · tab todos · ? help · q quit",
     };
 
-    let left_w = left_text.chars().count() as u16;
-    let hints_w = hints.chars().count() as u16;
+    let left_w = left_text.width() as u16;
+    let hints_w = hints.width() as u16;
 
     if !left_text.is_empty() {
         frame.render_widget(
@@ -1207,8 +1208,7 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
     let (desc_slice, desc_cursor_off) = if form.description.value.contains('\n') {
         let (preview, extra) = markdown_preview(&form.description.value);
         let summary = format!("{preview}  [md +{extra} · Ctrl-E]");
-        let truncated: String = summary.chars().take(desc_w).collect();
-        (truncated, 0)
+        (truncate_to_width(&summary, desc_w), 0)
     } else {
         let (s, off) = visible_text_slice(&desc_display, form.description.cursor, desc_w);
         (s.to_string(), off)
@@ -1333,11 +1333,11 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
     let save_label = "Save ↵";
     let cancel_label = "Cancel";
     let btn_y = rows[5].y;
-    let save_w = (save_label.chars().count() as u16).min(rows[5].width);
+    let save_w = (save_label.width() as u16).min(rows[5].width);
     let save_rect = Rect::new(rows[5].x, btn_y, save_w, 1);
     let cancel_x = rows[5].x.saturating_add(save_w + 3);
     let cancel_w =
-        (cancel_label.chars().count() as u16).min(rows[5].right().saturating_sub(cancel_x));
+        (cancel_label.width() as u16).min(rows[5].right().saturating_sub(cancel_x));
     let cancel_rect = Rect::new(cancel_x, btn_y, cancel_w, 1);
 
     frame.render_widget(
@@ -1609,29 +1609,56 @@ fn help_row(theme: &Theme, keys: &'static str, desc: impl Into<String>) -> Line<
     ])
 }
 
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > max_width {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
+}
+
 fn visible_text_slice(text: &str, cursor: usize, width: usize) -> (&str, usize) {
     if width == 0 {
         return ("", 0);
     }
-    let char_count = text.chars().count();
-    let max_visible = width.saturating_sub(1).max(1);
-    let scroll = if cursor >= max_visible {
-        cursor + 1 - max_visible
-    } else {
-        0
-    };
-    let start_byte = text
+    let chars: Vec<(usize, usize)> = text
         .char_indices()
-        .nth(scroll)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    let end_char = (scroll + width).min(char_count);
-    let end_byte = text
-        .char_indices()
-        .nth(end_char)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-    (&text[start_byte..end_byte], cursor.saturating_sub(scroll))
+        .map(|(byte_idx, ch)| (byte_idx, ch.width().unwrap_or(0)))
+        .collect();
+    let clamped_cursor = cursor.min(chars.len());
+    let max_cursor_col = width.saturating_sub(1);
+
+    // Choose the earliest start char index so the cursor fits within `max_cursor_col` cells
+    let mut start = clamped_cursor;
+    let mut cursor_col = 0usize;
+    while start > 0 {
+        let cw = chars[start - 1].1;
+        if cursor_col + cw > max_cursor_col {
+            break;
+        }
+        cursor_col += cw;
+        start -= 1;
+    }
+
+    let start_byte = chars.get(start).map(|(b, _)| *b).unwrap_or(text.len());
+    let mut end = start;
+    let mut used = 0usize;
+    while end < chars.len() {
+        let cw = chars[end].1;
+        if used + cw > width {
+            break;
+        }
+        used += cw;
+        end += 1;
+    }
+    let end_byte = chars.get(end).map(|(b, _)| *b).unwrap_or(text.len());
+    (&text[start_byte..end_byte], cursor_col)
 }
 
 fn centered_rect(max_width: u16, max_height: u16, area: Rect) -> Rect {
@@ -1693,7 +1720,7 @@ fn tags_border_line<'a>(
 
     for (idx, tag) in tags.iter().enumerate() {
         let label = format!("#{tag}");
-        let item_w = label.chars().count() + usize::from(idx > 0);
+        let item_w = label.width() + usize::from(idx > 0);
         let remaining_after = tags.len().saturating_sub(idx + 1);
         let reserve = if remaining_after > 0 {
             format!(" +{remaining_after}").len()
@@ -1746,5 +1773,23 @@ fn priority_tag_style(theme: &Theme, priority: Priority, selected: bool) -> Styl
         base.add_modifier(Modifier::BOLD)
     } else {
         base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_text_slice_handles_wide_unicode_chars() {
+        // Each CJK char is 2 display cells wide
+        let text = "日本語タスク";
+        let (slice, cursor_col) = visible_text_slice(text, 6, 8);
+        assert!(slice.width() <= 8);
+        assert!(cursor_col < 8);
+        assert_eq!(slice, "タスク");
+        assert_eq!(cursor_col, 6);
+
+        assert_eq!(truncate_to_width("日本語", 5), "日本");
     }
 }
