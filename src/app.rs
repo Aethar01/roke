@@ -471,6 +471,7 @@ pub struct App {
     pub sync_requested: bool,
     pub syncing: bool,
     pub pending_editor: Option<PendingEditor>,
+    pub pending_yank: Option<String>,
     pub view: View,
     pub mode: Mode,
     pub todo_filter: TodoFilter,
@@ -547,6 +548,7 @@ impl App {
             sync_requested: false,
             syncing: false,
             pending_editor: None,
+            pending_yank: None,
             view: initial_view,
             mode: Mode::Normal,
             todo_filter: initial_filter,
@@ -970,6 +972,17 @@ impl App {
             }
             KeyCode::Char('n') => {
                 self.pending_editor = Some(PendingEditor::Task(task_id));
+            }
+            KeyCode::Char('y') => {
+                if let Some(task) = self.store.get(task_id) {
+                    if task.description.trim().is_empty() {
+                        self.pending_yank = Some(task.title.clone());
+                        self.set_message("Yanked title");
+                    } else {
+                        self.pending_yank = Some(task.description.clone());
+                        self.set_message("Yanked notes");
+                    }
+                }
             }
             KeyCode::Char('e') => {
                 self.mode = Mode::Normal;
@@ -1516,6 +1529,12 @@ impl App {
             KeyCode::Char('A') => {
                 self.archive_done_tasks();
             }
+            KeyCode::Char('y') => {
+                self.yank_selected(false);
+            }
+            KeyCode::Char('Y') => {
+                self.yank_selected(true);
+            }
             KeyCode::Char('t') => {
                 self.open_tag_filter_modal();
             }
@@ -1876,6 +1895,42 @@ impl App {
             self.clamp_selections();
             self.set_message(format!("Deleted \"{}\" (press u to undo)", removed.title));
         }
+    }
+
+    pub fn yank_selected(&mut self, full_markdown: bool) {
+        let Some(id) = self.selected_task_id() else {
+            return;
+        };
+        let Some(task) = self.store.get(id).cloned() else {
+            return;
+        };
+        if !full_markdown {
+            self.pending_yank = Some(task.title.clone());
+            self.set_message("Yanked title");
+            return;
+        }
+        let check = if task.status == Status::Done { "x" } else { " " };
+        let mut out = format!("- [{check}] {}", task.title);
+        let eff_tags = self.effective_tags(&task);
+        if !eff_tags.is_empty() {
+            for tag in &eff_tags {
+                out.push_str(&format!(" #{tag}"));
+            }
+        }
+        if let Some(due) = &task.due {
+            out.push_str(&format!(" @{due}"));
+        }
+        if !task.description.trim().is_empty() {
+            out.push('\n');
+            for line in task.description.lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.truncate(out.trim_end().len());
+        }
+        self.pending_yank = Some(out);
+        self.set_message("Yanked task");
     }
 
     pub fn archive_done_tasks(&mut self) {
@@ -2890,6 +2945,22 @@ default_sort = "priority"
         assert_eq!(created.tags, vec!["ops", "release"]);
         assert_eq!(created.due.as_deref(), Some("2026-12-15"));
         assert_eq!(created.repeat.as_deref(), Some("weekly"));
+    }
+
+    #[test]
+    fn yank_copies_title_full_markdown_and_preview_notes() {
+        let mut app = sample_app();
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.pending_yank.take().as_deref(), Some("Alpha"));
+
+        app.handle_key(key(KeyCode::Char('Y')));
+        let full = app.pending_yank.take().expect("should yank full task");
+        assert!(full.contains("- [ ] Alpha #work"));
+        assert!(full.contains("First task"));
+
+        app.handle_key(key(KeyCode::Char('v')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(app.pending_yank.take().as_deref(), Some("First task"));
     }
 
     #[test]

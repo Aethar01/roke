@@ -2096,6 +2096,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(&theme, "S", "Sync via SSH"),
         help_row(&theme, "d / x", "Delete task"),
         help_row(&theme, "A", "Archive all Done tasks"),
+        help_row(&theme, "y / Y", "Yank title (or notes) / full task"),
         help_row(&theme, "u / Ctrl-R", "Undo / Redo"),
         help_row(&theme, "/   Esc", "Search   Clear filter"),
         Line::raw(""),

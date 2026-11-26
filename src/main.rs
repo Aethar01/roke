@@ -23,11 +23,72 @@ use crossterm::terminal::{
 use model::TaskStore;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use sync::SyncManager;
 
 const LIVE_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn copy_to_clipboard(text: &str, out: &mut impl Write) {
+    // 1. Emit OSC 52 escape sequence (works locally and over SSH/tmux)
+    let encoded = base64_encode(text.as_bytes());
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+
+    // 2. Best-effort native clipboard fallback
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    #[cfg(not(unix))]
+    let candidates: &[(&str, &[&str])] = &[];
+
+    for (prog, args) in candidates {
+        if let Ok(mut child) = Command::new(prog)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                break;
+            }
+        }
+    }
+}
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -130,6 +191,10 @@ fn run_loop(
     let mut needs_draw = true;
 
     loop {
+        if let Some(text) = app.pending_yank.take() {
+            copy_to_clipboard(&text, terminal.backend_mut());
+        }
+
         if let Some(target) = app.pending_editor.take() {
             if let Some((initial, title)) = app.editor_initial_content(target) {
                 suspend_terminal(terminal)?;
