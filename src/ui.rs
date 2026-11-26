@@ -630,6 +630,15 @@ fn adjust_scroll_with_gap(
     }
 }
 
+fn overflow_indicator(above: usize, below: usize) -> Option<String> {
+    match (above > 0, below > 0) {
+        (false, false) => None,
+        (true, false) => Some(format!("↑{above}")),
+        (false, true) => Some(format!("↓{below}")),
+        (true, true) => Some(format!("↑{above} ↓{below}")),
+    }
+}
+
 fn render_todo_list(frame: &mut Frame, app: &mut App, area: Rect) {
     app.regions.todo_list_area = area;
     if area.height == 0 || area.width < 4 {
@@ -657,25 +666,34 @@ fn render_todo_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&id| app.store.get(id).map(todo_card_height).unwrap_or(3))
         .collect();
+    let total_height: u16 = heights.iter().copied().sum();
+    let reserve_indicator = total_height > area.height && area.height >= 4;
+    let list_h = if reserve_indicator {
+        area.height.saturating_sub(1)
+    } else {
+        area.height
+    };
     adjust_scroll_with_gap(
         &heights,
         card_gap,
         app.todo_selected,
         &mut app.todo_scroll,
-        area.height,
+        list_h,
     );
 
     let show_status_tag = app.todo_filter == TodoFilter::All;
+    let list_bottom = area.y.saturating_add(list_h);
     let mut y = area.y;
+    let mut rendered_count = 0usize;
     for (idx, &task_id) in ids.iter().enumerate().skip(app.todo_scroll) {
-        if y >= area.bottom() {
+        if y >= list_bottom {
             break;
         }
         let Some(task) = app.store.get(task_id).cloned() else {
             continue;
         };
         let desired_h = heights[idx];
-        let remaining = area.bottom().saturating_sub(y);
+        let remaining = list_bottom.saturating_sub(y);
         if remaining < 3 && y > area.y {
             break;
         }
@@ -706,7 +724,20 @@ fn render_todo_list(frame: &mut Frame, app: &mut App, area: Rect) {
             show_status_tag,
             &app.tag_filters,
         );
+        rendered_count += 1;
         y = y.saturating_add(h + card_gap);
+    }
+
+    if reserve_indicator {
+        let above = app.todo_scroll;
+        let below = ids.len().saturating_sub(app.todo_scroll + rendered_count);
+        if let Some(ind) = overflow_indicator(above, below) {
+            let w = (ind.width() as u16).min(area.width);
+            frame.render_widget(
+                Paragraph::new(Span::styled(ind, Style::default().fg(theme.muted))),
+                Rect::new(area.right().saturating_sub(w), list_bottom, w, 1),
+            );
+        }
     }
 }
 
@@ -981,6 +1012,7 @@ fn render_kanban_view(frame: &mut Frame, app: &mut App, area: Rect) {
         let scroll = app.kanban_scroll[col_idx];
 
         let mut y = list_area.y;
+        let mut rendered_count = 0usize;
         for (idx, &task_id) in ids.iter().enumerate().skip(scroll) {
             if y >= list_area.bottom() {
                 break;
@@ -1017,7 +1049,21 @@ fn render_kanban_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 is_being_dragged,
                 &app.tag_filters,
             );
+            rendered_count += 1;
             y = y.saturating_add(h + card_gap);
+        }
+
+        let above = scroll;
+        let below = ids.len().saturating_sub(scroll + rendered_count);
+        if let Some(ind) = overflow_indicator(above, below) {
+            let ind_w = ind.width() as u16;
+            let header_min = (status.label().len() + 6) as u16;
+            if inner.width > header_min + ind_w + 1 {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(ind, Style::default().fg(theme.muted))),
+                    Rect::new(inner.right().saturating_sub(ind_w), inner.y, ind_w, 1),
+                );
+            }
         }
     }
 }
@@ -1502,8 +1548,19 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
     let area = centered_rect(42, desired_h, frame.area());
     frame.render_widget(Clear, area);
 
+    let list_h = area.height.saturating_sub(3);
+    let visible_rows = list_h as usize;
+    let clamped_sel = selected.min(all_tags.len().saturating_sub(1));
+    let scroll = if visible_rows == 0 || clamped_sel < visible_rows {
+        0
+    } else {
+        (clamped_sel + 1 - visible_rows).min(all_tags.len().saturating_sub(visible_rows))
+    };
+    let above = scroll;
+    let below = all_tags.len().saturating_sub(scroll + visible_rows);
+
     let mode_text = format!(" match: {} ", app.tag_match_mode.label());
-    let outer = Block::default()
+    let mut outer = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.muted))
@@ -1515,6 +1572,15 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
             Line::from(Span::styled(mode_text, Style::default().fg(theme.accent)))
                 .alignment(Alignment::Right),
         );
+    if let Some(ind) = overflow_indicator(above, below) {
+        outer = outer.title_bottom(
+            Line::from(Span::styled(
+                format!(" {ind} "),
+                Style::default().fg(theme.muted),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -1522,16 +1588,8 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
         return;
     }
 
-    let list_h = inner.height.saturating_sub(1);
-    let visible_rows = list_h as usize;
     let footer_y = inner.bottom().saturating_sub(1);
     let mut rows_regions = Vec::new();
-    let clamped_sel = selected.min(all_tags.len().saturating_sub(1));
-    let scroll = if visible_rows == 0 || clamped_sel < visible_rows {
-        0
-    } else {
-        (clamped_sel + 1 - visible_rows).min(all_tags.len().saturating_sub(visible_rows))
-    };
 
     for (row_offset, (idx, tag)) in all_tags
         .iter()
