@@ -162,6 +162,7 @@ impl McpServer {
             "list_archive" => self.tool_list_archive(),
             "unarchive_task" => self.tool_unarchive_task(&args),
             "list_tags" => self.tool_list_tags(),
+            "board_stats" => self.tool_board_stats(),
             "sync_tasks" => self.tool_sync_tasks(),
             other => {
                 return json_rpc_error(id, -32602, format!("Unknown tool: '{other}'"));
@@ -414,6 +415,11 @@ impl McpServer {
         Ok(json!({ "tags": tags }))
     }
 
+    fn tool_board_stats(&self) -> Result<Value, String> {
+        let stats = ops::board_stats(&self.storage_path, &self.config)?;
+        serde_json::to_value(stats).map_err(|e| e.to_string())
+    }
+
     fn tool_sync_tasks(&self) -> Result<Value, String> {
         let report = ops::sync_tasks(&self.storage_path, &self.config)?;
         serde_json::to_value(report).map_err(|e| e.to_string())
@@ -604,6 +610,20 @@ fn tool_definitions(read_only: bool) -> Value {
         json!({
             "name": "list_archive",
             "description": "List completed tasks stored in the sibling archive.jsonl file.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "board_stats",
+            "description": "Return a summary of board counts (todo, in_progress, done, archived, overdue, due_today, recurring, 7-day completed count, and top tags).",
             "annotations": {
                 "readOnlyHint": true,
                 "destructiveHint": false,
@@ -1080,7 +1100,16 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(ro_names, vec!["list_tasks", "get_task", "list_tags", "list_archive"]);
+        assert_eq!(
+            ro_names,
+            vec![
+                "list_tasks",
+                "get_task",
+                "list_tags",
+                "list_archive",
+                "board_stats"
+            ]
+        );
         assert_eq!(
             ro_tools["result"]["tools"][0]["annotations"]["readOnlyHint"],
             true

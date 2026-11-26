@@ -195,6 +195,10 @@ pub enum SubCommand {
     /// List all tags and their task counts
     Tags,
 
+    /// Show a compact summary of board counts, due dates, velocity, and top tags
+    #[command(alias = "summary")]
+    Stats,
+
     /// Sync tasks over SSH with peers configured in config.toml
     Sync,
 
@@ -833,6 +837,73 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                         painter.colored(&padded, painter.theme.accent),
                         painter.muted(&count.to_string())
                     );
+                }
+            }
+        }
+        SubCommand::Stats => {
+            let stats = ops::board_stats(&path, cfg)?;
+            if json {
+                print_json(&stats)?;
+            } else {
+                println!(
+                    "{}  {} {}  {} {}  {} {}",
+                    painter.style("roke", painter.theme.text, true, false, false),
+                    painter.badge("○", painter.theme.todo),
+                    stats.todo,
+                    painter.badge("◐", painter.theme.in_progress),
+                    stats.in_progress,
+                    painter.badge("✓", painter.theme.done),
+                    stats.done,
+                );
+                let mut highlights: Vec<String> = Vec::new();
+                if stats.overdue > 0 {
+                    highlights.push(painter.style(
+                        &format!("{} overdue", stats.overdue),
+                        painter.theme.error,
+                        true,
+                        false,
+                        false,
+                    ));
+                }
+                if stats.due_today > 0 {
+                    highlights.push(painter.colored(
+                        &format!("{} due today", stats.due_today),
+                        painter.theme.in_progress,
+                    ));
+                }
+                if stats.high_priority_open > 0 {
+                    highlights.push(painter.colored(
+                        &format!("{} high priority", stats.high_priority_open),
+                        painter.theme.priority_high,
+                    ));
+                }
+                if stats.recurring > 0 {
+                    highlights.push(painter.subtle(&format!("↻ {} recurring", stats.recurring)));
+                }
+                if !highlights.is_empty() {
+                    println!("  {}", highlights.join("  ·  "));
+                }
+                println!(
+                    "  {}",
+                    painter.muted(&format!(
+                        "{} done (7d)  ·  {} archived  ·  {} total active",
+                        stats.completed_last_7_days, stats.archived, stats.total
+                    ))
+                );
+                if !stats.top_tags.is_empty() {
+                    let tag_line = stats
+                        .top_tags
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "{} {}",
+                                painter.colored(&format!("#{}", t.tag), painter.theme.accent),
+                                painter.muted(&t.count.to_string())
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    println!("  {tag_line}");
                 }
             }
         }

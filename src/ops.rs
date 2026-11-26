@@ -117,6 +117,22 @@ pub struct ArchiveReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardStats {
+    pub total: usize,
+    pub open: usize,
+    pub todo: usize,
+    pub in_progress: usize,
+    pub done: usize,
+    pub archived: usize,
+    pub overdue: usize,
+    pub due_today: usize,
+    pub recurring: usize,
+    pub high_priority_open: usize,
+    pub completed_last_7_days: usize,
+    pub top_tags: Vec<TagCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardSnapshot {
     pub total: usize,
     pub todo: usize,
@@ -572,6 +588,80 @@ pub fn unarchive_task(path: &Path, cfg: &AppConfig, selector: &str) -> Result<Ta
     Ok(out)
 }
 
+pub fn board_stats(path: &Path, cfg: &AppConfig) -> Result<BoardStats, String> {
+    let store = load_store(path, cfg)?;
+    let archive_store = load_store(&archive_path_for(path), cfg)?;
+    let today = today_ymd();
+    let seven_days_ago = now_millis().saturating_sub(7 * 24 * 60 * 60 * 1000);
+
+    let mut todo = 0usize;
+    let mut in_progress = 0usize;
+    let mut done = 0usize;
+    let mut overdue = 0usize;
+    let mut due_today = 0usize;
+    let mut recurring = 0usize;
+    let mut high_priority_open = 0usize;
+    let mut completed_last_7_days = 0usize;
+    let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for task in &store.tasks {
+        match task.status {
+            Status::Todo => todo += 1,
+            Status::InProgress => in_progress += 1,
+            Status::Done => {
+                done += 1;
+                if task.updated_at >= seven_days_ago {
+                    completed_last_7_days += 1;
+                }
+            }
+        }
+        if task.status != Status::Done {
+            if task.priority == Priority::High {
+                high_priority_open += 1;
+            }
+            match task.due_state(&today) {
+                Some(DueState::Overdue) => overdue += 1,
+                Some(DueState::Today) => due_today += 1,
+                _ => {}
+            }
+        }
+        if task.repeat.is_some() {
+            recurring += 1;
+        }
+        for tag in effective_tags_for(task, &cfg.sync) {
+            *tag_counts.entry(tag).or_insert(0) += 1;
+        }
+    }
+
+    for task in &archive_store.tasks {
+        if task.updated_at >= seven_days_ago {
+            completed_last_7_days += 1;
+        }
+    }
+
+    let mut top_tags: Vec<TagCount> = tag_counts
+        .into_iter()
+        .map(|(tag, count)| TagCount { tag, count })
+        .collect();
+    top_tags.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tag.cmp(&b.tag)));
+    top_tags.truncate(8);
+
+    Ok(BoardStats {
+        total: store.tasks.len(),
+        open: todo + in_progress,
+        todo,
+        in_progress,
+        done,
+        archived: archive_store.tasks.len(),
+        overdue,
+        due_today,
+        recurring,
+        high_priority_open,
+        completed_last_7_days,
+        top_tags,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,6 +936,62 @@ mod tests {
         .unwrap();
         assert_eq!(updated.status, Status::Todo);
         assert_eq!(updated.due.as_deref(), Some("2099-01-08"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn board_stats_summarizes_counts_overdue_and_top_tags() {
+        let path = temp_store_path("stats");
+        let cfg = AppConfig::default();
+
+        add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Overdue high".into(),
+                priority: Priority::High,
+                tags: vec!["work".into(), "ops".into()],
+                due: Some("2020-01-01".into()),
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+        add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Doing".into(),
+                status: Status::InProgress,
+                tags: vec!["work".into()],
+                repeat: Some("weekly".into()),
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+        add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Shipped".into(),
+                status: Status::Done,
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+
+        let stats = board_stats(&path, &cfg).unwrap();
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.open, 2);
+        assert_eq!(stats.todo, 1);
+        assert_eq!(stats.in_progress, 1);
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.overdue, 1);
+        assert_eq!(stats.high_priority_open, 1);
+        assert_eq!(stats.recurring, 1);
+        assert_eq!(stats.completed_last_7_days, 1);
+        assert_eq!(stats.top_tags[0].tag, "work");
+        assert_eq!(stats.top_tags[0].count, 2);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
