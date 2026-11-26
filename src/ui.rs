@@ -245,7 +245,7 @@ fn status_filter_row_width(app: &App) -> u16 {
             .store
             .tasks
             .iter()
-            .filter(|t| filter.matches(t.status) && app.matches_tag(t))
+            .filter(|t| filter.matches(t.status) && app.matches_tag(t) && app.matches_search(t))
             .count();
         let label_w = (filter.label().len() + 1 + count.to_string().len()) as u16;
         if idx > 0 {
@@ -359,7 +359,7 @@ fn render_filter_bar(
             .store
             .tasks
             .iter()
-            .filter(|t| filter.matches(t.status) && app.matches_tag(t))
+            .filter(|t| filter.matches(t.status) && app.matches_tag(t) && app.matches_search(t))
             .count();
         let label = format!("{} {}", filter.label(), count);
         let w = label.len() as u16;

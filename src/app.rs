@@ -456,7 +456,7 @@ impl App {
         tags
     }
 
-    fn matches_search(&self, task: &Task) -> bool {
+    pub fn matches_search(&self, task: &Task) -> bool {
         let q = self.active_search_text().trim().to_lowercase();
         if q.is_empty() {
             return true;
@@ -2241,6 +2241,17 @@ inject_device_tag = true
         }
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.filtered_todo_ids().len(), 1);
+
+        // Status filter pill counts must reflect active search query ("All 1", "To Do 1", "Done 0")
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let row_y = app.regions.filter_pills[0].1.y;
+        let line: String = (0..80).map(|x| buf[(x, row_y)].symbol()).collect();
+        assert!(line.contains("All 1"), "expected 'All 1' in filter bar, got: {line}");
+        assert!(line.contains("To Do 1"), "expected 'To Do 1' in filter bar, got: {line}");
+        assert!(line.contains("Done 0"), "expected 'Done 0' in filter bar, got: {line}");
     }
 
     #[test]
