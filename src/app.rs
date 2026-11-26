@@ -348,7 +348,11 @@ pub enum Mode {
     Search,
     TaskModal(TaskForm),
     TagFilter(usize),
-    NotesPreview { task_id: u64, scroll: u16 },
+    NotesPreview {
+        task_id: u64,
+        scroll: u16,
+        selected_check: usize,
+    },
     Help(u16),
 }
 
@@ -410,6 +414,7 @@ pub struct LayoutRegions {
     pub modal: Option<ModalRegions>,
     pub tag_modal: Option<TagModalRegions>,
     pub notes_modal: Option<Rect>,
+    pub notes_check_rows: Vec<(usize, Rect)>,
     pub help_modal: Option<Rect>,
 }
 
@@ -432,6 +437,7 @@ impl LayoutRegions {
         self.modal = None;
         self.tag_modal = None;
         self.notes_modal = None;
+        self.notes_check_rows.clear();
         self.help_modal = None;
     }
 }
@@ -882,14 +888,45 @@ impl App {
         }
     }
 
+    fn toggle_notes_checklist(&mut self, task_id: u64, check_idx: usize) {
+        if self.store.get(task_id).is_none() {
+            return;
+        }
+        self.push_undo();
+        let toggled = self
+            .store
+            .get_mut(task_id)
+            .and_then(|t| t.toggle_checklist_item(check_idx));
+        if let Some(checked) = toggled {
+            self.persist();
+            self.set_message(if checked {
+                "Checked item"
+            } else {
+                "Unchecked item"
+            });
+        } else {
+            self.undo_stack.pop();
+        }
+    }
+
     fn handle_notes_preview_key(&mut self, key: KeyEvent) {
         let Mode::NotesPreview {
             task_id,
             mut scroll,
+            mut selected_check,
         } = self.mode
         else {
             return;
         };
+        let total_checks = self
+            .store
+            .get(task_id)
+            .and_then(|t| t.checklist_progress())
+            .map(|(_, total)| total)
+            .unwrap_or(0);
+        if total_checks > 0 && selected_check >= total_checks {
+            selected_check = total_checks - 1;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => {
                 self.mode = Mode::Normal;
@@ -913,6 +950,19 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => {
                 scroll = u16::MAX;
             }
+            KeyCode::Tab | KeyCode::Char(']') if total_checks > 0 => {
+                selected_check = (selected_check + 1) % total_checks;
+            }
+            KeyCode::BackTab | KeyCode::Char('[') if total_checks > 0 => {
+                selected_check = if selected_check == 0 {
+                    total_checks - 1
+                } else {
+                    selected_check - 1
+                };
+            }
+            KeyCode::Char(' ') | KeyCode::Enter if total_checks > 0 => {
+                self.toggle_notes_checklist(task_id, selected_check);
+            }
             KeyCode::Char('n') => {
                 self.pending_editor = Some(PendingEditor::Task(task_id));
             }
@@ -924,7 +974,11 @@ impl App {
             }
             _ => {}
         }
-        self.mode = Mode::NotesPreview { task_id, scroll };
+        self.mode = Mode::NotesPreview {
+            task_id,
+            scroll,
+            selected_check,
+        };
     }
 
     fn handle_tag_filter_key(&mut self, key: KeyEvent) {
@@ -1372,6 +1426,7 @@ impl App {
                     self.mode = Mode::NotesPreview {
                         task_id: id,
                         scroll: 0,
+                        selected_check: 0,
                     };
                 }
             }
@@ -1933,12 +1988,29 @@ impl App {
                 }
                 return;
             }
-            Mode::NotesPreview { task_id, scroll } => {
+            Mode::NotesPreview {
+                task_id,
+                scroll,
+                selected_check,
+            } => {
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(area) = self.regions.notes_modal {
                             if !rect_contains(area, x, y) {
                                 self.mode = Mode::Normal;
+                            } else {
+                                let checks = self.regions.notes_check_rows.clone();
+                                for (check_idx, rect) in checks {
+                                    if rect_contains(rect, x, y) {
+                                        self.toggle_notes_checklist(task_id, check_idx);
+                                        self.mode = Mode::NotesPreview {
+                                            task_id,
+                                            scroll,
+                                            selected_check: check_idx,
+                                        };
+                                        return;
+                                    }
+                                }
                             }
                         } else {
                             self.mode = Mode::Normal;
@@ -1948,12 +2020,14 @@ impl App {
                         self.mode = Mode::NotesPreview {
                             task_id,
                             scroll: scroll.saturating_add(2),
+                            selected_check,
                         };
                     }
                     MouseEventKind::ScrollUp => {
                         self.mode = Mode::NotesPreview {
                             task_id,
                             scroll: scroll.saturating_sub(2),
+                            selected_check,
                         };
                     }
                     _ => {}
@@ -3041,18 +3115,28 @@ default_sort = "priority"
         );
         assert_eq!(app.store.get(1).unwrap().checklist_progress(), Some((1, 2)));
 
-        // Open read-only Markdown notes preview with 'v' and scroll/close
+        // Open read-only Markdown notes preview with 'v' and toggle checklist interactively
         app.handle_key(key(KeyCode::Char('v')));
         assert!(matches!(
             app.mode,
             Mode::NotesPreview {
                 task_id: 1,
-                scroll: 0
+                scroll: 0,
+                selected_check: 0
             }
         ));
         let preview_backend = TestBackend::new(80, 24);
         let mut preview_terminal = Terminal::new(preview_backend).unwrap();
         preview_terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        // Space toggles item 0 (`- [ ] Step 1` -> `- [x] Step 1`)
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.store.get(1).unwrap().checklist_progress(), Some((2, 2)));
+        assert!(app.store.get(1).unwrap().description.contains("- [x] Step 1"));
+        // Tab moves to item 1 (`- [x] Step 2`) and Space unchecks it
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.store.get(1).unwrap().checklist_progress(), Some((1, 2)));
+        assert!(app.store.get(1).unwrap().description.contains("- [ ] Step 2"));
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Normal));

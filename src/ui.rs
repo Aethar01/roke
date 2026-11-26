@@ -65,8 +65,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_task_modal(frame, app, &form_clone);
     } else if let Mode::TagFilter(sel) = app.mode {
         render_tag_filter_modal(frame, app, sel);
-    } else if let Mode::NotesPreview { task_id, scroll } = app.mode {
-        render_notes_preview_modal(frame, app, task_id, scroll);
+    } else if let Mode::NotesPreview {
+        task_id,
+        scroll,
+        selected_check,
+    } = app.mode
+    {
+        render_notes_preview_modal(frame, app, task_id, scroll, selected_check);
     } else if let Mode::Help(scroll) = app.mode {
         render_help_modal(frame, app, scroll);
     }
@@ -1726,7 +1731,13 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
     });
 }
 
-fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, scroll: u16) {
+fn render_notes_preview_modal(
+    frame: &mut Frame,
+    app: &mut App,
+    task_id: u64,
+    scroll: u16,
+    selected_check: usize,
+) {
     let Some(task) = app.store.get(task_id).cloned() else {
         app.mode = Mode::Normal;
         return;
@@ -1736,6 +1747,12 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
     let area = centered_rect(72, 22, frame.area());
     frame.render_widget(Clear, area);
     app.regions.notes_modal = Some(area);
+    let total_checks = task.checklist_progress().map(|(_, t)| t).unwrap_or(0);
+    let clamped_check = if total_checks > 0 {
+        selected_check.min(total_checks - 1)
+    } else {
+        0
+    };
 
     let title_label = format!(
         " {} ",
@@ -1770,6 +1787,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut check_line_map: Vec<(usize, usize)> = Vec::new(); // (line_idx, check_idx)
     if !eff_tags.is_empty() || task.due.is_some() || task.checklist_progress().is_some() {
         let mut meta_spans: Vec<Span<'static>> = Vec::new();
         for (i, tag) in eff_tags.iter().enumerate() {
@@ -1823,6 +1841,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
         )));
     } else {
         let mut in_code_fence = false;
+        let mut check_idx = 0usize;
         for raw_line in task.description.lines() {
             let trimmed = raw_line.trim_start();
             if trimmed.starts_with("```") {
@@ -1864,13 +1883,22 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
                 .or_else(|| trimmed.strip_prefix("+ [X] "))
             {
                 let indent = &raw_line[..raw_line.len() - trimmed.len()];
+                let is_cur = check_idx == clamped_check;
+                let prefix = if is_cur {
+                    Span::styled("▸ ", Style::default().fg(theme.accent))
+                } else {
+                    Span::raw("  ")
+                };
+                check_line_map.push((lines.len(), check_idx));
+                check_idx += 1;
                 lines.push(Line::from(vec![
+                    prefix,
                     Span::raw(indent.to_string()),
                     Span::styled("✓ ", Style::default().fg(theme.done)),
                     Span::styled(
                         rest.to_string(),
                         Style::default()
-                            .fg(theme.muted)
+                            .fg(if is_cur { theme.subtle } else { theme.muted })
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
                 ]));
@@ -1880,10 +1908,26 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
                 .or_else(|| trimmed.strip_prefix("+ [ ] "))
             {
                 let indent = &raw_line[..raw_line.len() - trimmed.len()];
+                let is_cur = check_idx == clamped_check;
+                let prefix = if is_cur {
+                    Span::styled("▸ ", Style::default().fg(theme.accent))
+                } else {
+                    Span::raw("  ")
+                };
+                check_line_map.push((lines.len(), check_idx));
+                check_idx += 1;
                 lines.push(Line::from(vec![
+                    prefix,
                     Span::raw(indent.to_string()),
                     Span::styled("○ ", Style::default().fg(theme.todo)),
-                    Span::styled(rest.to_string(), Style::default().fg(theme.text)),
+                    Span::styled(
+                        rest.to_string(),
+                        Style::default().fg(theme.text).add_modifier(if is_cur {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                    ),
                 ]));
             } else if let Some(rest) = trimmed.strip_prefix("> ") {
                 lines.push(Line::from(vec![
@@ -1917,17 +1961,38 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
 
     let body_h = inner.height.saturating_sub(2);
     let body_rect = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), body_h);
-    let total_visual: u16 = lines
+    let row_counts: Vec<u16> = lines
         .iter()
         .map(|l| visual_line_rows(l, body_rect.width))
-        .sum();
+        .collect();
+    let total_visual: u16 = row_counts.iter().copied().sum();
     let max_scroll = total_visual.saturating_sub(body_h);
     let clamped_scroll = scroll.min(max_scroll);
-    if clamped_scroll != scroll {
+    if clamped_scroll != scroll || clamped_check != selected_check {
         app.mode = Mode::NotesPreview {
             task_id,
             scroll: clamped_scroll,
+            selected_check: clamped_check,
         };
+    }
+
+    // Map visible checklist rows to screen rectangles for mouse toggling
+    let mut visual_y = 0u16;
+    let mut check_iter = check_line_map.into_iter().peekable();
+    for (line_idx, &rows) in row_counts.iter().enumerate() {
+        if let Some(&(ci_line, check_idx)) = check_iter.peek() {
+            if ci_line == line_idx {
+                check_iter.next();
+                if visual_y >= clamped_scroll && visual_y < clamped_scroll.saturating_add(body_h) {
+                    let screen_y = body_rect.y + (visual_y - clamped_scroll);
+                    app.regions.notes_check_rows.push((
+                        check_idx,
+                        Rect::new(body_rect.x, screen_y, body_rect.width, rows.min(body_rect.bottom().saturating_sub(screen_y))),
+                    ));
+                }
+            }
+        }
+        visual_y = visual_y.saturating_add(rows);
     }
 
     frame.render_widget(
@@ -1938,10 +2003,17 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
     );
 
     let footer_y = inner.bottom().saturating_sub(1);
-    let hint = format!(
-        "j/k scroll · n edit in {} · e edit task · esc close",
-        app.editor_label
-    );
+    let hint = if total_checks > 0 {
+        format!(
+            "j/k scroll · tab/space toggle check · n {} · e edit · esc close",
+            app.editor_label
+        )
+    } else {
+        format!(
+            "j/k scroll · n edit in {} · e edit task · esc close",
+            app.editor_label
+        )
+    };
     frame.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(theme.muted))),
         Rect::new(inner.x + 1, footer_y, inner.width.saturating_sub(2), 1),
@@ -2324,6 +2396,7 @@ mod tests {
         app.mode = Mode::NotesPreview {
             task_id: id,
             scroll: u16::MAX,
+            selected_check: 0,
         };
 
         let backend = TestBackend::new(60, 16);

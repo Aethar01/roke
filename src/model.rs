@@ -725,22 +725,57 @@ impl Task {
         let mut done = 0usize;
         let mut total = 0usize;
         for line in self.description.lines() {
-            let trimmed = line.trim_start();
-            let rest = trimmed
-                .strip_prefix("- ")
-                .or_else(|| trimmed.strip_prefix("* "))
-                .or_else(|| trimmed.strip_prefix("+ "));
-            if let Some(after_bullet) = rest {
-                let after_bullet = after_bullet.trim_start();
-                if after_bullet.starts_with("[ ]") {
-                    total += 1;
-                } else if after_bullet.starts_with("[x]") || after_bullet.starts_with("[X]") {
-                    total += 1;
+            if let Some(checked) = parse_checklist_line(line) {
+                total += 1;
+                if checked {
                     done += 1;
                 }
             }
         }
         (total > 0).then_some((done, total))
+    }
+
+    /// Toggle the `check_idx`-th Markdown checklist item (`[ ]` <-> `[x]`) in `description`.
+    /// Returns `Some(is_now_checked)` on success.
+    pub fn toggle_checklist_item(&mut self, check_idx: usize) -> Option<bool> {
+        let mut lines: Vec<String> = self.description.lines().map(str::to_string).collect();
+        let mut seen = 0usize;
+        for line in &mut lines {
+            if let Some(checked) = parse_checklist_line(line) {
+                if seen == check_idx {
+                    let trimmed = line.trim_start();
+                    let indent_len = line.len() - trimmed.len();
+                    // Find `[ ]` / `[x]` / `[X]` right after the bullet (`- `, `* `, `+ `)
+                    let after_bullet_offset = indent_len + 2;
+                    let rest = &line[after_bullet_offset..];
+                    let ws_len = rest.len() - rest.trim_start().len();
+                    let box_start = after_bullet_offset + ws_len;
+                    let replacement = if checked { "[ ]" } else { "[x]" };
+                    line.replace_range(box_start..box_start + 3, replacement);
+                    self.description = lines.join("\n");
+                    self.touch();
+                    return Some(!checked);
+                }
+                seen += 1;
+            }
+        }
+        None
+    }
+}
+
+pub(crate) fn parse_checklist_line(line: &str) -> Option<bool> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))?;
+    let after = rest.trim_start();
+    if after.starts_with("[ ]") {
+        Some(false)
+    } else if after.starts_with("[x]") || after.starts_with("[X]") {
+        Some(true)
+    } else {
+        None
     }
 }
 
