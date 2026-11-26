@@ -65,6 +65,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_task_modal(frame, app, &form_clone);
     } else if let Mode::TagFilter(sel) = app.mode {
         render_tag_filter_modal(frame, app, sel);
+    } else if let Mode::NotesPreview { task_id, scroll } = app.mode {
+        render_notes_preview_modal(frame, app, task_id, scroll);
     } else if matches!(app.mode, Mode::Help) {
         render_help_modal(frame, app);
     }
@@ -765,6 +767,17 @@ fn render_todo_card(
             Span::raw("   "),
             Span::styled(preview, Style::default().fg(theme.muted)),
         ];
+        if let Some((done, total)) = task.checklist_progress() {
+            let color = if done == total {
+                theme.done
+            } else {
+                theme.accent
+            };
+            spans.push(Span::styled(
+                format!("  [{done}/{total}]"),
+                Style::default().fg(color),
+            ));
+        }
         if extra_lines > 0 {
             spans.push(Span::styled(
                 format!("  [md +{extra_lines}]"),
@@ -1061,13 +1074,26 @@ fn render_kanban_card(
 
     if has_desc {
         let (preview, extra_lines) = markdown_preview(&task.description);
-        let text = if extra_lines > 0 {
-            format!("{preview} [md +{extra_lines}]")
-        } else {
-            preview
-        };
+        let mut spans = vec![Span::styled(preview, Style::default().fg(theme.muted))];
+        if let Some((done, total)) = task.checklist_progress() {
+            let color = if done == total {
+                theme.done
+            } else {
+                theme.accent
+            };
+            spans.push(Span::styled(
+                format!(" [{done}/{total}]"),
+                Style::default().fg(color),
+            ));
+        }
+        if extra_lines > 0 {
+            spans.push(Span::styled(
+                format!(" [md +{extra_lines}]"),
+                Style::default().fg(theme.subtle),
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(theme.muted))),
+            Paragraph::new(Line::from(spans)),
             Rect::new(padded.x, padded.y + title_h, padded.width, 1),
         );
     }
@@ -1534,9 +1560,206 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
     });
 }
 
+fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, scroll: u16) {
+    let Some(task) = app.store.get(task_id).cloned() else {
+        app.mode = Mode::Normal;
+        return;
+    };
+    let theme = app.theme.clone();
+    let eff_tags = app.effective_tags(&task);
+    let area = centered_rect(72, 22, frame.area());
+    frame.render_widget(Clear, area);
+    app.regions.notes_modal = Some(area);
+
+    let title_label = format!(" {} ", truncate_to_width(&task.title, area.width.saturating_sub(24) as usize));
+    let meta_badge = format!(" {} {} · {} ", task.status.glyph(), task.status.label(), task.priority.label());
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(
+            title_label,
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title(
+            Line::from(Span::styled(
+                meta_badge,
+                Style::default().fg(status_color(&theme, task.status)),
+            ))
+            .alignment(Alignment::Right),
+        );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    if inner.width < 6 || inner.height < 3 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !eff_tags.is_empty() || task.checklist_progress().is_some() {
+        let mut meta_spans: Vec<Span<'static>> = Vec::new();
+        for (i, tag) in eff_tags.iter().enumerate() {
+            if i > 0 {
+                meta_spans.push(Span::raw(" "));
+            }
+            meta_spans.push(Span::styled(
+                format!("#{tag}"),
+                Style::default().fg(theme.accent),
+            ));
+        }
+        if let Some((done, total)) = task.checklist_progress() {
+            if !meta_spans.is_empty() {
+                meta_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
+            }
+            meta_spans.push(Span::styled(
+                format!("Checklist {done}/{total}"),
+                Style::default().fg(if done == total {
+                    theme.done
+                } else {
+                    theme.subtle
+                }),
+            ));
+        }
+        lines.push(Line::from(meta_spans));
+        lines.push(Line::raw(""));
+    }
+
+    if task.description.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("No notes yet. Press 'n' to write Markdown in {}.", app.editor_label),
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        let mut in_code_fence = false;
+        for raw_line in task.description.lines() {
+            let trimmed = raw_line.trim_start();
+            if trimmed.starts_with("```") {
+                in_code_fence = !in_code_fence;
+                lines.push(Line::from(Span::styled(
+                    raw_line.to_string(),
+                    Style::default().fg(theme.muted),
+                )));
+                continue;
+            }
+            if in_code_fence {
+                lines.push(Line::from(Span::styled(
+                    raw_line.to_string(),
+                    Style::default().fg(theme.subtle),
+                )));
+                continue;
+            }
+            if let Some(heading) = trimmed.strip_prefix("# ") {
+                lines.push(Line::from(Span::styled(
+                    heading.to_string(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                )));
+            } else if let Some(heading) = trimmed
+                .strip_prefix("## ")
+                .or_else(|| trimmed.strip_prefix("### "))
+            {
+                lines.push(Line::from(Span::styled(
+                    heading.to_string(),
+                    Style::default()
+                        .fg(theme.text)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else if let Some(rest) = trimmed
+                .strip_prefix("- [x] ")
+                .or_else(|| trimmed.strip_prefix("- [X] "))
+                .or_else(|| trimmed.strip_prefix("* [x] "))
+                .or_else(|| trimmed.strip_prefix("* [X] "))
+            {
+                let indent = &raw_line[..raw_line.len() - trimmed.len()];
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled("✓ ", Style::default().fg(theme.done)),
+                    Span::styled(
+                        rest.to_string(),
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ),
+                ]));
+            } else if let Some(rest) = trimmed
+                .strip_prefix("- [ ] ")
+                .or_else(|| trimmed.strip_prefix("* [ ] "))
+            {
+                let indent = &raw_line[..raw_line.len() - trimmed.len()];
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled("○ ", Style::default().fg(theme.todo)),
+                    Span::styled(rest.to_string(), Style::default().fg(theme.text)),
+                ]));
+            } else if let Some(rest) = trimmed.strip_prefix("> ") {
+                lines.push(Line::from(vec![
+                    Span::styled("│ ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        rest.to_string(),
+                        Style::default()
+                            .fg(theme.subtle)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            } else if let Some(rest) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                let indent = &raw_line[..raw_line.len() - trimmed.len()];
+                lines.push(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled("• ", Style::default().fg(theme.accent)),
+                    Span::styled(rest.to_string(), Style::default().fg(theme.text)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    raw_line.to_string(),
+                    Style::default().fg(theme.text),
+                )));
+            }
+        }
+    }
+
+    let body_h = inner.height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(body_h);
+    let clamped_scroll = scroll.min(max_scroll);
+    if clamped_scroll != scroll {
+        app.mode = Mode::NotesPreview {
+            task_id,
+            scroll: clamped_scroll,
+        };
+    }
+
+    let body_rect = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        body_h,
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((clamped_scroll, 0)),
+        body_rect,
+    );
+
+    let footer_y = inner.bottom().saturating_sub(1);
+    let hint = format!(
+        "j/k scroll · n edit in {} · e edit task · esc close",
+        app.editor_label
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(theme.muted))),
+        Rect::new(inner.x + 1, footer_y, inner.width.saturating_sub(2), 1),
+    );
+}
+
 fn render_help_modal(frame: &mut Frame, app: &mut App) {
     let theme = app.theme.clone();
-    let area = centered_rect(58, 24, frame.area());
+    let area = centered_rect(58, 25, frame.area());
     frame.render_widget(Clear, area);
     app.regions.help_modal = Some(area);
 
@@ -1550,6 +1773,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_section(&theme, "Tasks"),
         help_row(&theme, "a / o", "New task"),
         help_row(&theme, "e / i / Enter", "Edit task"),
+        help_row(&theme, "v", "Preview task & Markdown notes"),
         help_row(
             &theme,
             "n",

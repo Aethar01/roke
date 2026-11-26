@@ -281,6 +281,29 @@ impl Task {
             now
         };
     }
+
+    /// Count Markdown checklist items (`- [ ]` / `- [x]`) in `description`.
+    pub fn checklist_progress(&self) -> Option<(usize, usize)> {
+        let mut done = 0usize;
+        let mut total = 0usize;
+        for line in self.description.lines() {
+            let trimmed = line.trim_start();
+            let rest = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .or_else(|| trimmed.strip_prefix("+ "));
+            if let Some(after_bullet) = rest {
+                let after_bullet = after_bullet.trim_start();
+                if after_bullet.starts_with("[ ]") {
+                    total += 1;
+                } else if after_bullet.starts_with("[x]") || after_bullet.starts_with("[X]") {
+                    total += 1;
+                    done += 1;
+                }
+            }
+        }
+        (total > 0).then_some((done, total))
+    }
 }
 
 pub fn parse_tags(input: &str) -> Vec<String> {

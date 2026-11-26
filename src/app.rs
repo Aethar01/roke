@@ -335,6 +335,7 @@ pub enum Mode {
     Search,
     TaskModal(TaskForm),
     TagFilter(usize),
+    NotesPreview { task_id: u64, scroll: u16 },
     Help,
 }
 
@@ -391,6 +392,7 @@ pub struct LayoutRegions {
     pub kanban_cards: Vec<(u64, Status, Rect)>,
     pub modal: Option<ModalRegions>,
     pub tag_modal: Option<TagModalRegions>,
+    pub notes_modal: Option<Rect>,
     pub help_modal: Option<Rect>,
 }
 
@@ -411,6 +413,7 @@ impl LayoutRegions {
         self.kanban_cards.clear();
         self.modal = None;
         self.tag_modal = None;
+        self.notes_modal = None;
         self.help_modal = None;
     }
 }
@@ -826,8 +829,50 @@ impl App {
             Mode::Search => self.handle_search_key(key),
             Mode::TaskModal(_) => self.handle_modal_key(key),
             Mode::TagFilter(_) => self.handle_tag_filter_key(key),
+            Mode::NotesPreview { .. } => self.handle_notes_preview_key(key),
             Mode::Help => self.handle_help_key(key),
         }
+    }
+
+    fn handle_notes_preview_key(&mut self, key: KeyEvent) {
+        let Mode::NotesPreview { task_id, mut scroll } = self.mode else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                scroll = scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                scroll = scroll.saturating_sub(1);
+            }
+            KeyCode::Char('d') | KeyCode::PageDown => {
+                scroll = scroll.saturating_add(8);
+            }
+            KeyCode::Char('u') | KeyCode::PageUp => {
+                scroll = scroll.saturating_sub(8);
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                scroll = 0;
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                scroll = u16::MAX;
+            }
+            KeyCode::Char('n') => {
+                self.pending_editor = Some(PendingEditor::Task(task_id));
+            }
+            KeyCode::Char('e') => {
+                self.mode = Mode::Normal;
+                self.select_task_by_id(task_id);
+                self.open_edit_modal();
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::NotesPreview { task_id, scroll };
     }
 
     fn handle_tag_filter_key(&mut self, key: KeyEvent) {
@@ -1214,6 +1259,14 @@ impl App {
             }
             KeyCode::Char('n') => {
                 self.open_notes_in_editor();
+            }
+            KeyCode::Char('v') => {
+                if let Some(id) = self.selected_task_id() {
+                    self.mode = Mode::NotesPreview {
+                        task_id: id,
+                        scroll: 0,
+                    };
+                }
             }
             KeyCode::Char(' ') => {
                 self.toggle_or_advance_selected();
@@ -1689,6 +1742,33 @@ impl App {
                     }
                     MouseEventKind::ScrollUp => {
                         self.mode = Mode::TagFilter(sel.saturating_sub(1));
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Mode::NotesPreview { task_id, scroll } => {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(area) = self.regions.notes_modal {
+                            if !rect_contains(area, x, y) {
+                                self.mode = Mode::Normal;
+                            }
+                        } else {
+                            self.mode = Mode::Normal;
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.mode = Mode::NotesPreview {
+                            task_id,
+                            scroll: scroll.saturating_add(2),
+                        };
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.mode = Mode::NotesPreview {
+                            task_id,
+                            scroll: scroll.saturating_sub(2),
+                        };
                     }
                     _ => {}
                 }
@@ -2535,6 +2615,17 @@ inject_device_tag = true
             app.store.get(1).unwrap().description,
             "# Alpha Notes\n- [ ] Step 1\n- [x] Step 2"
         );
+        assert_eq!(app.store.get(1).unwrap().checklist_progress(), Some((1, 2)));
+
+        // Open read-only Markdown notes preview with 'v' and scroll/close
+        app.handle_key(key(KeyCode::Char('v')));
+        assert!(matches!(app.mode, Mode::NotesPreview { task_id: 1, scroll: 0 }));
+        let preview_backend = TestBackend::new(80, 24);
+        let mut preview_terminal = Terminal::new(preview_backend).unwrap();
+        preview_terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
 
         // Press 'e' then Ctrl-E inside modal to open modal notes in $EDITOR
         app.handle_key(key(KeyCode::Char('e')));
