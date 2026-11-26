@@ -200,6 +200,24 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
+    if !app.marked_ids.is_empty() {
+        let mark_label = format!("◆ {} marked", app.marked_ids.len());
+        let mark_w = mark_label.width() as u16;
+        if right_edge > x + mark_w + 1 {
+            right_edge -= mark_w + 2;
+            let rect = Rect::new(right_edge, y, mark_w, 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    mark_label,
+                    Style::default()
+                        .fg(theme.drag)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                rect,
+            );
+        }
+    }
+
     if app.due_focus {
         let due_label = "@ due";
         let due_w = due_label.width() as u16;
@@ -800,6 +818,7 @@ fn render_todo_list(frame: &mut Frame, app: &mut App, area: Rect) {
             .push((task_id, card_rect, checkbox_rect));
 
         let is_selected = idx == app.todo_selected;
+        let is_marked = app.is_marked(task_id);
         let eff_tags = app.effective_tags(&task);
         render_todo_card(
             frame,
@@ -808,6 +827,7 @@ fn render_todo_list(frame: &mut Frame, app: &mut App, area: Rect) {
             &eff_tags,
             card_rect,
             is_selected,
+            is_marked,
             show_status_tag,
             &app.tag_filters,
         );
@@ -836,10 +856,17 @@ fn render_todo_card(
     tags: &[String],
     rect: Rect,
     selected: bool,
+    marked: bool,
     show_status_tag: bool,
     active_tags: &[String],
 ) {
-    let border_color = if selected { theme.accent } else { theme.muted };
+    let border_color = if selected {
+        theme.accent
+    } else if marked {
+        theme.drag
+    } else {
+        theme.muted
+    };
 
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -899,11 +926,15 @@ fn render_todo_card(
         Style::default().fg(theme.subtle)
     };
 
-    let mut lines = vec![Line::from(vec![
-        Span::raw(" "),
-        glyph,
-        Span::styled(task.title.clone(), title_style),
-    ])];
+    let mut title_spans = vec![Span::raw(" "), glyph];
+    if marked {
+        title_spans.push(Span::styled(
+            "◆ ",
+            Style::default().fg(theme.drag).add_modifier(Modifier::BOLD),
+        ));
+    }
+    title_spans.push(Span::styled(task.title.clone(), title_style));
+    let mut lines = vec![Line::from(title_spans)];
 
     if inner.height >= 2 && !task.description.is_empty() {
         let (preview, extra_lines) = markdown_preview(&task.description);
@@ -1120,6 +1151,7 @@ fn render_kanban_view(frame: &mut Frame, app: &mut App, area: Rect) {
             app.regions.kanban_cards.push((task_id, status, card_rect));
 
             let is_selected = is_focused && idx == selected;
+            let is_marked = app.is_marked(task_id);
             let is_being_dragged = app
                 .drag
                 .as_ref()
@@ -1133,6 +1165,7 @@ fn render_kanban_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 &eff_tags,
                 card_rect,
                 is_selected,
+                is_marked,
                 is_being_dragged,
                 &app.tag_filters,
             );
@@ -1163,6 +1196,7 @@ fn render_kanban_card(
     tags: &[String],
     rect: Rect,
     selected: bool,
+    marked: bool,
     dragging: bool,
     active_tags: &[String],
 ) {
@@ -1170,6 +1204,8 @@ fn render_kanban_card(
         theme.drag
     } else if selected {
         theme.accent
+    } else if marked {
+        theme.drag
     } else {
         theme.muted
     };
@@ -1238,8 +1274,19 @@ fn render_kanban_card(
         padded.height
     };
 
+    let title_line = if marked {
+        Line::from(vec![
+            Span::styled(
+                "◆ ",
+                Style::default().fg(theme.drag).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(task.title.clone(), title_style),
+        ])
+    } else {
+        Line::from(Span::styled(task.title.clone(), title_style))
+    };
     frame.render_widget(
-        Paragraph::new(Span::styled(task.title.clone(), title_style)).wrap(Wrap { trim: true }),
+        Paragraph::new(title_line).wrap(Wrap { trim: true }),
         Rect::new(padded.x, padded.y, padded.width, title_h),
     );
 
@@ -2233,6 +2280,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(&theme, "O", "Cycle sort (manual/priority/due/updated)"),
         help_row(&theme, "t / T", "Filter tags / edit tags"),
         help_row(&theme, "D / @", "Edit due date / toggle due-today focus"),
+        help_row(&theme, "m / M", "Mark task / mark all or clear marks"),
         help_row(&theme, "S", "Sync via SSH"),
         help_row(&theme, "d / x", "Delete task"),
         help_row(&theme, "A", "Archive all Done tasks"),

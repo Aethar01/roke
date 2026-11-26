@@ -508,6 +508,7 @@ pub struct App {
     pub todo_filter: TodoFilter,
     pub sort_order: SortOrder,
     pub due_focus: bool,
+    pub marked_ids: Vec<u64>,
     pub tag_filters: Vec<String>,
     pub tag_match_mode: TagMatchMode,
     pub todo_selected: usize,
@@ -599,6 +600,7 @@ impl App {
             todo_filter: initial_filter,
             sort_order: initial_sort,
             due_focus: false,
+            marked_ids: Vec::new(),
             tag_filters: Vec::new(),
             tag_match_mode: TagMatchMode::All,
             todo_selected: 0,
@@ -749,7 +751,47 @@ impl App {
         }
     }
 
+    pub fn is_marked(&self, task_id: u64) -> bool {
+        self.marked_ids.contains(&task_id)
+    }
+
+    pub fn toggle_mark_selected(&mut self) {
+        let Some(id) = self.selected_task_id() else {
+            return;
+        };
+        if let Some(pos) = self.marked_ids.iter().position(|&m| m == id) {
+            self.marked_ids.remove(pos);
+        } else {
+            self.marked_ids.push(id);
+        }
+        self.move_selection_down();
+        if self.marked_ids.is_empty() {
+            self.set_message("Marks cleared");
+        } else {
+            self.set_message(format!("{} marked", self.marked_ids.len()));
+        }
+    }
+
+    pub fn toggle_mark_all_visible(&mut self) {
+        if !self.marked_ids.is_empty() {
+            self.marked_ids.clear();
+            self.set_message("Marks cleared");
+            return;
+        }
+        let visible = match self.view {
+            View::TodoList => self.filtered_todo_ids(),
+            View::Kanban => self.column_task_ids(self.current_kanban_status()),
+        };
+        if visible.is_empty() {
+            return;
+        }
+        self.marked_ids = visible;
+        self.set_message(format!("Marked {} tasks", self.marked_ids.len()));
+    }
+
     pub fn clamp_selections(&mut self) {
+        self.marked_ids
+            .retain(|&id| self.store.tasks.iter().any(|t| t.id == id));
         let existing_tags = self.all_tags();
         self.tag_filters
             .retain(|active_tag| existing_tags.iter().any(|t| t == active_tag));
@@ -1737,6 +1779,12 @@ impl App {
             KeyCode::Char('Y') => {
                 self.yank_selected(true);
             }
+            KeyCode::Char('m') => {
+                self.toggle_mark_selected();
+            }
+            KeyCode::Char('M') => {
+                self.toggle_mark_all_visible();
+            }
             KeyCode::Char('t') => {
                 self.open_tag_filter_modal();
             }
@@ -1767,6 +1815,10 @@ impl App {
             KeyCode::Char('/') => {
                 self.search_input = TextInput::new(self.search_query.clone());
                 self.mode = Mode::Search;
+            }
+            KeyCode::Esc if !self.marked_ids.is_empty() => {
+                self.marked_ids.clear();
+                self.set_message("Marks cleared");
             }
             KeyCode::Esc if !self.search_query.is_empty() => {
                 self.search_query.clear();
@@ -1992,6 +2044,13 @@ impl App {
     }
 
     fn toggle_or_advance_selected(&mut self) {
+        if !self.marked_ids.is_empty() {
+            match self.view {
+                View::TodoList => self.batch_toggle_marked_done(),
+                View::Kanban => self.cycle_selected_status(),
+            }
+            return;
+        }
         let Some(id) = self.selected_task_id() else {
             return;
         };
@@ -2001,7 +2060,65 @@ impl App {
         }
     }
 
+    fn batch_toggle_marked_done(&mut self) {
+        let ids: Vec<u64> = self
+            .marked_ids
+            .iter()
+            .copied()
+            .filter(|&id| self.store.get(id).is_some())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let all_done = ids
+            .iter()
+            .all(|&id| self.store.get(id).is_some_and(|t| t.status == Status::Done));
+        let target = if all_done { Status::Todo } else { Status::Done };
+        self.push_undo();
+        for &id in &ids {
+            if let Some(task) = self.store.get_mut(id) {
+                if target == Status::Done && task.repeat.is_some() {
+                    task.complete_if_recurring();
+                } else {
+                    task.status = target;
+                    task.touch();
+                }
+            }
+        }
+        self.persist();
+        self.clamp_selections();
+        let n = ids.len();
+        self.set_message(format!("Marked {n} tasks as {}", target.label()));
+    }
+
     fn cycle_selected_status(&mut self) {
+        if !self.marked_ids.is_empty() {
+            let ids: Vec<u64> = self
+                .marked_ids
+                .iter()
+                .copied()
+                .filter(|&id| self.store.get(id).is_some())
+                .collect();
+            if ids.is_empty() {
+                return;
+            }
+            self.push_undo();
+            for &id in &ids {
+                if let Some(task) = self.store.get_mut(id) {
+                    let next = task.status.cycle();
+                    if next == Status::Done && task.repeat.is_some() {
+                        task.complete_if_recurring();
+                    } else {
+                        task.status = next;
+                        task.touch();
+                    }
+                }
+            }
+            self.persist();
+            self.clamp_selections();
+            self.set_message(format!("Cycled status on {} tasks", ids.len()));
+            return;
+        }
         let Some(id) = self.selected_task_id() else {
             return;
         };
@@ -2013,6 +2130,48 @@ impl App {
     }
 
     fn move_selected_task_status(&mut self, forward: bool) {
+        if !self.marked_ids.is_empty() {
+            let ids: Vec<u64> = self
+                .marked_ids
+                .iter()
+                .copied()
+                .filter(|&id| self.store.get(id).is_some())
+                .collect();
+            let mut moved = 0usize;
+            if ids.iter().any(|&id| {
+                self.store.get(id).is_some_and(|t| {
+                    if forward {
+                        t.status.next().is_some()
+                    } else {
+                        t.status.prev().is_some()
+                    }
+                })
+            }) {
+                self.push_undo();
+                for &id in &ids {
+                    if let Some(task) = self.store.get_mut(id) {
+                        let target = if forward {
+                            task.status.next()
+                        } else {
+                            task.status.prev()
+                        };
+                        if let Some(next_status) = target {
+                            if next_status == Status::Done && task.repeat.is_some() {
+                                task.complete_if_recurring();
+                            } else {
+                                task.status = next_status;
+                                task.touch();
+                            }
+                            moved += 1;
+                        }
+                    }
+                }
+                self.persist();
+                self.clamp_selections();
+                self.set_message(format!("Moved {moved} tasks"));
+            }
+            return;
+        }
         let Some(id) = self.selected_task_id() else {
             return;
         };
@@ -2108,6 +2267,27 @@ impl App {
     }
 
     fn cycle_selected_priority(&mut self) {
+        if !self.marked_ids.is_empty() {
+            let ids: Vec<u64> = self
+                .marked_ids
+                .iter()
+                .copied()
+                .filter(|&id| self.store.get(id).is_some())
+                .collect();
+            if ids.is_empty() {
+                return;
+            }
+            self.push_undo();
+            for &id in &ids {
+                if let Some(task) = self.store.get_mut(id) {
+                    task.priority = task.priority.cycle();
+                    task.touch();
+                }
+            }
+            self.persist();
+            self.set_message(format!("Cycled priority on {} tasks", ids.len()));
+            return;
+        }
         let Some(id) = self.selected_task_id() else {
             return;
         };
@@ -2123,6 +2303,29 @@ impl App {
     }
 
     fn delete_selected_task(&mut self) {
+        if !self.marked_ids.is_empty() {
+            let ids: Vec<u64> = self
+                .marked_ids
+                .iter()
+                .copied()
+                .filter(|&id| self.store.get(id).is_some())
+                .collect();
+            if ids.is_empty() {
+                return;
+            }
+            self.push_undo();
+            let mut deleted = 0usize;
+            for id in ids {
+                if self.store.remove(id).is_some() {
+                    deleted += 1;
+                }
+            }
+            self.marked_ids.clear();
+            self.persist();
+            self.clamp_selections();
+            self.set_message(format!("Deleted {deleted} tasks (press u to undo)"));
+            return;
+        }
         let Some(id) = self.selected_task_id() else {
             return;
         };
@@ -2148,17 +2351,9 @@ impl App {
         }
     }
 
-    pub fn yank_selected(&mut self, full_markdown: bool) {
-        let Some(id) = self.selected_task_id() else {
-            return;
-        };
-        let Some(task) = self.store.get(id).cloned() else {
-            return;
-        };
+    fn format_task_yank(&self, task: &Task, full_markdown: bool) -> String {
         if !full_markdown {
-            self.pending_yank = Some(task.title.clone());
-            self.set_message("Yanked title");
-            return;
+            return task.title.clone();
         }
         let check = if task.status == Status::Done {
             "x"
@@ -2166,7 +2361,7 @@ impl App {
             " "
         };
         let mut out = format!("- [{check}] {}", task.title);
-        let eff_tags = self.effective_tags(&task);
+        let eff_tags = self.effective_tags(task);
         if !eff_tags.is_empty() {
             for tag in &eff_tags {
                 out.push_str(&format!(" #{tag}"));
@@ -2184,8 +2379,36 @@ impl App {
             }
             out.truncate(out.trim_end().len());
         }
-        self.pending_yank = Some(out);
-        self.set_message("Yanked task");
+        out
+    }
+
+    pub fn yank_selected(&mut self, full_markdown: bool) {
+        if !self.marked_ids.is_empty() {
+            let parts: Vec<String> = self
+                .marked_ids
+                .iter()
+                .filter_map(|&id| self.store.get(id))
+                .map(|t| self.format_task_yank(t, full_markdown))
+                .collect();
+            if !parts.is_empty() {
+                let n = parts.len();
+                self.pending_yank = Some(parts.join("\n"));
+                self.set_message(format!("Yanked {n} tasks"));
+            }
+            return;
+        }
+        let Some(id) = self.selected_task_id() else {
+            return;
+        };
+        let Some(task) = self.store.get(id).cloned() else {
+            return;
+        };
+        self.pending_yank = Some(self.format_task_yank(&task, full_markdown));
+        self.set_message(if full_markdown {
+            "Yanked task"
+        } else {
+            "Yanked title"
+        });
     }
 
     pub fn archive_done_tasks(&mut self) {
@@ -3323,6 +3546,34 @@ default_sort = "priority"
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.due_focus);
         assert_eq!(app.filtered_todo_ids().len(), 4);
+    }
+
+    #[test]
+    fn multi_select_marks_apply_batch_move_delete_and_single_undo() {
+        let mut app = sample_app();
+        // Mark task 1 and task 2 with 'm', 'm'
+        app.handle_key(key(KeyCode::Char('m')));
+        app.handle_key(key(KeyCode::Char('m')));
+        assert_eq!(app.marked_ids, vec![1, 2]);
+
+        // Batch toggle done with Space
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.store.get(1).unwrap().status, Status::Done);
+        assert_eq!(app.store.get(2).unwrap().status, Status::Done);
+
+        // Single undo restores both tasks
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.store.get(1).unwrap().status, Status::Todo);
+        assert_eq!(app.store.get(2).unwrap().status, Status::Todo);
+
+        // Batch delete removes both tasks and clears marks
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.store.tasks.len(), 2);
+        assert!(app.marked_ids.is_empty());
+
+        // Single undo restores both deleted tasks
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.store.tasks.len(), 4);
     }
 
     #[test]
