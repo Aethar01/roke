@@ -123,14 +123,31 @@ fn ssh_base_args(peer: &PeerConfig) -> Vec<String> {
     args
 }
 
-fn remote_path_arg(remote_path: Option<&str>) -> String {
+fn needs_encoded_remote_path(path: &str) -> bool {
+    path.contains('\'') || path.contains('\\') || path.contains('\n') || path.contains('\r')
+}
+
+fn encode_decimal_bytes(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() * 3);
+    for b in path.as_bytes() {
+        out.push_str(&format!("{b:03}"));
+    }
+    out
+}
+
+fn remote_path_arg(remote_path: Option<&str>) -> (bool, String) {
     match remote_path.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => {
-            // Single-quoted argument safe across POSIX sh and fish when no single-quotes/backslashes.
-            let safe = p.replace('\\', "\\\\").replace('\'', "\\'");
-            format!(" '{safe}'")
-        }
-        None => String::new(),
+        Some(p) if needs_encoded_remote_path(p) => (true, format!(" {}", encode_decimal_bytes(p))),
+        Some(p) => (false, format!(" '{p}'")),
+        None => (false, String::new()),
+    }
+}
+
+fn resolve_path_snippet(encoded: bool) -> &'static str {
+    if encoded {
+        r#"p=$(awk "BEGIN{s=ARGV[1];f=ARGV[2];for(i=1;i<=length(s);i+=3)printf f,substr(s,i,3)+0}" "$1" "%c"); case "$p" in "~/"*) p="$HOME/${p#~/}" ;; esac"#
+    } else {
+        r#"p="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/roke/todos.jsonl}"; case "$p" in "~/"*) p="$HOME/${p#~/}" ;; esac"#
     }
 }
 
@@ -149,13 +166,17 @@ fn format_ssh_stderr(output: &std::process::Output) -> String {
 /// Runs a POSIX sh snippet via `sh -c '...'` with zero backslashes or single quotes inside the
 /// body so it works regardless of whether the remote login shell is bash, zsh, sh, or fish.
 fn build_pull_command(remote_path: Option<&str>) -> String {
-    let body = r#"p="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/roke/todos.jsonl}"; case "$p" in "~/"*) p="$HOME/${p#~/}" ;; esac; [ -f "$p" ] && cat "$p" || true"#;
-    format!("sh -c '{body}' _{}", remote_path_arg(remote_path))
+    let (encoded, arg) = remote_path_arg(remote_path);
+    let resolve = resolve_path_snippet(encoded);
+    format!(r#"sh -c '{resolve}; [ -f "$p" ] && cat "$p" || true' _{arg}"#)
 }
 
 fn build_push_command(remote_path: Option<&str>) -> String {
-    let body = r#"p="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/roke/todos.jsonl}"; case "$p" in "~/"*) p="$HOME/${p#~/}" ;; esac; mkdir -p "$(dirname "$p")" && tmp="$p.tmp.$$" && cat > "$tmp" && mv "$tmp" "$p""#;
-    format!("sh -c '{body}' _{}", remote_path_arg(remote_path))
+    let (encoded, arg) = remote_path_arg(remote_path);
+    let resolve = resolve_path_snippet(encoded);
+    format!(
+        r#"sh -c '{resolve}; mkdir -p "$(dirname "$p")" && tmp="$p.tmp.$$" && cat > "$tmp" && mv "$tmp" "$p"' _{arg}"#
+    )
 }
 
 fn pull_peer_store(peer: &PeerConfig) -> Result<Option<TaskStore>, String> {
@@ -210,6 +231,24 @@ fn push_peer_store(peer: &PeerConfig, store: &TaskStore) -> Result<(), String> {
     Ok(())
 }
 
+fn stores_semantically_equal(a: &TaskStore, b: &TaskStore) -> bool {
+    if a.tombstones != b.tombstones || a.tasks.len() != b.tasks.len() {
+        return false;
+    }
+    let a_by_uid: HashMap<&str, &Task> = a.tasks.iter().map(|t| (t.uid.as_str(), t)).collect();
+    b.tasks.iter().all(|bt| {
+        a_by_uid.get(bt.uid.as_str()).is_some_and(|at| {
+            at.title == bt.title
+                && at.description == bt.description
+                && at.status == bt.status
+                && at.priority == bt.priority
+                && at.tags == bt.tags
+                && at.updated_at == bt.updated_at
+                && at.origin == bt.origin
+        })
+    })
+}
+
 pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome {
     let local_name = config.effective_device_name();
     let mut working = local_store;
@@ -217,17 +256,30 @@ pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome
 
     let mut synced_peers = 0;
     let mut errors = Vec::new();
-    let mut reachable_peers: Vec<&PeerConfig> = Vec::new();
+    let mut reachable_peers: Vec<(&PeerConfig, Option<TaskStore>)> = Vec::new();
 
-    // Pass 1: Pull and merge from every reachable peer
-    for peer in &config.peers {
-        match pull_peer_store(peer) {
+    // Pass 1: Pull from all peers in parallel
+    let pull_results: Vec<(&PeerConfig, Result<Option<TaskStore>, String>)> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = config
+                .peers
+                .iter()
+                .map(|peer| scope.spawn(move || (peer, pull_peer_store(peer))))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("peer pull thread panicked"))
+                .collect()
+        });
+
+    for (peer, result) in pull_results {
+        match result {
             Ok(Some(remote_store)) => {
                 working = merge_stores(&working, &remote_store, &local_name, &peer.name);
-                reachable_peers.push(peer);
+                reachable_peers.push((peer, Some(remote_store)));
             }
             Ok(None) => {
-                reachable_peers.push(peer);
+                reachable_peers.push((peer, None));
             }
             Err(err) => {
                 errors.push(format!("{}: {err}", peer.name));
@@ -235,9 +287,34 @@ pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome
         }
     }
 
-    // Pass 2: Push the merged store back to every reachable peer
-    for peer in reachable_peers {
-        match push_peer_store(peer, &working) {
+    // Pass 2: Push merged store back in parallel, skipping peers already up to date
+    let mut peers_to_push: Vec<&PeerConfig> = Vec::new();
+    for (peer, remote_opt) in reachable_peers {
+        let up_to_date = match remote_opt {
+            Some(ref remote) => stores_semantically_equal(&working, remote),
+            None => working.tasks.is_empty() && working.tombstones.is_empty(),
+        };
+        if up_to_date {
+            synced_peers += 1;
+        } else {
+            peers_to_push.push(peer);
+        }
+    }
+
+    let working_ref = &working;
+    let push_results: Vec<(&PeerConfig, Result<(), String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = peers_to_push
+            .into_iter()
+            .map(|peer| scope.spawn(move || (peer, push_peer_store(peer, working_ref))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("peer push thread panicked"))
+            .collect()
+    });
+
+    for (peer, result) in push_results {
+        match result {
             Ok(()) => synced_peers += 1,
             Err(err) => errors.push(format!("{}: {err}", peer.name)),
         }
@@ -407,6 +484,67 @@ mod tests {
             assert_eq!(
                 String::from_utf8_lossy(&pull_out.stdout),
                 "{\"title\":\"hello\"}\n"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_shell_commands_handle_quotes_and_spaces_under_sh_and_fish() {
+        let dir = std::env::temp_dir().join(format!(
+            "roke_sync_quote's dir_{}",
+            std::process::id()
+        ));
+        let file = dir.join("my'todos\\list.jsonl");
+        let _ = std::fs::remove_dir_all(&dir);
+        let file_str = file.to_string_lossy().to_string();
+
+        let push_cmd = build_push_command(Some(&file_str));
+        let pull_cmd = build_pull_command(Some(&file_str));
+        assert!(push_cmd.starts_with("sh -c '"));
+        assert!(pull_cmd.starts_with("sh -c '"));
+
+        let mut shells = vec!["sh"];
+        if Command::new("fish").arg("--version").output().is_ok() {
+            shells.push("fish");
+        }
+
+        for shell in shells {
+            let mut child = Command::new(shell)
+                .arg("-c")
+                .arg(&push_cmd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn shell");
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"{\"title\":\"quoted\"}\n")
+                .unwrap();
+            let push_out = child.wait_with_output().unwrap();
+            assert!(
+                push_out.status.success(),
+                "{shell} push failed: {}",
+                String::from_utf8_lossy(&push_out.stderr)
+            );
+
+            let pull_out = Command::new(shell)
+                .arg("-c")
+                .arg(&pull_cmd)
+                .output()
+                .unwrap();
+            assert!(
+                pull_out.status.success(),
+                "{shell} pull failed: {}",
+                String::from_utf8_lossy(&pull_out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&pull_out.stdout),
+                "{\"title\":\"quoted\"}\n"
             );
         }
 
