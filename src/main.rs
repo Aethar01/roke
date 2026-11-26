@@ -148,7 +148,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::with_config(store, Some(storage_path), cfg);
+    let mut app = App::with_config_and_path(store, Some(storage_path), Some(config_path), cfg);
     let mut sync_mgr = SyncManager::new();
     if app.sync_config.auto_sync_on_start && !app.sync_config.peers.is_empty() {
         app.request_sync();
@@ -208,6 +208,9 @@ fn run_loop(
 
         if last_reload_check.elapsed() >= LIVE_RELOAD_INTERVAL {
             if app.reload_if_changed() {
+                needs_draw = true;
+            }
+            if app.reload_config_if_changed() {
                 needs_draw = true;
             }
             last_reload_check = Instant::now();

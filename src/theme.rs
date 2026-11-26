@@ -46,6 +46,9 @@ impl Default for Theme {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThemeConfig {
+    /// Optional built-in palette preset ("default", "catppuccin", "tokyo-night", "gruvbox", "nord", "minimal").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     pub accent: Option<String>,
     pub text: Option<String>,
     pub subtle: Option<String>,
@@ -67,6 +70,7 @@ pub struct ThemeConfig {
 impl ThemeConfig {
     pub fn default_template() -> Self {
         Self {
+            preset: Some("default".into()),
             accent: Some("cyan".into()),
             text: Some("white".into()),
             subtle: Some("gray".into()),
@@ -88,8 +92,115 @@ impl ThemeConfig {
 }
 
 impl Theme {
+    pub fn preset(name: &str) -> Option<Self> {
+        let norm: String = name
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| !matches!(c, '_' | '-' | ' '))
+            .collect();
+        match norm.as_str() {
+            "default" | "ansi" => Some(Self::default()),
+            "catppuccin" | "catppuccinmocha" | "mocha" => Some(Self {
+                accent: Color::Rgb(0x89, 0xb4, 0xfa),
+                text: Color::Rgb(0xcd, 0xd6, 0xf4),
+                subtle: Color::Rgb(0xa6, 0xad, 0xc8),
+                muted: Color::Rgb(0x6c, 0x70, 0x86),
+                todo: Color::Rgb(0x89, 0xb4, 0xfa),
+                in_progress: Color::Rgb(0xf9, 0xe2, 0xaf),
+                done: Color::Rgb(0xa6, 0xe3, 0xa1),
+                priority_high: Color::Rgb(0xf3, 0x8b, 0xa8),
+                priority_medium: Color::Rgb(0xfa, 0xb3, 0x87),
+                priority_low: Color::Rgb(0x6c, 0x70, 0x86),
+                add: Color::Rgb(0xa6, 0xe3, 0xa1),
+                drag: Color::Rgb(0xf9, 0xe2, 0xaf),
+                drop: Color::Rgb(0xa6, 0xe3, 0xa1),
+                error: Color::Rgb(0xf3, 0x8b, 0xa8),
+                tag: Color::Rgb(0x7f, 0x84, 0x9c),
+                tag_active: Color::Rgb(0x89, 0xb4, 0xfa),
+            }),
+            "tokyonight" | "tokyo" => Some(Self {
+                accent: Color::Rgb(0x7a, 0xa2, 0xf7),
+                text: Color::Rgb(0xc0, 0xca, 0xf5),
+                subtle: Color::Rgb(0xa9, 0xb1, 0xd6),
+                muted: Color::Rgb(0x56, 0x5f, 0x89),
+                todo: Color::Rgb(0x7d, 0xcf, 0xff),
+                in_progress: Color::Rgb(0xe0, 0xaf, 0x68),
+                done: Color::Rgb(0x9e, 0xce, 0x6a),
+                priority_high: Color::Rgb(0xf7, 0x76, 0x8e),
+                priority_medium: Color::Rgb(0xe0, 0xaf, 0x68),
+                priority_low: Color::Rgb(0x56, 0x5f, 0x89),
+                add: Color::Rgb(0x9e, 0xce, 0x6a),
+                drag: Color::Rgb(0xe0, 0xaf, 0x68),
+                drop: Color::Rgb(0x9e, 0xce, 0x6a),
+                error: Color::Rgb(0xf7, 0x76, 0x8e),
+                tag: Color::Rgb(0x56, 0x5f, 0x89),
+                tag_active: Color::Rgb(0x7a, 0xa2, 0xf7),
+            }),
+            "gruvbox" | "gruvboxdark" => Some(Self {
+                accent: Color::Rgb(0x83, 0xa5, 0x98),
+                text: Color::Rgb(0xeb, 0xdb, 0xb2),
+                subtle: Color::Rgb(0xd5, 0xc4, 0xa1),
+                muted: Color::Rgb(0x92, 0x83, 0x74),
+                todo: Color::Rgb(0x83, 0xa5, 0x98),
+                in_progress: Color::Rgb(0xfa, 0xbd, 0x2f),
+                done: Color::Rgb(0xb8, 0xbb, 0x26),
+                priority_high: Color::Rgb(0xfb, 0x49, 0x34),
+                priority_medium: Color::Rgb(0xfe, 0x80, 0x19),
+                priority_low: Color::Rgb(0x92, 0x83, 0x74),
+                add: Color::Rgb(0xb8, 0xbb, 0x26),
+                drag: Color::Rgb(0xfa, 0xbd, 0x2f),
+                drop: Color::Rgb(0xb8, 0xbb, 0x26),
+                error: Color::Rgb(0xfb, 0x49, 0x34),
+                tag: Color::Rgb(0x92, 0x83, 0x74),
+                tag_active: Color::Rgb(0x83, 0xa5, 0x98),
+            }),
+            "nord" => Some(Self {
+                accent: Color::Rgb(0x88, 0xc0, 0xd0),
+                text: Color::Rgb(0xec, 0xef, 0xf4),
+                subtle: Color::Rgb(0xd8, 0xde, 0xe9),
+                muted: Color::Rgb(0x61, 0x6e, 0x88),
+                todo: Color::Rgb(0x81, 0xa1, 0xc1),
+                in_progress: Color::Rgb(0xeb, 0xcb, 0x8b),
+                done: Color::Rgb(0xa3, 0xbe, 0x8c),
+                priority_high: Color::Rgb(0xbf, 0x61, 0x6a),
+                priority_medium: Color::Rgb(0xd0, 0x87, 0x70),
+                priority_low: Color::Rgb(0x61, 0x6e, 0x88),
+                add: Color::Rgb(0xa3, 0xbe, 0x8c),
+                drag: Color::Rgb(0xeb, 0xcb, 0x8b),
+                drop: Color::Rgb(0xa3, 0xbe, 0x8c),
+                error: Color::Rgb(0xbf, 0x61, 0x6a),
+                tag: Color::Rgb(0x61, 0x6e, 0x88),
+                tag_active: Color::Rgb(0x88, 0xc0, 0xd0),
+            }),
+            "minimal" | "mono" | "monochrome" => Some(Self {
+                accent: Color::White,
+                text: Color::White,
+                subtle: Color::Gray,
+                muted: Color::DarkGray,
+                todo: Color::Gray,
+                in_progress: Color::White,
+                done: Color::DarkGray,
+                priority_high: Color::White,
+                priority_medium: Color::Gray,
+                priority_low: Color::DarkGray,
+                add: Color::White,
+                drag: Color::White,
+                drop: Color::White,
+                error: Color::Red,
+                tag: Color::DarkGray,
+                tag_active: Color::White,
+            }),
+            _ => None,
+        }
+    }
+
     pub fn from_config(cfg: &ThemeConfig) -> Self {
-        let mut theme = Self::default();
+        let mut theme = cfg
+            .preset
+            .as_deref()
+            .and_then(Self::preset)
+            .unwrap_or_default();
         if let Some(c) = cfg.accent.as_deref().and_then(parse_color) {
             theme.accent = c;
             theme.tag_active = c;
@@ -234,5 +345,24 @@ mod tests {
         assert_eq!(theme.accent, Color::Blue);
         assert_eq!(theme.tag_active, Color::Blue);
         assert_eq!(theme.done, Color::Green);
+    }
+
+    #[test]
+    fn theme_preset_loads_and_allows_key_overrides() {
+        let cfg: ThemeConfig = toml::from_str(
+            r##"
+preset = "catppuccin"
+accent = "#ff00aa"
+"##,
+        )
+        .unwrap();
+        let theme = Theme::from_config(&cfg);
+        assert_eq!(theme.accent, Color::Rgb(0xff, 0x00, 0xaa));
+        assert_eq!(theme.tag_active, Color::Rgb(0xff, 0x00, 0xaa));
+        assert_eq!(theme.done, Color::Rgb(0xa6, 0xe3, 0xa1));
+        assert!(Theme::preset("tokyo-night").is_some());
+        assert!(Theme::preset("gruvbox").is_some());
+        assert!(Theme::preset("nord").is_some());
+        assert!(Theme::preset("minimal").is_some());
     }
 }

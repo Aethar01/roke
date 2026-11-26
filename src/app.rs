@@ -464,6 +464,7 @@ struct LastClick {
 pub struct App {
     pub store: TaskStore,
     pub storage_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
     pub theme: Theme,
     pub editor_config: Option<String>,
     pub editor_label: String,
@@ -495,6 +496,7 @@ pub struct App {
     pub should_quit: bool,
     last_click: Option<LastClick>,
     last_file_stamp: Option<FileStamp>,
+    last_config_stamp: Option<FileStamp>,
     dirty: bool,
 }
 
@@ -508,9 +510,19 @@ impl App {
     }
 
     pub fn with_config(store: TaskStore, storage_path: Option<PathBuf>, config: AppConfig) -> Self {
+        Self::with_config_and_path(store, storage_path, None, config)
+    }
+
+    pub fn with_config_and_path(
+        store: TaskStore,
+        storage_path: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        config: AppConfig,
+    ) -> Self {
         let theme = config.resolved_theme();
         let editor_label = editor_display_name(config.editor.as_deref());
         let last_file_stamp = storage_path.as_deref().and_then(file_stamp);
+        let last_config_stamp = config_path.as_deref().and_then(file_stamp);
         let initial_view = match config
             .default_view
             .as_deref()
@@ -541,6 +553,7 @@ impl App {
         Self {
             store,
             storage_path,
+            config_path,
             theme,
             editor_config: config.editor,
             editor_label,
@@ -572,6 +585,7 @@ impl App {
             should_quit: false,
             last_click: None,
             last_file_stamp,
+            last_config_stamp,
             dirty: false,
         }
     }
@@ -811,6 +825,32 @@ impl App {
             self.set_message("Reloaded external changes");
         }
         changed
+    }
+
+    /// Watch `config.toml` and hot-reload theme, editor, and sync settings on change.
+    pub fn reload_config_if_changed(&mut self) -> bool {
+        let Some(path) = self.config_path.clone() else {
+            return false;
+        };
+        let current_stamp = file_stamp(&path);
+        if current_stamp == self.last_config_stamp {
+            return false;
+        }
+        self.last_config_stamp = current_stamp;
+        match AppConfig::load_or_default(&path) {
+            Ok(cfg) => {
+                self.theme = cfg.resolved_theme();
+                self.editor_label = editor_display_name(cfg.editor.as_deref());
+                self.editor_config = cfg.editor;
+                self.sync_config = cfg.sync;
+                self.set_message("Reloaded config.toml");
+                true
+            }
+            Err(err) => {
+                self.set_message(format!("Config reload error: {err}"));
+                true
+            }
+        }
     }
 
     pub fn request_sync(&mut self) {
@@ -2961,6 +3001,31 @@ default_sort = "priority"
         app.handle_key(key(KeyCode::Char('v')));
         app.handle_key(key(KeyCode::Char('y')));
         assert_eq!(app.pending_yank.take().as_deref(), Some("First task"));
+    }
+
+    #[test]
+    fn live_config_reload_updates_theme_and_editor() {
+        let dir = std::env::temp_dir().join(format!("roke_cfg_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(&cfg_path, "[theme]\npreset = \"nord\"\n").unwrap();
+
+        let cfg = AppConfig::load_or_default(&cfg_path).unwrap();
+        let mut app = App::with_config_and_path(TaskStore::new_empty(), None, Some(cfg_path.clone()), cfg);
+        assert_eq!(app.theme, Theme::preset("nord").unwrap());
+        assert!(!app.reload_config_if_changed());
+
+        std::fs::write(
+            &cfg_path,
+            "editor = \"helix\"\n[theme]\npreset = \"gruvbox\"\n",
+        )
+        .unwrap();
+        assert!(app.reload_config_if_changed());
+        assert_eq!(app.theme, Theme::preset("gruvbox").unwrap());
+        assert_eq!(app.editor_label, "helix");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
