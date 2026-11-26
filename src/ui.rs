@@ -67,8 +67,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_tag_filter_modal(frame, app, sel);
     } else if let Mode::NotesPreview { task_id, scroll } = app.mode {
         render_notes_preview_modal(frame, app, task_id, scroll);
-    } else if matches!(app.mode, Mode::Help) {
-        render_help_modal(frame, app);
+    } else if let Mode::Help(scroll) = app.mode {
+        render_help_modal(frame, app, scroll);
     }
 }
 
@@ -1845,12 +1845,8 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
     );
 }
 
-fn render_help_modal(frame: &mut Frame, app: &mut App) {
+fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
     let theme = app.theme.clone();
-    let area = centered_rect(58, 27, frame.area());
-    frame.render_widget(Clear, area);
-    app.regions.help_modal = Some(area);
-
     let lines = vec![
         help_section(&theme, "Navigate"),
         help_row(&theme, "j / k  ↑ / ↓", "Move down / up"),
@@ -1889,7 +1885,25 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         ),
     ];
 
-    let block = Block::default()
+    let desired_h = (lines.len() as u16).saturating_add(3);
+    let area = centered_rect(60, desired_h, frame.area());
+    frame.render_widget(Clear, area);
+    app.regions.help_modal = Some(area);
+
+    let inner_h = area.height.saturating_sub(2);
+    let inner_w = area.width.saturating_sub(4);
+    let total_visual: u16 = lines
+        .iter()
+        .map(|l| visual_line_rows(l, inner_w))
+        .sum();
+    let body_h = inner_h.saturating_sub(1);
+    let max_scroll = total_visual.saturating_sub(body_h);
+    let clamped_scroll = scroll.min(max_scroll);
+    if clamped_scroll != scroll {
+        app.mode = Mode::Help(clamped_scroll);
+    }
+
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.muted))
@@ -1897,17 +1911,49 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
             " Shortcuts ",
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ));
+    if max_scroll > 0 {
+        let indicator = format!(
+            " {}{} ",
+            if clamped_scroll > 0 { "↑" } else { " " },
+            if clamped_scroll < max_scroll { "↓" } else { " " }
+        );
+        block = block.title(
+            Line::from(Span::styled(indicator, Style::default().fg(theme.accent)))
+                .alignment(Alignment::Right),
+        );
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.width < 4 || inner.height < 2 {
+        return;
+    }
+
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((clamped_scroll, 0)),
+        Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), body_h),
+    );
+    let hint = if max_scroll > 0 {
+        "j/k scroll · esc / ? close"
+    } else {
+        "esc / ? close"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(theme.muted))),
         Rect::new(
             inner.x + 1,
-            inner.y,
+            inner.bottom().saturating_sub(1),
             inner.width.saturating_sub(2),
-            inner.height,
+            1,
         ),
     );
+}
+
+fn visual_line_rows(line: &Line<'_>, width: u16) -> u16 {
+    let w = width.max(1) as usize;
+    let line_w: usize = line.spans.iter().map(|s| s.content.width()).sum();
+    line_w.max(1).div_ceil(w) as u16
 }
 
 fn help_section(theme: &Theme, title: &'static str) -> Line<'static> {

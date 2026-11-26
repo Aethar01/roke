@@ -342,7 +342,7 @@ pub enum Mode {
     TaskModal(TaskForm),
     TagFilter(usize),
     NotesPreview { task_id: u64, scroll: u16 },
-    Help,
+    Help(u16),
 }
 
 #[derive(Debug, Clone)]
@@ -870,7 +870,7 @@ impl App {
             Mode::TaskModal(_) => self.handle_modal_key(key),
             Mode::TagFilter(_) => self.handle_tag_filter_key(key),
             Mode::NotesPreview { .. } => self.handle_notes_preview_key(key),
-            Mode::Help => self.handle_help_key(key),
+            Mode::Help(_) => self.handle_help_key(key),
         }
     }
 
@@ -966,12 +966,35 @@ impl App {
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) {
+        let Mode::Help(mut scroll) = self.mode else {
+            return;
+        };
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Enter => {
                 self.mode = Mode::Normal;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                scroll = scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                scroll = scroll.saturating_sub(1);
+            }
+            KeyCode::Char('d') | KeyCode::PageDown => {
+                scroll = scroll.saturating_add(8);
+            }
+            KeyCode::Char('u') | KeyCode::PageUp => {
+                scroll = scroll.saturating_sub(8);
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                scroll = 0;
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                scroll = u16::MAX;
             }
             _ => {}
         }
+        self.mode = Mode::Help(scroll);
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
@@ -1246,7 +1269,7 @@ impl App {
                 self.should_quit = true;
             }
             KeyCode::Char('?') => {
-                self.mode = Mode::Help;
+                self.mode = Mode::Help(0);
             }
             KeyCode::Tab => {
                 self.view = self.view.toggle();
@@ -1822,15 +1845,24 @@ impl App {
         let y = mouse.row;
 
         match self.mode {
-            Mode::Help => {
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                    if let Some(area) = self.regions.help_modal {
-                        if !rect_contains(area, x, y) {
+            Mode::Help(scroll) => {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(area) = self.regions.help_modal {
+                            if !rect_contains(area, x, y) {
+                                self.mode = Mode::Normal;
+                            }
+                        } else {
                             self.mode = Mode::Normal;
                         }
-                    } else {
-                        self.mode = Mode::Normal;
                     }
+                    MouseEventKind::ScrollDown => {
+                        self.mode = Mode::Help(scroll.saturating_add(2));
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.mode = Mode::Help(scroll.saturating_sub(2));
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -2013,7 +2045,7 @@ impl App {
             return;
         }
         if rect_contains(self.regions.help_btn, x, y) {
-            self.mode = Mode::Help;
+            self.mode = Mode::Help(0);
             return;
         }
 
@@ -2862,8 +2894,15 @@ default_sort = "priority"
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         app.open_add_modal();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
-        app.mode = Mode::Help;
+        app.mode = Mode::Help(0);
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        app.handle_key(key(KeyCode::Char('G')));
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        if let Mode::Help(scroll) = app.mode {
+            assert!(scroll > 0, "small terminal help modal should scroll");
+        } else {
+            panic!("expected Help mode");
+        }
     }
 
     #[test]
