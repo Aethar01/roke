@@ -1,0 +1,23 @@
+name: Update Homebrew formula
+
+# homebrew-tap bumps its roke formula to the latest release whenever its
+# Update roke formula workflow runs, and runs it hourly in case this is missed.
+on:
+  # A tag's release only exists once the Release workflow has finished.
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    steps:
+      - name: Run homebrew-tap's Update roke formula
+        env:
+          # A fine-grained token with Actions read and write on homebrew-tap.
+          GH_TOKEN: ${{ secrets.TAP_REPO_TOKEN }}
+        run: gh workflow run update-roke.yml --repo Aethar01/homebrew-tap

@@ -42,6 +42,9 @@ fn parse_cli() -> CliOptions {
         } else if arg == "--print-config" {
             println!("{}", AppConfig::default_template_toml());
             std::process::exit(0);
+        } else if arg == "--version" || arg == "-V" {
+            println!("roke {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
         } else if arg == "--help" || arg == "-h" {
             println!("roke — Terminal Todo & Kanban board");
             println!();
@@ -51,6 +54,7 @@ fn parse_cli() -> CliOptions {
             println!("  -f, --file <PATH>     Path to JSONL task file");
             println!("  -c, --config <PATH>   Path to TOML config file (theme + SSH sync)");
             println!("      --print-config    Print default config.toml to stdout");
+            println!("  -V, --version         Print version");
             println!("  -h, --help            Show this help message");
             std::process::exit(0);
         }

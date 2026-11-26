@@ -27,6 +27,14 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 
 ## Installation
 
+### Homebrew (macOS & Linux)
+
+```bash
+brew install aethar01/tap/roke
+```
+
+### From source
+
 Requires Rust 1.75+ (Cargo).
 
 ```bash
