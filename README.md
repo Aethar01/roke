@@ -22,7 +22,8 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 - **Vim-first, mouse-friendly** — Navigate with `h`/`j`/`k`/`l`, `gg`/`G`, move cards across columns with `H`/`L` or `<`/`>`, reorder with `J`/`K`, undo with `u`, and search live with `/`. Click tabs, filters, checkboxes (`○`/`◐`/`✓`), double-click cards to edit, scroll with the wheel, and drag-and-drop cards across Kanban columns.
 - **Zero-clutter multi-tag filtering** — Tag tasks (`work, personal`), filter by multiple tags at once via clicks or the `t` picker, and toggle between `and` (match all) and `or` (match any). Tags tuck quietly into card bottom borders and disappear completely when unused.
 - **Plain JSONL storage & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), one compact JSON object per line with atomic saves. The TUI watches for external changes and reloads live, merging safely on save.
-- **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`move`/`done`/`rm`/`tags`/`sync` (with `--json`), or connect any MCP client directly with `roke mcp`.
+- **Markdown notes in `$EDITOR`** — Task notes support full Markdown and open directly in `nvim` / `$VISUAL` / `$EDITOR` (or a configured `editor` in `config.toml`) via `n` in the TUI, `Ctrl-E` in the edit modal, or `roke notes <id>`.
+- **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`notes`/`move`/`done`/`rm`/`tags`/`sync` (with `--json` and theme-aware colours), or connect any MCP client directly with `roke mcp`.
 - **TOML config & theming** — Override any colour in `$XDG_CONFIG_HOME/roke/config.toml` using ANSI-16 names (`blue`, `dark_gray`, `reset`), 256-color indices, or `#rrggbb` hex values.
 - **Conflict-free SSH sync** — Two-way background sync over system `ssh` (`BatchMode=yes`, honoring `~/.ssh/config`) using last-write-wins timestamps and tombstones. Works across `bash`, `zsh`, `sh`, and `fish` login shells, with an optional `inject_device_tag` setting to dynamically tag tasks with the machine they came from.
 
@@ -54,16 +55,20 @@ roke --print-config                      # print a full starter config.toml to s
 
 ### CLI & agent usage
 
-All subcommands accept `--file`, `--config`, and `--json`, and accept either a numeric task ID or stable `uid`. Any edits appear live in an open `roke` TUI.
+All subcommands accept `--file`, `--config`, `--json`, and `--color <auto|always|never>` (honoring your `[theme]` colours from `config.toml` and `NO_COLOR`), and accept either a numeric task ID or stable `uid`. Any edits appear live in an open `roke` TUI.
 
 ```bash
-roke list --status todo --tag work --json
-roke add "Ship release" -d "Tag v0.2 and publish" -p high -t work,release --json
+roke list --status todo --tag work --verbose
+roke list --json
+roke add "Ship release" -d "Tag v0.1.2 and publish" -p high -t work,release --json
 roke edit 1 --add-tag urgent --priority high
+roke notes 1                             # open task Markdown notes in $EDITOR / nvim
+roke notes 1 --print                     # print raw Markdown notes to stdout
+cat spec.md | roke notes 1 --stdin       # set Markdown notes from stdin
 roke move 1 in-progress
 roke done 1
 roke rm 1
-roke tags --json
+roke tags
 roke sync --json
 
 # Batch add from JSON array or JSONL on stdin
@@ -97,6 +102,7 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 | `Tab` / `gt` / `1` / `2` | Switch between Todo List and Kanban Board |
 | `a` / `o` | New task |
 | `e` / `i` / `Enter` | Edit selected task |
+| `n` | Edit task's Markdown notes in `$EDITOR` (`Ctrl-E` inside modal) |
 | `Space` | Toggle done (Todos) or cycle status (Kanban) |
 | `H` / `L` or `<` / `>` | Move task to previous / next column |
 | `J` / `K` | Reorder task down / up |
@@ -122,6 +128,8 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 roke needs no configuration. To customize colours or enable SSH sync, create `~/.config/roke/config.toml` (only include what you want to override):
 
 ```toml
+editor = "nvim"            # optional; overrides $VISUAL / $EDITOR for Markdown notes
+
 [theme]
 accent = "blue"            # ANSI-16 name ("blue", "dark_gray", "reset"), 0-255 index, or "#rrggbb"
 

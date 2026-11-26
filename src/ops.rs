@@ -239,7 +239,11 @@ pub fn add_tasks_batch(
         if title.is_empty() {
             return Err("task title cannot be empty".into());
         }
-        let description = input.description.trim().to_string();
+        let description = if input.description.trim().is_empty() {
+            String::new()
+        } else {
+            input.description.replace("\r\n", "\n").trim_end().to_string()
+        };
         let tags = normalize_tags(&input.tags);
         let origin = input
             .origin
@@ -291,7 +295,11 @@ pub fn update_task(
         task.title = trimmed;
     }
     if let Some(desc) = input.description {
-        task.description = desc.trim().to_string();
+        task.description = if desc.trim().is_empty() {
+            String::new()
+        } else {
+            desc.replace("\r\n", "\n").trim_end().to_string()
+        };
     }
     if let Some(status) = input.status {
         task.status = status;

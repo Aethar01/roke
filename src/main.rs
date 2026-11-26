@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod config;
+mod editor;
 mod mcp;
 mod model;
 mod ops;
@@ -9,7 +10,8 @@ mod theme;
 mod ui;
 
 use app::App;
-use cli::Command;
+use clap::Parser;
+use cli::{format_error, Cli};
 use config::AppConfig;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
@@ -31,47 +33,34 @@ fn restore_terminal() {
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let parsed = match cli::parse_args(&args) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            eprintln!("error: {err}");
-            std::process::exit(2);
-        }
-    };
+    let cli = Cli::parse();
 
-    // Commands that do not need config or task file loading
-    match parsed.command {
-        Command::PrintConfig | Command::Version | Command::Help(_) => {
-            if let Err(err) = cli::run_command(parsed, &AppConfig::default()) {
-                eprintln!("error: {err}");
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
-        _ => {}
+    if cli.print_config {
+        println!("{}", AppConfig::default_template_toml());
+        return Ok(());
     }
 
-    let cfg = match AppConfig::load_or_default(&parsed.global.config_path) {
+    let config_path = cli.config_path();
+    let cfg = match AppConfig::load_or_default(&config_path) {
         Ok(cfg) => cfg,
         Err(err) => {
             eprintln!(
                 "Warning: could not load config {}: {err}. Using defaults.",
-                parsed.global.config_path.display()
+                config_path.display()
             );
             AppConfig::default()
         }
     };
 
-    if !matches!(parsed.command, Command::Tui) {
-        if let Err(err) = cli::run_command(parsed, &cfg) {
-            eprintln!("error: {err}");
+    if let Some(cmd) = &cli.command {
+        if let Err(err) = cli::run_subcommand(&cli, cmd, &cfg) {
+            eprintln!("{}", format_error(&err, cli.color));
             std::process::exit(1);
         }
         return Ok(());
     }
 
-    let storage_path = parsed.global.storage_path;
+    let storage_path = cli.storage_path();
     let mut store = match TaskStore::load_or_init(&storage_path) {
         Ok(store) => store,
         Err(err) => {
@@ -110,6 +99,18 @@ fn main() -> io::Result<()> {
     result
 }
 
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    terminal.show_cursor()
+}
+
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -118,6 +119,19 @@ fn run_loop(
     let mut last_reload_check = Instant::now();
 
     loop {
+        if let Some(target) = app.pending_editor.take() {
+            if let Some((initial, title)) = app.editor_initial_content(target) {
+                suspend_terminal(terminal)?;
+                let edit_res = editor::edit_markdown_in_editor(
+                    &initial,
+                    &title,
+                    app.editor_config.as_deref(),
+                );
+                resume_terminal(terminal)?;
+                app.apply_editor_result(target, edit_res);
+            }
+        }
+
         if last_reload_check.elapsed() >= LIVE_RELOAD_INTERVAL {
             app.reload_if_changed();
             last_reload_check = Instant::now();

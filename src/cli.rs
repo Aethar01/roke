@@ -1,454 +1,297 @@
 use crate::config::{default_config_path, AppConfig};
+use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{default_storage_path, parse_tags, Priority, Status, Task};
-use crate::ops::{
-    self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput,
-};
+use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
+use crate::theme::{to_crossterm_color, Theme};
+use clap::builder::styling::{AnsiColor, Effects, Styles};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::style::{Attribute, ContentStyle, StyledContent};
+use ratatui::style::Color;
 use serde::Deserialize;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
-pub struct GlobalOptions {
-    pub storage_path: PathBuf,
-    pub config_path: PathBuf,
-    pub json: bool,
+fn clap_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Green.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Yellow.on_default())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Red.on_default() | Effects::BOLD)
+        .error(AnsiColor::Red.on_default() | Effects::BOLD)
 }
 
-#[derive(Debug, Clone)]
-pub enum Command {
-    Tui,
-    PrintConfig,
-    Version,
-    Help(Option<String>),
-    List(TaskFilter),
-    Get { selector: String },
-    Add {
-        input: AddTaskInput,
-        from_stdin: bool,
-    },
-    Edit {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorChoice {
+    pub fn should_color_stdout(self) -> bool {
+        match self {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => {
+                if std::env::var_os("NO_COLOR").is_some() {
+                    return false;
+                }
+                if let Ok(force) = std::env::var("CLICOLOR_FORCE") {
+                    if !force.is_empty() && force != "0" {
+                        return true;
+                    }
+                }
+                io::stdout().is_terminal()
+            }
+        }
+    }
+
+    pub fn should_color_stderr(self) -> bool {
+        match self {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => {
+                if std::env::var_os("NO_COLOR").is_some() {
+                    return false;
+                }
+                if let Ok(force) = std::env::var("CLICOLOR_FORCE") {
+                    if !force.is_empty() && force != "0" {
+                        return true;
+                    }
+                }
+                io::stderr().is_terminal()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "roke",
+    version,
+    about = "A quiet terminal todo list and Kanban board",
+    long_about = "roke — A quiet terminal todo list and Kanban board.\n\nRun with no subcommand to launch the interactive TUI, or use subcommands for scripting and AI agents.",
+    styles = clap_styles(),
+    subcommand_negates_reqs = false,
+)]
+pub struct Cli {
+    /// Path to JSONL task file
+    #[arg(short = 'f', long = "file", value_name = "PATH", global = true)]
+    pub file: Option<PathBuf>,
+
+    /// Path to TOML config file (theme + SSH sync)
+    #[arg(short = 'c', long = "config", value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
+
+    /// Output structured JSON (for CLI subcommands)
+    #[arg(long = "json", global = true)]
+    pub json: bool,
+
+    /// Control colored CLI output
+    #[arg(
+        long = "color",
+        value_enum,
+        default_value_t = ColorChoice::Auto,
+        value_name = "WHEN",
+        global = true
+    )]
+    pub color: ColorChoice,
+
+    /// Print default config.toml to stdout and exit
+    #[arg(long = "print-config")]
+    pub print_config: bool,
+
+    #[command(subcommand)]
+    pub command: Option<SubCommand>,
+}
+
+impl Cli {
+    pub fn storage_path(&self) -> PathBuf {
+        self.file.clone().unwrap_or_else(default_storage_path)
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.config.clone().unwrap_or_else(default_config_path)
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SubCommand {
+    /// List tasks (filter by status, priority, tag, or search)
+    #[command(alias = "ls")]
+    List(ListArgs),
+
+    /// Show details for a single task by ID or UID
+    #[command(alias = "show")]
+    Get {
+        /// Task numeric ID or stable UID
         selector: String,
-        input: UpdateTaskInput,
     },
+
+    /// Add a new task (or batch import via --stdin)
+    #[command(alias = "new")]
+    Add(AddArgs),
+
+    /// Edit fields or tags on an existing task
+    #[command(alias = "update")]
+    Edit(EditArgs),
+
+    /// View or edit a task's Markdown notes in $EDITOR (or via --print / --set / --stdin)
+    #[command(alias = "note")]
+    Notes(NotesArgs),
+
+    /// Move a task to todo, in-progress, or done
+    #[command(alias = "mv")]
     Move {
+        /// Task numeric ID or stable UID
         selector: String,
+        /// Target status (todo, in-progress, done)
+        #[arg(value_parser = Status::parse)]
         status: Status,
     },
+
+    /// Mark a task as done
     Done {
+        /// Task numeric ID or stable UID
         selector: String,
     },
-    Remove {
+
+    /// Delete a task and record a sync tombstone
+    #[command(aliases = ["delete", "del"])]
+    Rm {
+        /// Task numeric ID or stable UID
         selector: String,
     },
+
+    /// List all tags and their task counts
     Tags,
+
+    /// Sync tasks over SSH with peers configured in config.toml
     Sync,
+
+    /// Run built-in Model Context Protocol (MCP) server over stdio
     Mcp,
 }
 
-#[derive(Debug, Clone)]
-pub struct ParsedCli {
-    pub global: GlobalOptions,
-    pub command: Command,
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Filter by status (todo, in-progress, done)
+    #[arg(short = 's', long = "status", value_parser = Status::parse)]
+    pub status: Option<Status>,
+
+    /// Filter by priority (low, medium, high)
+    #[arg(short = 'p', long = "priority", value_parser = Priority::parse)]
+    pub priority: Option<Priority>,
+
+    /// Filter by tag(s); repeatable or comma-separated
+    #[arg(short = 't', long = "tag", visible_alias = "tags")]
+    pub tags: Vec<String>,
+
+    /// Match any tag (OR) instead of all tags (AND)
+    #[arg(long = "any-tag", visible_alias = "or")]
+    pub any_tag: bool,
+
+    /// Case-insensitive search across title, description, and tags
+    #[arg(short = 'q', long = "search")]
+    pub search: Option<String>,
+
+    /// Show descriptions and UIDs beneath each task
+    #[arg(short = 'v', long = "verbose")]
+    pub verbose: bool,
 }
 
-pub fn parse_args(args: &[String]) -> Result<ParsedCli, String> {
-    let mut storage_path = default_storage_path();
-    let mut config_path = default_config_path();
-    let mut json = false;
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Task title (omit when using --stdin)
+    #[arg(value_name = "TITLE")]
+    pub title: Vec<String>,
 
-    // First pass: extract global options while preserving subcommand + rest
-    let mut rest: Vec<String> = Vec::new();
-    let mut i = 0;
-    let mut after_double_dash = false;
+    /// Task description or notes
+    #[arg(short = 'd', long = "desc", visible_alias = "description", default_value = "")]
+    pub description: String,
 
-    while i < args.len() {
-        let arg = &args[i];
-        if after_double_dash {
-            rest.push(arg.clone());
-            i += 1;
-            continue;
-        }
-        if arg == "--" {
-            after_double_dash = true;
-            rest.push(arg.clone());
-            i += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "-f" | "--file" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                storage_path = PathBuf::from(val);
-            }
-            "-c" | "--config" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                config_path = PathBuf::from(val);
-            }
-            "--json" => {
-                json = true;
-            }
-            "--print-config" => {
-                return Ok(ParsedCli {
-                    global: GlobalOptions {
-                        storage_path,
-                        config_path,
-                        json,
-                    },
-                    command: Command::PrintConfig,
-                });
-            }
-            "-V" | "--version" => {
-                return Ok(ParsedCli {
-                    global: GlobalOptions {
-                        storage_path,
-                        config_path,
-                        json,
-                    },
-                    command: Command::Version,
-                });
-            }
-            _ => rest.push(arg.clone()),
-        }
-        i += 1;
-    }
+    /// Initial status (todo, in-progress, done)
+    #[arg(short = 's', long = "status", value_parser = Status::parse, default_value = "todo")]
+    pub status: Status,
 
-    let global = GlobalOptions {
-        storage_path,
-        config_path,
-        json,
-    };
+    /// Task priority (low, medium, high)
+    #[arg(short = 'p', long = "priority", value_parser = Priority::parse, default_value = "medium")]
+    pub priority: Priority,
 
-    if rest.is_empty() {
-        return Ok(ParsedCli {
-            global,
-            command: Command::Tui,
-        });
-    }
+    /// Tag(s); repeatable or comma-separated
+    #[arg(short = 't', long = "tag", visible_alias = "tags")]
+    pub tags: Vec<String>,
 
-    let first = rest[0].as_str();
-    let sub_args = &rest[1..];
+    /// Override task origin (defaults to local device_name)
+    #[arg(long = "origin")]
+    pub origin: Option<String>,
 
-    if first == "-h" || first == "--help" {
-        return Ok(ParsedCli {
-            global,
-            command: Command::Help(None),
-        });
-    }
-    if first == "help" {
-        let topic = sub_args.first().cloned();
-        return Ok(ParsedCli {
-            global,
-            command: Command::Help(topic),
-        });
-    }
-
-    // Per-subcommand help
-    if sub_args
-        .iter()
-        .take_while(|a| a.as_str() != "--")
-        .any(|a| a == "-h" || a == "--help")
-    {
-        return Ok(ParsedCli {
-            global,
-            command: Command::Help(Some(first.to_string())),
-        });
-    }
-
-    let command = match first {
-        "list" | "ls" => parse_list_args(sub_args)?,
-        "get" | "show" => parse_single_selector(first, sub_args)
-            .map(|selector| Command::Get { selector })?,
-        "add" | "new" => parse_add_args(sub_args)?,
-        "edit" | "update" => parse_edit_args(sub_args)?,
-        "move" | "mv" => parse_move_args(sub_args)?,
-        "done" => parse_single_selector("done", sub_args)
-            .map(|selector| Command::Done { selector })?,
-        "rm" | "delete" | "del" => parse_single_selector(first, sub_args)
-            .map(|selector| Command::Remove { selector })?,
-        "tags" => {
-            if !sub_args.is_empty() {
-                return Err(format!("unexpected argument for 'tags': {}", sub_args[0]));
-            }
-            Command::Tags
-        }
-        "sync" => {
-            if !sub_args.is_empty() {
-                return Err(format!("unexpected argument for 'sync': {}", sub_args[0]));
-            }
-            Command::Sync
-        }
-        "mcp" => {
-            if !sub_args.is_empty() {
-                return Err(format!("unexpected argument for 'mcp': {}", sub_args[0]));
-            }
-            Command::Mcp
-        }
-        other => {
-            return Err(format!(
-                "unknown command or option '{other}'. Run `roke --help` for usage."
-            ));
-        }
-    };
-
-    Ok(ParsedCli { global, command })
+    /// Read a JSON object, JSON array, or JSONL of tasks from stdin
+    #[arg(long = "stdin")]
+    pub from_stdin: bool,
 }
 
-fn parse_single_selector(cmd: &str, args: &[String]) -> Result<String, String> {
-    let mut positional = Vec::new();
-    let mut after_dd = false;
-    for arg in args {
-        if !after_dd && arg == "--" {
-            after_dd = true;
-            continue;
-        }
-        if !after_dd && arg.starts_with('-') {
-            return Err(format!("unknown option '{arg}' for '{cmd}'"));
-        }
-        positional.push(arg.clone());
-    }
-    match positional.len() {
-        1 => Ok(positional.remove(0)),
-        0 => Err(format!("missing task <id|uid> for '{cmd}'")),
-        _ => Err(format!(
-            "too many arguments for '{cmd}' (expected one <id|uid>)"
-        )),
-    }
+#[derive(Debug, Args)]
+pub struct EditArgs {
+    /// Task numeric ID or stable UID
+    pub selector: String,
+
+    /// New task title
+    #[arg(long = "title")]
+    pub title: Option<String>,
+
+    /// New task description
+    #[arg(short = 'd', long = "desc", visible_alias = "description")]
+    pub description: Option<String>,
+
+    /// New status (todo, in-progress, done)
+    #[arg(short = 's', long = "status", value_parser = Status::parse)]
+    pub status: Option<Status>,
+
+    /// New priority (low, medium, high)
+    #[arg(short = 'p', long = "priority", value_parser = Priority::parse)]
+    pub priority: Option<Priority>,
+
+    /// Replace all tags (pass "" to clear)
+    #[arg(short = 't', long = "tags")]
+    pub tags: Option<String>,
+
+    /// Add tag(s) without removing existing ones
+    #[arg(long = "add-tag")]
+    pub add_tags: Vec<String>,
+
+    /// Remove tag(s)
+    #[arg(long = "rm-tag", visible_alias = "remove-tag")]
+    pub remove_tags: Vec<String>,
+
+    /// Open the task's Markdown notes in $EDITOR (nvim, etc.)
+    #[arg(short = 'e', long = "editor")]
+    pub open_editor: bool,
 }
 
-fn parse_list_args(args: &[String]) -> Result<Command, String> {
-    let mut filter = TaskFilter::default();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        match arg.as_str() {
-            "-s" | "--status" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                filter.status = Some(Status::parse(val)?);
-            }
-            "-p" | "--priority" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                filter.priority = Some(Priority::parse(val)?);
-            }
-            "-t" | "--tag" | "--tags" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                filter.tags.extend(parse_tags(val));
-            }
-            "--any-tag" | "--or" => {
-                filter.tag_match_all = false;
-            }
-            "-q" | "--search" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                filter.search = Some(val.clone());
-            }
-            other => {
-                return Err(format!("unknown option '{other}' for 'list'"));
-            }
-        }
-        i += 1;
-    }
-    Ok(Command::List(filter))
-}
+#[derive(Debug, Args)]
+pub struct NotesArgs {
+    /// Task numeric ID or stable UID
+    pub selector: String,
 
-fn parse_add_args(args: &[String]) -> Result<Command, String> {
-    let mut input = AddTaskInput::default();
-    let mut from_stdin = false;
-    let mut title_parts: Vec<String> = Vec::new();
-    let mut after_dd = false;
-    let mut i = 0;
+    /// Print the raw Markdown notes to stdout without launching an editor
+    #[arg(short = 'p', long = "print")]
+    pub print: bool,
 
-    while i < args.len() {
-        let arg = &args[i];
-        if after_dd {
-            title_parts.push(arg.clone());
-            i += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => {
-                after_dd = true;
-            }
-            "--stdin" => {
-                from_stdin = true;
-            }
-            "-d" | "--desc" | "--description" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.description = val.clone();
-            }
-            "-s" | "--status" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.status = Status::parse(val)?;
-            }
-            "-p" | "--priority" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.priority = Priority::parse(val)?;
-            }
-            "-t" | "--tag" | "--tags" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.tags.extend(parse_tags(val));
-            }
-            "--origin" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.origin = Some(val.clone());
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown option '{other}' for 'add'"));
-            }
-            word => title_parts.push(word.to_string()),
-        }
-        i += 1;
-    }
+    /// Replace Markdown notes directly with this text
+    #[arg(long = "set", value_name = "MARKDOWN")]
+    pub set: Option<String>,
 
-    input.title = title_parts.join(" ").trim().to_string();
-    if !from_stdin && input.title.is_empty() {
-        return Err("missing task title. Usage: roke add <title> [OPTIONS]".into());
-    }
+    /// Replace Markdown notes by reading from stdin
+    #[arg(long = "stdin")]
+    pub from_stdin: bool,
 
-    Ok(Command::Add { input, from_stdin })
-}
-
-fn parse_edit_args(args: &[String]) -> Result<Command, String> {
-    let mut selector: Option<String> = None;
-    let mut input = UpdateTaskInput::default();
-    let mut after_dd = false;
-    let mut i = 0;
-
-    while i < args.len() {
-        let arg = &args[i];
-        if after_dd {
-            if selector.is_none() {
-                selector = Some(arg.clone());
-            } else {
-                return Err(format!("unexpected positional argument '{arg}' for 'edit'"));
-            }
-            i += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => after_dd = true,
-            "--title" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.title = Some(val.clone());
-            }
-            "-d" | "--desc" | "--description" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.description = Some(val.clone());
-            }
-            "-s" | "--status" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.status = Some(Status::parse(val)?);
-            }
-            "-p" | "--priority" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.priority = Some(Priority::parse(val)?);
-            }
-            "-t" | "--tags" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.tags = Some(parse_tags(val));
-            }
-            "--add-tag" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.add_tags.extend(parse_tags(val));
-            }
-            "--rm-tag" | "--remove-tag" => {
-                i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or_else(|| format!("missing value for {arg}"))?;
-                input.remove_tags.extend(parse_tags(val));
-            }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown option '{other}' for 'edit'"));
-            }
-            pos => {
-                if selector.is_none() {
-                    selector = Some(pos.to_string());
-                } else {
-                    return Err(format!("unexpected positional argument '{pos}' for 'edit'"));
-                }
-            }
-        }
-        i += 1;
-    }
-
-    let selector = selector
-        .ok_or_else(|| "missing task <id|uid>. Usage: roke edit <id|uid> [OPTIONS]".to_string())?;
-    if input.is_empty() {
-        return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag.".into());
-    }
-
-    Ok(Command::Edit { selector, input })
-}
-
-fn parse_move_args(args: &[String]) -> Result<Command, String> {
-    let mut positional = Vec::new();
-    let mut after_dd = false;
-    for arg in args {
-        if !after_dd && arg == "--" {
-            after_dd = true;
-            continue;
-        }
-        if !after_dd && arg.starts_with('-') {
-            return Err(format!("unknown option '{arg}' for 'move'"));
-        }
-        positional.push(arg.clone());
-    }
-    if positional.len() != 2 {
-        return Err("Usage: roke move <id|uid> <todo|in-progress|done>".into());
-    }
-    let selector = positional.remove(0);
-    let status = Status::parse(&positional.remove(0))?;
-    Ok(Command::Move { selector, status })
+    /// Clear the task's notes
+    #[arg(long = "clear")]
+    pub clear: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,94 +363,239 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
     Ok(out)
 }
 
-pub fn run_command(parsed: ParsedCli, cfg: &AppConfig) -> Result<(), String> {
-    let path = &parsed.global.storage_path;
-    let json = parsed.global.json;
+pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<(), String> {
+    let path = cli.storage_path();
+    let json = cli.json;
+    let painter = Painter::new(cfg.resolved_theme(), cli.color.should_color_stdout());
 
-    match parsed.command {
-        Command::Tui => unreachable!("TUI is handled by main"),
-        Command::PrintConfig => {
-            println!("{}", AppConfig::default_template_toml());
-        }
-        Command::Version => {
-            println!("roke {}", env!("CARGO_PKG_VERSION"));
-        }
-        Command::Help(topic) => {
-            print!("{}", help_text(topic.as_deref()));
-        }
-        Command::List(filter) => {
-            let tasks = ops::list_tasks(path, cfg, &filter)?;
+    match cmd {
+        SubCommand::List(args) => {
+            let filter = TaskFilter {
+                status: args.status,
+                priority: args.priority,
+                tags: args.tags.iter().flat_map(|t| parse_tags(t)).collect(),
+                tag_match_all: !args.any_tag,
+                search: args.search.clone(),
+            };
+            let tasks = ops::list_tasks(&path, cfg, &filter)?;
             if json {
                 print_json(&tasks)?;
             } else if tasks.is_empty() {
-                println!("No tasks found.");
+                println!("{}", painter.muted("No tasks found."));
             } else {
+                let id_width = tasks
+                    .iter()
+                    .map(|t| t.id.to_string().len() + 1)
+                    .max()
+                    .unwrap_or(2);
                 for task in &tasks {
-                    println!("{}", format_task_line(task));
+                    let eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                    println!("{}", painter.format_task_line(task, &eff_tags, id_width));
+                    if args.verbose {
+                        let indent = " ".repeat(id_width + 5);
+                        if !task.description.is_empty() {
+                            for line in task.description.lines() {
+                                println!("{indent}{}", painter.subtle(line));
+                            }
+                        }
+                        println!("{indent}{}", painter.muted(&format!("uid: {}", task.uid)));
+                    }
                 }
             }
         }
-        Command::Get { selector } => {
-            let task = ops::get_task(path, cfg, &selector)?;
+        SubCommand::Get { selector } => {
+            let task = ops::get_task(&path, cfg, selector)?;
             if json {
                 print_json(&task)?;
             } else {
-                print!("{}", format_task_detail(&task));
+                let eff_tags = ops::effective_tags_for(&task, &cfg.sync);
+                print!("{}", painter.format_task_detail(&task, &eff_tags));
             }
         }
-        Command::Add { input, from_stdin } => {
-            if from_stdin {
+        SubCommand::Add(args) => {
+            let input = AddTaskInput {
+                title: args.title.join(" ").trim().to_string(),
+                description: args.description.clone(),
+                status: args.status,
+                priority: args.priority,
+                tags: args.tags.iter().flat_map(|t| parse_tags(t)).collect(),
+                origin: args.origin.clone(),
+            };
+            if args.from_stdin {
                 let mut buf = String::new();
                 io::stdin()
                     .read_to_string(&mut buf)
                     .map_err(|e| format!("failed to read stdin: {e}"))?;
                 let batch = parse_stdin_tasks(&buf, &input)?;
-                let created = ops::add_tasks_batch(path, cfg, batch)?;
+                let created = ops::add_tasks_batch(&path, cfg, batch)?;
                 if json {
                     print_json(&created)?;
                 } else {
                     for task in &created {
-                        println!("Added {}", format_task_line(task));
+                        let eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                        println!(
+                            "{} {}",
+                            painter.badge("+", painter.theme.add),
+                            painter.format_task_line(task, &eff_tags, 0)
+                        );
                     }
                 }
             } else {
-                let task = ops::add_task(path, cfg, input)?;
+                if input.title.is_empty() {
+                    return Err("missing task title. Usage: roke add <TITLE> [OPTIONS]".into());
+                }
+                let task = ops::add_task(&path, cfg, input)?;
                 if json {
                     print_json(&task)?;
                 } else {
-                    println!("Added {}", format_task_line(&task));
+                    let eff_tags = ops::effective_tags_for(&task, &cfg.sync);
+                    println!(
+                        "{} {}",
+                        painter.badge("+", painter.theme.add),
+                        painter.format_task_line(&task, &eff_tags, 0)
+                    );
                 }
             }
         }
-        Command::Edit { selector, input } => {
-            let task = ops::update_task(path, cfg, &selector, input)?;
+        SubCommand::Edit(args) => {
+            let mut description = args.description.clone();
+            if args.open_editor {
+                let existing = ops::get_task(&path, cfg, &args.selector)?;
+                let seed = description.as_deref().unwrap_or(&existing.description);
+                if let Some(updated_md) = editor::edit_markdown_in_editor(
+                    seed,
+                    &existing.title,
+                    cfg.editor.as_deref(),
+                )? {
+                    description = Some(updated_md);
+                } else if args.title.is_none()
+                    && args.status.is_none()
+                    && args.priority.is_none()
+                    && args.tags.is_none()
+                    && args.add_tags.is_empty()
+                    && args.remove_tags.is_empty()
+                {
+                    if json {
+                        print_json(&existing)?;
+                    } else {
+                        println!("{}", painter.muted("No changes."));
+                    }
+                    return Ok(());
+                }
+            }
+            let input = UpdateTaskInput {
+                title: args.title.clone(),
+                description,
+                status: args.status,
+                priority: args.priority,
+                tags: args.tags.as_deref().map(parse_tags),
+                add_tags: args.add_tags.iter().flat_map(|t| parse_tags(t)).collect(),
+                remove_tags: args.remove_tags.iter().flat_map(|t| parse_tags(t)).collect(),
+            };
+            if input.is_empty() {
+                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --editor.".into());
+            }
+            let task = ops::update_task(&path, cfg, &args.selector, input)?;
             if json {
                 print_json(&task)?;
             } else {
-                println!("Updated {}", format_task_line(&task));
+                let eff_tags = ops::effective_tags_for(&task, &cfg.sync);
+                println!(
+                    "{} {}",
+                    painter.badge("✎", painter.theme.accent),
+                    painter.format_task_line(&task, &eff_tags, 0)
+                );
             }
         }
-        Command::Move { selector, status } => {
-            let task = ops::update_task(
-                path,
+        SubCommand::Notes(args) => {
+            let existing = ops::get_task(&path, cfg, &args.selector)?;
+            if args.print {
+                if json {
+                    print_json(&serde_json::json!({
+                        "id": existing.id,
+                        "uid": existing.uid,
+                        "title": existing.title,
+                        "notes": existing.description,
+                    }))?;
+                } else if !existing.description.is_empty() {
+                    println!("{}", existing.description);
+                }
+                return Ok(());
+            }
+
+            let new_notes: Option<String> = if args.clear {
+                Some(String::new())
+            } else if let Some(text) = &args.set {
+                Some(text.clone())
+            } else if args.from_stdin {
+                let mut buf = String::new();
+                io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| format!("failed to read stdin: {e}"))?;
+                Some(buf)
+            } else {
+                editor::edit_markdown_in_editor(
+                    &existing.description,
+                    &existing.title,
+                    cfg.editor.as_deref(),
+                )?
+            };
+
+            let Some(notes) = new_notes else {
+                if json {
+                    print_json(&existing)?;
+                } else {
+                    println!("{}", painter.muted("Notes unchanged."));
+                }
+                return Ok(());
+            };
+
+            let updated = ops::update_task(
+                &path,
                 cfg,
-                &selector,
+                &args.selector,
                 UpdateTaskInput {
-                    status: Some(status),
+                    description: Some(notes),
+                    ..UpdateTaskInput::default()
+                },
+            )?;
+            if json {
+                print_json(&updated)?;
+            } else {
+                let eff_tags = ops::effective_tags_for(&updated, &cfg.sync);
+                println!(
+                    "{} {}",
+                    painter.badge("✎", painter.theme.accent),
+                    painter.format_task_line(&updated, &eff_tags, 0)
+                );
+            }
+        }
+        SubCommand::Move { selector, status } => {
+            let task = ops::update_task(
+                &path,
+                cfg,
+                selector,
+                UpdateTaskInput {
+                    status: Some(*status),
                     ..UpdateTaskInput::default()
                 },
             )?;
             if json {
                 print_json(&task)?;
             } else {
-                println!("Moved {}", format_task_line(&task));
+                let eff_tags = ops::effective_tags_for(&task, &cfg.sync);
+                println!(
+                    "{} {}",
+                    painter.badge("→", painter.status_color(task.status)),
+                    painter.format_task_line(&task, &eff_tags, 0)
+                );
             }
         }
-        Command::Done { selector } => {
+        SubCommand::Done { selector } => {
             let task = ops::update_task(
-                path,
+                &path,
                 cfg,
-                &selector,
+                selector,
                 UpdateTaskInput {
                     status: Some(Status::Done),
                     ..UpdateTaskInput::default()
@@ -616,31 +604,47 @@ pub fn run_command(parsed: ParsedCli, cfg: &AppConfig) -> Result<(), String> {
             if json {
                 print_json(&task)?;
             } else {
-                println!("Done {}", format_task_line(&task));
+                let eff_tags = ops::effective_tags_for(&task, &cfg.sync);
+                println!(
+                    "{} {}",
+                    painter.badge("✓", painter.theme.done),
+                    painter.format_task_line(&task, &eff_tags, 0)
+                );
             }
         }
-        Command::Remove { selector } => {
-            let removed = ops::delete_task(path, cfg, &selector)?;
+        SubCommand::Rm { selector } => {
+            let removed = ops::delete_task(&path, cfg, selector)?;
             if json {
                 print_json(&removed)?;
             } else {
-                println!("Deleted #{} {}", removed.id, removed.title);
+                println!(
+                    "{} {} {}",
+                    painter.badge("✕", painter.theme.error),
+                    painter.muted(&format!("#{}", removed.id)),
+                    painter.strikethrough(&removed.title)
+                );
             }
         }
-        Command::Tags => {
-            let tags = ops::list_tags(path, cfg)?;
+        SubCommand::Tags => {
+            let tags = ops::list_tags(&path, cfg)?;
             if json {
                 print_json(&tags)?;
             } else if tags.is_empty() {
-                println!("No tags.");
+                println!("{}", painter.muted("No tags."));
             } else {
+                let width = tags.iter().map(|t| t.tag.len() + 1).max().unwrap_or(4);
                 for TagCount { tag, count } in tags {
-                    println!("#{tag}\t{count}");
+                    let padded = format!("{:<width$}", format!("#{tag}"));
+                    println!(
+                        "{}  {}",
+                        painter.colored(&padded, painter.theme.accent),
+                        painter.muted(&count.to_string())
+                    );
                 }
             }
         }
-        Command::Sync => {
-            let report: SyncReport = ops::sync_tasks(path, cfg)?;
+        SubCommand::Sync => {
+            let report: SyncReport = ops::sync_tasks(&path, cfg)?;
             if json {
                 print_json(&report)?;
             } else {
@@ -650,19 +654,24 @@ pub fn run_command(parsed: ParsedCli, cfg: &AppConfig) -> Result<(), String> {
                     "peers"
                 };
                 println!(
-                    "Synced {} {noun} ({} tasks total)",
-                    report.synced_peers, report.total_tasks
+                    "{} Synced {} {noun} {}",
+                    painter.badge("↻", painter.theme.accent),
+                    report.synced_peers,
+                    painter.muted(&format!("({} tasks total)", report.total_tasks))
                 );
                 for err in &report.errors {
-                    eprintln!("Sync error: {err}");
+                    eprintln!(
+                        "{} {err}",
+                        painter.badge("!", painter.theme.error)
+                    );
                 }
             }
             if !report.errors.is_empty() && report.synced_peers == 0 {
                 return Err(report.errors.join("; "));
             }
         }
-        Command::Mcp => {
-            let server = McpServer::new(path.clone(), cfg.clone());
+        SubCommand::Mcp => {
+            let server = McpServer::new(path, cfg.clone());
             server
                 .serve_stdio()
                 .map_err(|e| format!("MCP server I/O error: {e}"))?;
@@ -672,151 +681,208 @@ pub fn run_command(parsed: ParsedCli, cfg: &AppConfig) -> Result<(), String> {
     Ok(())
 }
 
+pub fn format_error(msg: &str, color_choice: ColorChoice) -> String {
+    if color_choice.should_color_stderr() {
+        let prefix = ContentStyle {
+            foreground_color: Some(crossterm::style::Color::Red),
+            attributes: Attribute::Bold.into(),
+            ..Default::default()
+        }
+        .apply("error:");
+        format!("{prefix} {msg}")
+    } else {
+        format!("error: {msg}")
+    }
+}
+
 fn print_json<T: serde::Serialize>(val: &T) -> Result<(), String> {
     let text = serde_json::to_string_pretty(val).map_err(|e| e.to_string())?;
     println!("{text}");
     Ok(())
 }
 
-fn format_task_line(task: &Task) -> String {
-    let tags = if task.tags.is_empty() {
-        String::new()
-    } else {
-        let joined = task
-            .tags
-            .iter()
-            .map(|t| format!("#{t}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("  {joined}")
-    };
-    format!(
-        "#{} {} {} {}{}",
-        task.id,
-        task.status.glyph(),
-        task.priority.dot(),
-        task.title,
-        tags
-    )
+pub struct Painter {
+    pub theme: Theme,
+    pub enabled: bool,
 }
 
-fn format_task_detail(task: &Task) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("#{} {}\n", task.id, task.title));
-    out.push_str(&format!("  uid:      {}\n", task.uid));
-    out.push_str(&format!("  status:   {}\n", task.status.label()));
-    out.push_str(&format!("  priority: {}\n", task.priority.label()));
-    if !task.tags.is_empty() {
-        let tags = task
-            .tags
-            .iter()
-            .map(|t| format!("#{t}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("  tags:     {tags}\n"));
+impl Painter {
+    pub fn new(theme: Theme, enabled: bool) -> Self {
+        Self { theme, enabled }
     }
-    if let Some(origin) = &task.origin {
-        out.push_str(&format!("  origin:   {origin}\n"));
-    }
-    if !task.description.is_empty() {
-        out.push_str(&format!("  desc:     {}\n", task.description));
-    }
-    out
-}
 
-pub fn help_text(topic: Option<&str>) -> &'static str {
-    match topic {
-        Some("list" | "ls") => {
-            "Usage: roke list [OPTIONS]\n\n\
-             List tasks from the store.\n\n\
-             Options:\n\
-               -s, --status <STATUS>      Filter by status (todo, in-progress, done)\n\
-               -p, --priority <PRIORITY>  Filter by priority (low, medium, high)\n\
-               -t, --tag <TAGS>           Filter by tag(s); repeatable or comma-separated\n\
-                   --any-tag              Match any tag (OR) instead of all tags (AND)\n\
-               -q, --search <QUERY>       Case-insensitive search in title, description, tags\n\
-                   --json                 Output JSON\n"
+    fn style(&self, text: &str, color: Color, bold: bool, dim: bool, strike: bool) -> String {
+        if !self.enabled {
+            return text.to_string();
         }
-        Some("get" | "show") => {
-            "Usage: roke get <ID|UID> [--json]\n\n\
-             Show details for a single task by numeric ID or UID.\n"
+        let mut style = ContentStyle {
+            foreground_color: Some(to_crossterm_color(color)),
+            ..Default::default()
+        };
+        if bold {
+            style.attributes.set(Attribute::Bold);
         }
-        Some("add" | "new") => {
-            "Usage: roke add <TITLE> [OPTIONS]\n\
-                    roke add --stdin [OPTIONS]\n\n\
-             Create one or more tasks.\n\n\
-             Options:\n\
-               -d, --desc <TEXT>          Task description\n\
-               -s, --status <STATUS>      Initial status (default: todo)\n\
-               -p, --priority <PRIORITY>  Priority: low, medium, high (default: medium)\n\
-               -t, --tag <TAGS>           Tag(s), comma-separated or repeated\n\
-                   --origin <NAME>        Override task origin (defaults to device_name)\n\
-                   --stdin                Read JSON object, JSON array, or JSONL from stdin\n\
-                   --json                 Output created task(s) as JSON\n"
+        if dim {
+            style.attributes.set(Attribute::Dim);
         }
-        Some("edit" | "update") => {
-            "Usage: roke edit <ID|UID> [OPTIONS]\n\n\
-             Update fields on an existing task.\n\n\
-             Options:\n\
-                   --title <TEXT>         New title\n\
-               -d, --desc <TEXT>          New description\n\
-               -s, --status <STATUS>      New status (todo, in-progress, done)\n\
-               -p, --priority <PRIORITY>  New priority (low, medium, high)\n\
-               -t, --tags <TAGS>          Replace all tags (empty string clears)\n\
-                   --add-tag <TAGS>       Add tag(s) without removing existing ones\n\
-                   --rm-tag <TAGS>        Remove tag(s)\n\
-                   --json                 Output updated task as JSON\n"
+        if strike {
+            style.attributes.set(Attribute::CrossedOut);
         }
-        Some("move" | "mv") => {
-            "Usage: roke move <ID|UID> <todo|in-progress|done> [--json]\n\n\
-             Move a task to a different status column.\n"
+        StyledContent::new(style, text).to_string()
+    }
+
+    fn colored(&self, text: &str, color: Color) -> String {
+        self.style(text, color, false, false, false)
+    }
+
+    fn badge(&self, glyph: &str, color: Color) -> String {
+        self.style(glyph, color, true, false, false)
+    }
+
+    fn muted(&self, text: &str) -> String {
+        self.style(text, self.theme.muted, false, false, false)
+    }
+
+    fn subtle(&self, text: &str) -> String {
+        self.style(text, self.theme.subtle, false, false, false)
+    }
+
+    fn strikethrough(&self, text: &str) -> String {
+        self.style(text, self.theme.muted, false, true, true)
+    }
+
+    fn status_color(&self, status: Status) -> Color {
+        match status {
+            Status::Todo => self.theme.todo,
+            Status::InProgress => self.theme.in_progress,
+            Status::Done => self.theme.done,
         }
-        Some("done") => {
-            "Usage: roke done <ID|UID> [--json]\n\n\
-             Mark a task as Done.\n"
+    }
+
+    fn priority_icon_and_color(&self, priority: Priority) -> (&'static str, Color) {
+        match priority {
+            Priority::High => ("▲", self.theme.priority_high),
+            Priority::Medium => ("•", self.theme.priority_medium),
+            Priority::Low => ("·", self.theme.priority_low),
         }
-        Some("rm" | "delete" | "del") => {
-            "Usage: roke rm <ID|UID> [--json]\n\n\
-             Delete a task and record a sync tombstone.\n"
+    }
+
+    pub fn format_task_line(&self, task: &Task, eff_tags: &[String], id_width: usize) -> String {
+        let raw_id = format!("#{}", task.id);
+        let id_str = if id_width > raw_id.len() {
+            format!("{raw_id:>id_width$}")
+        } else {
+            raw_id
+        };
+        let id_styled = self.muted(&id_str);
+        let status_styled = self.badge(task.status.glyph(), self.status_color(task.status));
+
+        let (prio_icon, prio_color) = self.priority_icon_and_color(task.priority);
+        let prio_styled = if task.status == Status::Done {
+            self.muted("·")
+        } else {
+            self.style(
+                prio_icon,
+                prio_color,
+                task.priority == Priority::High,
+                false,
+                false,
+            )
+        };
+
+        let title_styled = if task.status == Status::Done {
+            self.strikethrough(&task.title)
+        } else if task.priority == Priority::High {
+            self.style(&task.title, self.theme.text, true, false, false)
+        } else {
+            self.colored(&task.title, self.theme.text)
+        };
+
+        let tags_str = if eff_tags.is_empty() {
+            String::new()
+        } else {
+            let joined = eff_tags
+                .iter()
+                .map(|t| self.colored(&format!("#{t}"), self.theme.accent))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("  {joined}")
+        };
+
+        format!("{id_styled} {status_styled} {prio_styled} {title_styled}{tags_str}")
+    }
+
+    pub fn format_task_detail(&self, task: &Task, eff_tags: &[String]) -> String {
+        let mut out = String::new();
+        let status_color = self.status_color(task.status);
+        let (prio_icon, prio_color) = self.priority_icon_and_color(task.priority);
+
+        let header_title = if task.status == Status::Done {
+            self.strikethrough(&task.title)
+        } else {
+            self.style(&task.title, self.theme.text, true, false, false)
+        };
+        out.push_str(&format!(
+            "{} {} {}\n",
+            self.badge(task.status.glyph(), status_color),
+            self.muted(&format!("#{}", task.id)),
+            header_title
+        ));
+        out.push_str(&format!(
+            "  {} {}\n",
+            self.muted("uid:     "),
+            self.subtle(&task.uid)
+        ));
+        out.push_str(&format!(
+            "  {} {}\n",
+            self.muted("status:  "),
+            self.colored(
+                &format!("{} {}", task.status.glyph(), task.status.label()),
+                status_color
+            )
+        ));
+        out.push_str(&format!(
+            "  {} {}\n",
+            self.muted("priority:"),
+            self.colored(
+                &format!("{prio_icon} {}", task.priority.label()),
+                prio_color
+            )
+        ));
+        if !eff_tags.is_empty() {
+            let tags = eff_tags
+                .iter()
+                .map(|t| self.colored(&format!("#{t}"), self.theme.accent))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!("  {} {tags}\n", self.muted("tags:    ")));
         }
-        Some("tags") => {
-            "Usage: roke tags [--json]\n\n\
-             List all tags and their task counts.\n"
+        if let Some(origin) = &task.origin {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("origin:  "),
+                self.subtle(origin)
+            ));
         }
-        Some("sync") => {
-            "Usage: roke sync [--json]\n\n\
-             Run two-way SSH sync with peers configured in config.toml.\n"
+        if !task.description.is_empty() {
+            let lines: Vec<&str> = task.description.lines().collect();
+            if lines.len() <= 1 {
+                out.push_str(&format!(
+                    "  {} {}\n",
+                    self.muted("notes:   "),
+                    self.colored(&task.description, self.theme.text)
+                ));
+            } else {
+                out.push_str(&format!("  {}\n", self.muted("notes:")));
+                for line in lines {
+                    out.push_str(&format!(
+                        "    {}\n",
+                        self.colored(line, self.theme.text)
+                    ));
+                }
+            }
         }
-        Some("mcp") => {
-            "Usage: roke mcp [-f <PATH>] [-c <PATH>]\n\n\
-             Run a Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio.\n\
-             Exposes tools: list_tasks, get_task, add_task, update_task, delete_task,\n\
-             list_tags, sync_tasks — and resources: roke://tasks, roke://tags.\n"
-        }
-        _ => {
-            "roke — Terminal Todo & Kanban board\n\n\
-             Usage:\n\
-               roke [GLOBAL OPTIONS]                      Launch interactive TUI\n\
-               roke [GLOBAL OPTIONS] <COMMAND> [ARGS]     Run CLI command or MCP server\n\n\
-             Commands:\n\
-               list, ls       List tasks (filter by status, priority, tag, search)\n\
-               get, show      Show a single task by ID or UID\n\
-               add, new       Add a new task (or batch via --stdin)\n\
-               edit, update   Edit fields or tags on a task\n\
-               move, mv       Move a task to todo / in-progress / done\n\
-               done           Mark a task as done\n\
-               rm, delete     Delete a task (with sync tombstone)\n\
-               tags           List tags and counts\n\
-               sync           Sync tasks over SSH with configured peers\n\
-               mcp            Run built-in MCP server over stdio for AI agents\n\n\
-             Global Options:\n\
-               -f, --file <PATH>     Path to JSONL task file\n\
-               -c, --config <PATH>   Path to TOML config file (theme + SSH sync)\n\
-                   --json            Output structured JSON (for CLI commands)\n\
-                   --print-config    Print default config.toml to stdout\n\
-               -V, --version         Print version\n\
-               -h, --help            Show help (also `roke <command> --help`)\n"
-        }
+        out
     }
 }
 
@@ -828,13 +894,10 @@ mod tests {
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
-    fn s(items: &[&str]) -> Vec<String> {
-        items.iter().map(|v| v.to_string()).collect()
-    }
-
     #[test]
     fn parses_global_options_before_or_after_subcommand() {
-        let p = parse_args(&s(&[
+        let cli = Cli::try_parse_from([
+            "roke",
             "add",
             "Ship",
             "MCP",
@@ -845,19 +908,48 @@ mod tests {
             "--file",
             "/tmp/a.jsonl",
             "--json",
-        ]))
+            "--color",
+            "never",
+        ])
         .unwrap();
-        assert_eq!(p.global.storage_path, PathBuf::from("/tmp/a.jsonl"));
-        assert!(p.global.json);
-        match p.command {
-            Command::Add { input, from_stdin } => {
-                assert!(!from_stdin);
-                assert_eq!(input.title, "Ship MCP");
-                assert_eq!(input.priority, Priority::High);
-                assert_eq!(input.tags, vec!["work", "ai"]);
+        assert_eq!(cli.storage_path(), PathBuf::from("/tmp/a.jsonl"));
+        assert!(cli.json);
+        assert_eq!(cli.color, ColorChoice::Never);
+        match cli.command {
+            Some(SubCommand::Add(args)) => {
+                assert!(!args.from_stdin);
+                assert_eq!(args.title.join(" "), "Ship MCP");
+                assert_eq!(args.priority, Priority::High);
+                assert_eq!(args.tags, vec!["work,ai"]);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn painter_respects_color_toggle_and_icons() {
+        let task = Task {
+            id: 4,
+            uid: "local-1".into(),
+            title: "Review server details".into(),
+            description: String::new(),
+            status: Status::Todo,
+            priority: Priority::High,
+            tags: vec!["work".into()],
+            updated_at: 1,
+            origin: Some("local".into()),
+        };
+
+        let plain = Painter::new(Theme::default(), false);
+        let line_plain = plain.format_task_line(&task, &task.tags, 0);
+        assert_eq!(line_plain, "#4 ○ ▲ Review server details  #work");
+        assert!(!line_plain.contains('\x1b'));
+
+        let colored = Painter::new(Theme::default(), true);
+        let line_colored = colored.format_task_line(&task, &task.tags, 0);
+        assert!(line_colored.contains('\x1b'));
+        assert!(line_colored.contains("Review server details"));
+        assert!(line_colored.contains("#work"));
     }
 
     #[test]
@@ -895,7 +987,14 @@ mod tests {
         let file_str = file.to_string_lossy().to_string();
         let cfg = AppConfig::default();
 
-        let p = parse_args(&s(&[
+        let run = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let cmd = cli.command.as_ref().unwrap();
+            run_subcommand(&cli, cmd, &cfg).unwrap();
+        };
+
+        run(&[
+            "roke",
             "-f",
             &file_str,
             "add",
@@ -906,18 +1005,15 @@ mod tests {
             "high",
             "-t",
             "docs",
-        ]))
-        .unwrap();
-        run_command(p, &cfg).unwrap();
-
-        let p = parse_args(&s(&["-f", &file_str, "move", "1", "in-progress"])).unwrap();
-        run_command(p, &cfg).unwrap();
+        ]);
+        run(&["roke", "-f", &file_str, "move", "1", "in-progress"]);
 
         let task = ops::get_task(&file, &cfg, "1").unwrap();
         assert_eq!(task.title, "Draft RFC");
         assert_eq!(task.status, Status::InProgress);
 
-        let p = parse_args(&s(&[
+        run(&[
+            "roke",
             "-f",
             &file_str,
             "edit",
@@ -926,20 +1022,27 @@ mod tests {
             "urgent",
             "--title",
             "Finalize RFC",
-        ]))
-        .unwrap();
-        run_command(p, &cfg).unwrap();
+        ]);
+        run(&["roke", "-f", &file_str, "done", "1"]);
 
-        let p = parse_args(&s(&["-f", &file_str, "done", "1"])).unwrap();
-        run_command(p, &cfg).unwrap();
+        run(&[
+            "roke",
+            "-f",
+            &file_str,
+            "notes",
+            "1",
+            "--set",
+            "# Plan\n- [x] Ship notes",
+        ]);
+        let with_notes = ops::get_task(&file, &cfg, "1").unwrap();
+        assert_eq!(with_notes.description, "# Plan\n- [x] Ship notes");
 
         let updated = ops::get_task(&file, &cfg, "1").unwrap();
         assert_eq!(updated.title, "Finalize RFC");
         assert_eq!(updated.status, Status::Done);
         assert_eq!(updated.tags, vec!["docs", "urgent"]);
 
-        let p = parse_args(&s(&["-f", &file_str, "rm", "1"])).unwrap();
-        run_command(p, &cfg).unwrap();
+        run(&["roke", "-f", &file_str, "rm", "1"]);
         assert!(ops::list_tasks(&file, &cfg, &TaskFilter::default())
             .unwrap()
             .is_empty());

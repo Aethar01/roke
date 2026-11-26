@@ -143,6 +143,31 @@ impl Theme {
     }
 }
 
+pub fn to_crossterm_color(color: Color) -> crossterm::style::Color {
+    use crossterm::style::Color as Ct;
+    match color {
+        Color::Reset => Ct::Reset,
+        Color::Black => Ct::Black,
+        Color::Red => Ct::DarkRed,
+        Color::Green => Ct::DarkGreen,
+        Color::Yellow => Ct::DarkYellow,
+        Color::Blue => Ct::DarkBlue,
+        Color::Magenta => Ct::DarkMagenta,
+        Color::Cyan => Ct::DarkCyan,
+        Color::Gray => Ct::Grey,
+        Color::DarkGray => Ct::DarkGrey,
+        Color::LightRed => Ct::Red,
+        Color::LightGreen => Ct::Green,
+        Color::LightYellow => Ct::Yellow,
+        Color::LightBlue => Ct::Blue,
+        Color::LightMagenta => Ct::Magenta,
+        Color::LightCyan => Ct::Cyan,
+        Color::White => Ct::White,
+        Color::Rgb(r, g, b) => Ct::Rgb { r, g, b },
+        Color::Indexed(i) => Ct::AnsiValue(i),
+    }
+}
+
 pub fn parse_color(input: &str) -> Option<Color> {
     let trimmed = input.trim();
     if let Some(hex) = trimmed.strip_prefix('#') {

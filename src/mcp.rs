@@ -104,7 +104,7 @@ impl McpServer {
                     "name": "roke",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "roke is a terminal todo list and 3-column Kanban board (Todo, InProgress, Done). Use list_tasks, add_task, update_task, delete_task, list_tags, and sync_tasks to manage tasks. Prefer passing a task's stable `uid` (or numeric `id`) when updating or deleting. Changes saved here appear live in any open roke TUI."
+                "instructions": "roke is a terminal todo list and 3-column Kanban board (Todo, InProgress, Done). Use list_tasks, add_task, update_task, delete_task, list_tags, and sync_tasks to manage tasks. Prefer passing a task's stable `uid` (or numeric `id`) when updating or deleting. A task's `description` field holds optional Markdown notes (headings, checklists, code blocks, links) that users can also open in $EDITOR. Changes saved here appear live in any open roke TUI."
             }),
         )
     }
@@ -458,7 +458,7 @@ fn tool_definitions() -> Value {
                     },
                     "description": {
                         "type": "string",
-                        "description": "Optional longer description or notes."
+                        "description": "Optional Markdown notes (supports headings, checklists, links, code blocks)."
                     },
                     "status": {
                         "type": "string",
@@ -502,7 +502,7 @@ fn tool_definitions() -> Value {
                     },
                     "description": {
                         "type": "string",
-                        "description": "New task description."
+                        "description": "New Markdown notes for the task."
                     },
                     "status": {
                         "type": "string",

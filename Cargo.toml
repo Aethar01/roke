@@ -1,10 +1,11 @@
 [package]
 name = "roke"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A terminal todo and kanban app built with ratatui, vim keybindings, and mouse support"
 
 [dependencies]
+clap = { version = "4", features = ["derive", "color", "suggestions"] }
 crossterm = "0.28"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }

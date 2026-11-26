@@ -42,7 +42,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Verify binary
-        run: "./target/${{ matrix.target }}/release/roke" --version
+        run: ./target/${{ matrix.target }}/release/roke --version
 
       - name: Package tarball
         run: |

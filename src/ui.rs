@@ -556,6 +556,16 @@ fn render_tag_pills_wrapped(
     }
 }
 
+fn markdown_preview(desc: &str) -> (String, usize) {
+    let mut non_empty = desc.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = non_empty.next().unwrap_or("");
+    let cleaned = first.trim_start_matches('#').trim();
+    let preview = if cleaned.is_empty() { first } else { cleaned };
+    let total_lines = desc.lines().count();
+    let extra = total_lines.saturating_sub(1);
+    (preview.to_string(), extra)
+}
+
 fn todo_card_height(task: &Task) -> u16 {
     if task.description.is_empty() {
         3
@@ -749,10 +759,18 @@ fn render_todo_card(
     ])];
 
     if inner.height >= 2 && !task.description.is_empty() {
-        lines.push(Line::from(vec![
+        let (preview, extra_lines) = markdown_preview(&task.description);
+        let mut spans = vec![
             Span::raw("   "),
-            Span::styled(task.description.clone(), Style::default().fg(theme.muted)),
-        ]));
+            Span::styled(preview, Style::default().fg(theme.muted)),
+        ];
+        if extra_lines > 0 {
+            spans.push(Span::styled(
+                format!("  [md +{extra_lines}]"),
+                Style::default().fg(theme.subtle),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1041,11 +1059,14 @@ fn render_kanban_card(
     );
 
     if has_desc {
+        let (preview, extra_lines) = markdown_preview(&task.description);
+        let text = if extra_lines > 0 {
+            format!("{preview} [md +{extra_lines}]")
+        } else {
+            preview
+        };
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                task.description.clone(),
-                Style::default().fg(theme.muted),
-            )),
+            Paragraph::new(Span::styled(text, Style::default().fg(theme.muted))),
             Rect::new(padded.x, padded.y + title_h, padded.width, 1),
         );
     }
@@ -1182,21 +1203,29 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
 
     let desc_active = form.active_field == FormField::Description;
     let desc_w = rows[1].width as usize;
-    let (desc_slice, desc_cursor_off) =
-        visible_text_slice(&form.description.value, form.description.cursor, desc_w);
+    let desc_display = form.description.value.replace('\n', " ↵ ");
+    let (desc_slice, desc_cursor_off) = if form.description.value.contains('\n') {
+        let (preview, extra) = markdown_preview(&form.description.value);
+        let summary = format!("{preview}  [md +{extra} · Ctrl-E]");
+        let truncated: String = summary.chars().take(desc_w).collect();
+        (truncated, 0)
+    } else {
+        let (s, off) = visible_text_slice(&desc_display, form.description.cursor, desc_w);
+        (s.to_string(), off)
+    };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Notes",
-                field_label_style(&theme, desc_active),
-            )),
+            Line::from(vec![
+                Span::styled("Notes", field_label_style(&theme, desc_active)),
+                Span::styled("  (Ctrl-E: $EDITOR)", Style::default().fg(theme.muted)),
+            ]),
             Line::from(Span::styled(
                 if desc_slice.is_empty() && !desc_active {
-                    "optional"
+                    "optional markdown".to_string()
                 } else {
                     desc_slice
                 },
-                Style::default().fg(if desc_slice.is_empty() {
+                Style::default().fg(if form.description.value.is_empty() {
                     theme.muted
                 } else {
                     theme.text
@@ -1491,7 +1520,7 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
 
 fn render_help_modal(frame: &mut Frame, app: &mut App) {
     let theme = app.theme.clone();
-    let area = centered_rect(58, 22, frame.area());
+    let area = centered_rect(58, 23, frame.area());
     frame.render_widget(Clear, area);
     app.regions.help_modal = Some(area);
 
@@ -1505,6 +1534,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_section(&theme, "Tasks"),
         help_row(&theme, "a / o", "New task"),
         help_row(&theme, "e / i / Enter", "Edit task"),
+        help_row(&theme, "n", "Edit Markdown notes in $EDITOR"),
         help_row(&theme, "Space", "Toggle done / cycle status"),
         help_row(&theme, "H / L  < / >", "Move column left / right"),
         help_row(&theme, "J / K", "Reorder down / up"),

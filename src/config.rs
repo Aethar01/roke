@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// Optional editor command for editing Markdown task notes (overrides $VISUAL / $EDITOR).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
     #[serde(default)]
     pub theme: ThemeConfig,
     #[serde(default)]
@@ -152,6 +155,7 @@ impl AppConfig {
 
     pub fn default_template_toml() -> String {
         let sample = AppConfig {
+            editor: None,
             theme: ThemeConfig::default_template(),
             sync: SyncConfig {
                 device_name: Some(detect_hostname()),

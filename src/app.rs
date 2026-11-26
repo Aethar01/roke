@@ -240,6 +240,12 @@ impl TagMatchMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingEditor {
+    Task(u64),
+    Modal,
+}
+
 #[derive(Debug, Clone)]
 pub enum Mode {
     Normal,
@@ -345,9 +351,11 @@ pub struct App {
     pub store: TaskStore,
     pub storage_path: Option<PathBuf>,
     pub theme: Theme,
+    pub editor_config: Option<String>,
     pub sync_config: SyncConfig,
     pub sync_requested: bool,
     pub syncing: bool,
+    pub pending_editor: Option<PendingEditor>,
     pub view: View,
     pub mode: Mode,
     pub todo_filter: TodoFilter,
@@ -386,9 +394,11 @@ impl App {
             store,
             storage_path,
             theme,
+            editor_config: config.editor,
             sync_config: config.sync,
             sync_requested: false,
             syncing: false,
+            pending_editor: None,
             view: View::TodoList,
             mode: Mode::Normal,
             todo_filter: TodoFilter::All,
@@ -794,10 +804,75 @@ impl App {
         }
     }
 
+    pub fn open_notes_in_editor(&mut self) {
+        if let Some(id) = self.selected_task_id() {
+            self.pending_editor = Some(PendingEditor::Task(id));
+        }
+    }
+
+    pub fn editor_initial_content(&self, target: PendingEditor) -> Option<(String, String)> {
+        match target {
+            PendingEditor::Task(id) => self
+                .store
+                .get(id)
+                .map(|t| (t.description.clone(), t.title.clone())),
+            PendingEditor::Modal => {
+                if let Mode::TaskModal(form) = &self.mode {
+                    let title = if form.title.value.trim().is_empty() {
+                        "task".to_string()
+                    } else {
+                        form.title.value.clone()
+                    };
+                    Some((form.description.value.clone(), title))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub fn apply_editor_result(
+        &mut self,
+        target: PendingEditor,
+        result: Result<Option<String>, String>,
+    ) {
+        match result {
+            Err(err) => {
+                self.set_message(format!("Editor error: {err}"));
+            }
+            Ok(None) => {
+                self.set_message("Notes unchanged");
+            }
+            Ok(Some(markdown)) => match target {
+                PendingEditor::Task(id) => {
+                    self.push_undo();
+                    if let Some(task) = self.store.get_mut(id) {
+                        task.description = markdown;
+                        task.touch();
+                        self.persist();
+                        self.set_message("Notes updated");
+                    }
+                }
+                PendingEditor::Modal => {
+                    if let Mode::TaskModal(form) = &mut self.mode {
+                        form.description = TextInput::new(markdown);
+                        self.set_message("Notes updated in form");
+                    }
+                }
+            },
+        }
+    }
+
     fn handle_modal_key(&mut self, key: KeyEvent) {
         let Mode::TaskModal(mut form) = std::mem::replace(&mut self.mode, Mode::Normal) else {
             return;
         };
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+            self.mode = Mode::TaskModal(form);
+            self.pending_editor = Some(PendingEditor::Modal);
+            return;
+        }
 
         let mut keep_open = true;
         let mut submit = false;
@@ -903,7 +978,15 @@ impl App {
         if title.is_empty() {
             return Err("Title cannot be empty".into());
         }
-        let description = form.description.value.trim().to_string();
+        let description = if form.description.value.trim().is_empty() {
+            String::new()
+        } else {
+            form.description
+                .value
+                .replace("\r\n", "\n")
+                .trim_end()
+                .to_string()
+        };
         let tags = parse_tags(&form.tags.value);
         self.push_undo();
 
@@ -1032,6 +1115,9 @@ impl App {
             }
             KeyCode::Char('e') | KeyCode::Char('i') | KeyCode::Enter => {
                 self.open_edit_modal();
+            }
+            KeyCode::Char('n') => {
+                self.open_notes_in_editor();
             }
             KeyCode::Char(' ') => {
                 self.toggle_or_advance_selected();
@@ -2099,5 +2185,45 @@ inject_device_tag = true
         assert_eq!(on_disk.get(1).unwrap().status, Status::Done);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_editor_shortcuts_and_multiline_markdown_render() {
+        let mut app = sample_app();
+
+        // Press 'n' in Normal mode to request opening selected task notes in $EDITOR
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.pending_editor, Some(PendingEditor::Task(1)));
+        let target = app.pending_editor.take().unwrap();
+        let (initial, title) = app.editor_initial_content(target).unwrap();
+        assert_eq!(initial, "First task");
+        assert_eq!(title, "Alpha");
+
+        app.apply_editor_result(
+            target,
+            Ok(Some("# Alpha Notes\n- [ ] Step 1\n- [x] Step 2".into())),
+        );
+        assert_eq!(
+            app.store.get(1).unwrap().description,
+            "# Alpha Notes\n- [ ] Step 1\n- [x] Step 2"
+        );
+
+        // Press 'e' then Ctrl-E inside modal to open modal notes in $EDITOR
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(matches!(app.mode, Mode::TaskModal(_)));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.pending_editor, Some(PendingEditor::Modal));
+        let modal_target = app.pending_editor.take().unwrap();
+        app.apply_editor_result(modal_target, Ok(Some("# Updated\nMore lines".into())));
+
+        // Render modal + both views with multi-line Markdown without panic
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.store.get(1).unwrap().description, "# Updated\nMore lines");
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        app.handle_key(key(KeyCode::Char('2')));
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
     }
 }
