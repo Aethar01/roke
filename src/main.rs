@@ -1,70 +1,29 @@
 mod app;
+mod cli;
 mod config;
+mod mcp;
 mod model;
+mod ops;
 mod sync;
 mod theme;
 mod ui;
 
 use app::App;
-use config::{default_config_path, AppConfig};
+use cli::Command;
+use config::AppConfig;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use model::{default_storage_path, TaskStore};
+use model::TaskStore;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sync::SyncManager;
 
-struct CliOptions {
-    storage_path: PathBuf,
-    config_path: PathBuf,
-}
-
-fn parse_cli() -> CliOptions {
-    let mut storage_path = default_storage_path();
-    let mut config_path = default_config_path();
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--file" || arg == "-f" {
-            if let Some(path) = args.next() {
-                storage_path = PathBuf::from(path);
-            }
-        } else if arg == "--config" || arg == "-c" {
-            if let Some(path) = args.next() {
-                config_path = PathBuf::from(path);
-            }
-        } else if arg == "--print-config" {
-            println!("{}", AppConfig::default_template_toml());
-            std::process::exit(0);
-        } else if arg == "--version" || arg == "-V" {
-            println!("roke {}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
-        } else if arg == "--help" || arg == "-h" {
-            println!("roke — Terminal Todo & Kanban board");
-            println!();
-            println!("Usage: roke [OPTIONS]");
-            println!();
-            println!("Options:");
-            println!("  -f, --file <PATH>     Path to JSONL task file");
-            println!("  -c, --config <PATH>   Path to TOML config file (theme + SSH sync)");
-            println!("      --print-config    Print default config.toml to stdout");
-            println!("  -V, --version         Print version");
-            println!("  -h, --help            Show this help message");
-            std::process::exit(0);
-        }
-    }
-
-    CliOptions {
-        storage_path,
-        config_path,
-    }
-}
+const LIVE_RELOAD_INTERVAL: Duration = Duration::from_millis(500);
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -72,24 +31,53 @@ fn restore_terminal() {
 }
 
 fn main() -> io::Result<()> {
-    let opts = parse_cli();
-    let cfg = match AppConfig::load_or_default(&opts.config_path) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let parsed = match cli::parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+    };
+
+    // Commands that do not need config or task file loading
+    match parsed.command {
+        Command::PrintConfig | Command::Version | Command::Help(_) => {
+            if let Err(err) = cli::run_command(parsed, &AppConfig::default()) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let cfg = match AppConfig::load_or_default(&parsed.global.config_path) {
         Ok(cfg) => cfg,
         Err(err) => {
             eprintln!(
                 "Warning: could not load config {}: {err}. Using defaults.",
-                opts.config_path.display()
+                parsed.global.config_path.display()
             );
             AppConfig::default()
         }
     };
 
-    let mut store = match TaskStore::load_or_init(&opts.storage_path) {
+    if !matches!(parsed.command, Command::Tui) {
+        if let Err(err) = cli::run_command(parsed, &cfg) {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let storage_path = parsed.global.storage_path;
+    let mut store = match TaskStore::load_or_init(&storage_path) {
         Ok(store) => store,
         Err(err) => {
             eprintln!(
                 "Warning: could not load {}: {err}. Starting with empty list.",
-                opts.storage_path.display()
+                storage_path.display()
             );
             TaskStore::new_empty()
         }
@@ -108,7 +96,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::with_config(store, Some(opts.storage_path), cfg);
+    let mut app = App::with_config(store, Some(storage_path), cfg);
     let mut sync_mgr = SyncManager::new();
     if app.sync_config.auto_sync_on_start && !app.sync_config.peers.is_empty() {
         app.request_sync();
@@ -127,7 +115,14 @@ fn run_loop(
     app: &mut App,
     sync_mgr: &mut SyncManager,
 ) -> io::Result<()> {
+    let mut last_reload_check = Instant::now();
+
     loop {
+        if last_reload_check.elapsed() >= LIVE_RELOAD_INTERVAL {
+            app.reload_if_changed();
+            last_reload_check = Instant::now();
+        }
+
         if app.sync_requested && !sync_mgr.in_flight {
             app.sync_requested = false;
             if sync_mgr.trigger(app.store.clone(), app.sync_config.clone()) {

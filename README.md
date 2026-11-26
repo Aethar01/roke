@@ -21,7 +21,8 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 - **Two views, one store** — Switch seamlessly between a **Todo List** (`All`, `To Do`, `In Progress`, `Done`) and a three-column **Kanban Board** (`Tab`, `gt`, `1`/`2`, or click the header tabs).
 - **Vim-first, mouse-friendly** — Navigate with `h`/`j`/`k`/`l`, `gg`/`G`, move cards across columns with `H`/`L` or `<`/`>`, reorder with `J`/`K`, undo with `u`, and search live with `/`. Click tabs, filters, checkboxes (`○`/`◐`/`✓`), double-click cards to edit, scroll with the wheel, and drag-and-drop cards across Kanban columns.
 - **Zero-clutter multi-tag filtering** — Tag tasks (`work, personal`), filter by multiple tags at once via clicks or the `t` picker, and toggle between `and` (match all) and `or` (match any). Tags tuck quietly into card bottom borders and disappear completely when unused.
-- **Plain JSONL storage** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), one compact JSON object per line with atomic saves. Easy to inspect with `jq` or `rg`, or append from shell scripts.
+- **Plain JSONL storage & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), one compact JSON object per line with atomic saves. The TUI watches for external changes and reloads live, merging safely on save.
+- **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`move`/`done`/`rm`/`tags`/`sync` (with `--json`), or connect any MCP client directly with `roke mcp`.
 - **TOML config & theming** — Override any colour in `$XDG_CONFIG_HOME/roke/config.toml` using ANSI-16 names (`blue`, `dark_gray`, `reset`), 256-color indices, or `#rrggbb` hex values.
 - **Conflict-free SSH sync** — Two-way background sync over system `ssh` (`BatchMode=yes`, honoring `~/.ssh/config`) using last-write-wins timestamps and tombstones. Works across `bash`, `zsh`, `sh`, and `fish` login shells, with an optional `inject_device_tag` setting to dynamically tag tasks with the machine they came from.
 
@@ -45,11 +46,46 @@ install -m 755 target/release/roke ~/.local/bin/roke
 ## Usage
 
 ```bash
-roke                                     # open default store (~/.local/share/roke/todos.jsonl)
+roke                                     # open interactive TUI (~/.local/share/roke/todos.jsonl)
 roke --file ./project-todos.jsonl        # use a specific JSONL task file
 roke --config ./config.toml              # use a specific TOML config file
 roke --print-config                      # print a full starter config.toml to stdout
 ```
+
+### CLI & agent usage
+
+All subcommands accept `--file`, `--config`, and `--json`, and accept either a numeric task ID or stable `uid`. Any edits appear live in an open `roke` TUI.
+
+```bash
+roke list --status todo --tag work --json
+roke add "Ship release" -d "Tag v0.2 and publish" -p high -t work,release --json
+roke edit 1 --add-tag urgent --priority high
+roke move 1 in-progress
+roke done 1
+roke rm 1
+roke tags --json
+roke sync --json
+
+# Batch add from JSON array or JSONL on stdin
+echo '[{"title":"Task A","priority":"high"},{"title":"Task B","tags":["ops"]}]' | roke add --stdin --json
+```
+
+### MCP server (`roke mcp`)
+
+`roke` includes a zero-dependency stdio [Model Context Protocol](https://modelcontextprotocol.io/) server so AI agents (Claude Desktop, Claude Code, Cursor, T3 Code, etc.) can read and update your board directly:
+
+```json
+{
+  "mcpServers": {
+    "roke": {
+      "command": "roke",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-specific board. Exposed tools: `list_tasks`, `get_task`, `add_task`, `update_task`, `delete_task`, `list_tags`, and `sync_tasks`, plus `roke://tasks` and `roke://tags` resources.
 
 ### Keybindings
 

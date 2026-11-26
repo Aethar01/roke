@@ -1,5 +1,7 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
-use crate::model::{format_tags, parse_tags, Priority, Status, Task, TaskStore};
+use crate::model::{
+    file_stamp, format_tags, parse_tags, FileStamp, Priority, Status, Task, TaskStore,
+};
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -365,6 +367,8 @@ pub struct App {
     pub regions: LayoutRegions,
     pub should_quit: bool,
     last_click: Option<LastClick>,
+    last_file_stamp: Option<FileStamp>,
+    dirty: bool,
 }
 
 const MAX_UNDO: usize = 50;
@@ -377,6 +381,7 @@ impl App {
 
     pub fn with_config(store: TaskStore, storage_path: Option<PathBuf>, config: AppConfig) -> Self {
         let theme = config.resolved_theme();
+        let last_file_stamp = storage_path.as_deref().and_then(file_stamp);
         Self {
             store,
             storage_path,
@@ -403,6 +408,8 @@ impl App {
             regions: LayoutRegions::default(),
             should_quit: false,
             last_click: None,
+            last_file_stamp,
+            dirty: false,
         }
     }
 
@@ -564,11 +571,23 @@ impl App {
     }
 
     fn persist_inner(&mut self, allow_auto_sync: bool) {
-        if let Some(path) = &self.storage_path {
-            if let Err(err) = self.store.save(path) {
+        self.dirty = true;
+        if let Some(path) = self.storage_path.clone() {
+            let current_stamp = file_stamp(&path);
+            if current_stamp.is_some() && current_stamp != self.last_file_stamp {
+                if let Ok(mut disk_store) = TaskStore::load_or_empty(&path) {
+                    let local_name = self.sync_config.effective_device_name();
+                    disk_store.ensure_sync_metadata(&local_name);
+                    self.store =
+                        merge_stores(&self.store, &disk_store, &local_name, &local_name);
+                }
+            }
+            if let Err(err) = self.store.save(&path) {
                 self.status_message = Some(format!("Save failed: {err}"));
                 return;
             }
+            self.last_file_stamp = file_stamp(&path);
+            self.dirty = false;
         }
         if allow_auto_sync
             && self.sync_config.auto_sync_on_save
@@ -576,6 +595,50 @@ impl App {
         {
             self.sync_requested = true;
         }
+    }
+
+    /// Check whether `storage_path` was modified externally (e.g. by CLI, MCP, or another process)
+    /// and reload/merge changes into the live TUI without losing selection.
+    pub fn reload_if_changed(&mut self) -> bool {
+        let Some(path) = self.storage_path.clone() else {
+            return false;
+        };
+        let current_stamp = file_stamp(&path);
+        if current_stamp.is_none() || current_stamp == self.last_file_stamp {
+            return false;
+        }
+        let Ok(mut disk_store) = TaskStore::load_or_empty(&path) else {
+            return false;
+        };
+        let local_name = self.sync_config.effective_device_name();
+        disk_store.ensure_sync_metadata(&local_name);
+
+        let selected_uid = self
+            .selected_task_id()
+            .and_then(|id| self.store.get(id))
+            .map(|t| t.uid.clone());
+
+        let next_store = if self.dirty {
+            merge_stores(&self.store, &disk_store, &local_name, &local_name)
+        } else {
+            disk_store
+        };
+
+        let changed = next_store != self.store;
+        self.store = next_store;
+        self.last_file_stamp = current_stamp;
+        self.clamp_selections();
+
+        if let Some(uid) = selected_uid {
+            if let Some(id) = self.store.tasks.iter().find(|t| t.uid == uid).map(|t| t.id) {
+                self.select_task_by_id(id);
+            }
+        }
+
+        if changed {
+            self.set_message("Reloaded external changes");
+        }
+        changed
     }
 
     pub fn request_sync(&mut self) {
@@ -627,7 +690,9 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.persist();
+            if self.dirty {
+                self.persist();
+            }
             self.should_quit = true;
             return;
         }
@@ -892,7 +957,9 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => {
-                self.persist();
+                if self.dirty {
+                    self.persist();
+                }
                 self.should_quit = true;
             }
             KeyCode::Char('?') => {
@@ -1972,5 +2039,65 @@ inject_device_tag = true
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         app.mode = Mode::Help;
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn live_reload_and_merge_on_save_preserve_external_writes() {
+        use crate::ops::{self, AddTaskInput};
+        let dir = std::env::temp_dir().join(format!("roke_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("todos.jsonl");
+
+        let mut initial = TaskStore::new_empty();
+        initial.add_with_origin(
+            "Existing".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+            "local",
+        );
+        initial.save(&path).unwrap();
+
+        let cfg = AppConfig::default();
+        let mut app = App::with_config(initial, Some(path.clone()), cfg.clone());
+        assert!(!app.reload_if_changed());
+
+        // External agent adds a task via ops
+        let ext1 = ops::add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Added by agent".into(),
+                priority: Priority::High,
+                tags: vec!["agent".into()],
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+
+        assert!(app.reload_if_changed());
+        assert_eq!(app.store.tasks.len(), 2);
+        assert!(app.store.tasks.iter().any(|t| t.uid == ext1.uid));
+
+        // Another external write happens right before a TUI edit (before reload tick)
+        let ext2 = ops::add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Concurrent agent task".into(),
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+
+        // User toggles task 1 done in TUI; persist() must merge instead of clobbering ext2
+        app.toggle_task_done(1);
+        let on_disk = TaskStore::load_or_empty(&path).unwrap();
+        assert_eq!(on_disk.tasks.len(), 3);
+        assert!(on_disk.tasks.iter().any(|t| t.uid == ext2.uid));
+        assert_eq!(on_disk.get(1).unwrap().status, Status::Done);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -8,6 +8,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static UID_SEQ: AtomicU64 = AtomicU64::new(1);
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub modified: Option<SystemTime>,
+    pub len: u64,
+    #[cfg(unix)]
+    pub ino: u64,
+}
+
+pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    Some(FileStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+        #[cfg(unix)]
+        ino,
+    })
+}
 
 pub fn now_millis() -> u64 {
     SystemTime::now()
@@ -90,6 +114,18 @@ impl Status {
             Status::Done => Status::Todo,
         }
     }
+
+    pub fn parse(raw: &str) -> Result<Status, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "todo" | "to-do" | "to_do" | "to do" | "open" => Ok(Status::Todo),
+            "in_progress" | "in-progress" | "inprogress" | "in progress" | "doing" | "wip"
+            | "active" => Ok(Status::InProgress),
+            "done" | "complete" | "completed" | "closed" => Ok(Status::Done),
+            other => Err(format!(
+                "invalid status '{other}' (expected: todo, in-progress, done)"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +157,17 @@ impl Priority {
             Priority::Low => Priority::Medium,
             Priority::Medium => Priority::High,
             Priority::High => Priority::Low,
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Priority, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" | "l" | "1" => Ok(Priority::Low),
+            "medium" | "med" | "m" | "2" => Ok(Priority::Medium),
+            "high" | "h" | "3" | "urgent" => Ok(Priority::High),
+            other => Err(format!(
+                "invalid priority '{other}' (expected: low, medium, high)"
+            )),
         }
     }
 }
@@ -314,6 +361,29 @@ impl TaskStore {
         self.tasks.iter_mut().find(|t| t.id == id)
     }
 
+    /// Resolve a task selector by exact UID, numeric ID, or unique UID prefix (>= 4 chars).
+    pub fn find_id(&self, selector: &str) -> Option<u64> {
+        let needle = selector.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        if let Some(task) = self.tasks.iter().find(|t| t.uid == needle) {
+            return Some(task.id);
+        }
+        if let Ok(id) = needle.parse::<u64>() {
+            if self.tasks.iter().any(|t| t.id == id) {
+                return Some(id);
+            }
+        }
+        if needle.len() >= 4 {
+            let mut matches = self.tasks.iter().filter(|t| t.uid.starts_with(needle));
+            if let (Some(first), None) = (matches.next(), matches.next()) {
+                return Some(first.id);
+            }
+        }
+        None
+    }
+
     pub fn remove(&mut self, id: u64) -> Option<Task> {
         let pos = self.tasks.iter().position(|t| t.id == id)?;
         let removed = self.tasks.remove(pos);
@@ -462,6 +532,23 @@ impl TaskStore {
         Self::from_str_auto(&raw)
     }
 
+    /// Load an existing task store (migrating legacy `.json` if present) or return an empty store
+    /// without injecting tutorial starter tasks. Ideal for CLI, MCP, and live reloads.
+    pub fn load_or_empty(path: &Path) -> io::Result<Self> {
+        if !path.exists() {
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                let legacy_path = path.with_extension("json");
+                if legacy_path.exists() {
+                    let raw = fs::read_to_string(&legacy_path)?;
+                    return Self::from_str_auto(&raw);
+                }
+            }
+            return Ok(Self::new_empty());
+        }
+        let raw = fs::read_to_string(path)?;
+        Self::from_str_auto(&raw)
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -469,12 +556,14 @@ impl TaskStore {
             }
         }
         let content = self.to_jsonl()?;
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp_name = format!(
-            ".{}.tmp.{}",
+            ".{}.tmp.{}.{}",
             path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("todos.jsonl"),
-            std::process::id()
+            std::process::id(),
+            seq
         );
         let tmp_path = path.with_file_name(tmp_name);
         fs::write(&tmp_path, content)?;
