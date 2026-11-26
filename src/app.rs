@@ -1,7 +1,7 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
-    file_stamp, format_tags, parse_tags, FileStamp, Priority, Status, Task, TaskStore,
+    file_stamp, format_tags, now_millis, parse_tags, FileStamp, Priority, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -1462,9 +1462,75 @@ impl App {
         }
     }
 
+    fn reconcile_restored_store(current: &TaskStore, mut restored: TaskStore) -> TaskStore {
+        let now = now_millis();
+        let current_by_uid: std::collections::HashMap<&str, &Task> = current
+            .tasks
+            .iter()
+            .filter(|t| !t.uid.is_empty())
+            .map(|t| (t.uid.as_str(), t))
+            .collect();
+
+        // Keep tombstones from current for tasks not resurrected in `restored`
+        for (uid, &ts) in &current.tombstones {
+            restored
+                .tombstones
+                .entry(uid.clone())
+                .and_modify(|cur| {
+                    if ts > *cur {
+                        *cur = ts;
+                    }
+                })
+                .or_insert(ts);
+        }
+
+        let mut restored_uids = std::collections::HashSet::new();
+        for task in &mut restored.tasks {
+            if !task.uid.is_empty() {
+                restored_uids.insert(task.uid.clone());
+            }
+            let tomb_ts = restored.tombstones.remove(&task.uid).unwrap_or(0);
+            match current_by_uid.get(task.uid.as_str()) {
+                None => {
+                    // Resurrected task (e.g. undoing a delete): beat any tombstone
+                    task.updated_at = now
+                        .max(task.updated_at.saturating_add(1))
+                        .max(tomb_ts.saturating_add(1));
+                }
+                Some(cur) => {
+                    if **cur != *task {
+                        task.updated_at = now
+                            .max(cur.updated_at.saturating_add(1))
+                            .max(task.updated_at.saturating_add(1))
+                            .max(tomb_ts.saturating_add(1));
+                    }
+                }
+            }
+        }
+
+        // Tasks present in `current` but absent in `restored` (e.g. undoing an add) need tombstones
+        for cur in &current.tasks {
+            if !cur.uid.is_empty() && !restored_uids.contains(&cur.uid) {
+                let del_ts = now.max(cur.updated_at.saturating_add(1));
+                restored
+                    .tombstones
+                    .entry(cur.uid.clone())
+                    .and_modify(|ts| {
+                        if del_ts > *ts {
+                            *ts = del_ts;
+                        }
+                    })
+                    .or_insert(del_ts);
+            }
+        }
+
+        restored.next_id = restored.next_id.max(current.next_id);
+        restored
+    }
+
     fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
-            self.store = prev;
+            self.store = Self::reconcile_restored_store(&self.store, prev);
             self.persist();
             self.clamp_selections();
             self.set_message("Undid last change");
@@ -2024,6 +2090,67 @@ inject_device_tag = true
         // Undo delete
         app.handle_key(key(KeyCode::Char('u')));
         assert_eq!(app.filtered_todo_ids(), vec![2, 1, 3, 4]);
+    }
+
+    #[test]
+    fn undo_bumps_lww_timestamps_and_survives_sync_merge() {
+        let mut app = sample_app();
+        let uid1 = app.store.get(1).unwrap().uid.clone();
+
+        // Delete task 1, simulate remote receiving that tombstone
+        app.handle_key(key(KeyCode::Char('d')));
+        let remote_after_delete = app.store.clone();
+        assert!(remote_after_delete.tombstones.contains_key(&uid1));
+
+        // Undo delete locally, then merge with remote that still has the tombstone
+        app.handle_key(key(KeyCode::Char('u')));
+        let merged = merge_stores(&app.store, &remote_after_delete, "local", "peer");
+        assert!(
+            merged.tasks.iter().any(|t| t.uid == uid1),
+            "resurrected task must beat prior tombstone on sync"
+        );
+
+        // Edit task 1 (toggle done), simulate remote receiving the edit
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.store.get(1).unwrap().status, Status::Done);
+        let remote_after_edit = app.store.clone();
+
+        // Undo edit locally, then merge with remote
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.store.get(1).unwrap().status, Status::Todo);
+        let merged_edit = merge_stores(&app.store, &remote_after_edit, "local", "peer");
+        assert_eq!(
+            merged_edit
+                .tasks
+                .iter()
+                .find(|t| t.uid == uid1)
+                .unwrap()
+                .status,
+            Status::Todo
+        );
+
+        // Add a task, simulate remote receiving it, then undo add
+        app.handle_key(key(KeyCode::Char('a')));
+        for ch in "Temp task".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        let added_uid = app
+            .store
+            .tasks
+            .iter()
+            .find(|t| t.title == "Temp task")
+            .unwrap()
+            .uid
+            .clone();
+        let remote_with_added = app.store.clone();
+
+        app.handle_key(key(KeyCode::Char('u')));
+        let merged_add = merge_stores(&app.store, &remote_with_added, "local", "peer");
+        assert!(
+            !merged_add.tasks.iter().any(|t| t.uid == added_uid),
+            "undone task addition must record tombstone so sync does not resurrect it"
+        );
     }
 
     #[test]
