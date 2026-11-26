@@ -1,7 +1,7 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::model::{
-    now_millis, parse_due_date, parse_tags, today_ymd, DueState, FileLock, Priority, Status, Task,
-    TaskStore,
+    now_millis, parse_due_date, parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority,
+    SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, sync_all_peers};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ pub struct TaskFilter {
     pub tag_match_all: bool,
     pub search: Option<String>,
     pub overdue_only: bool,
+    pub sort: SortOrder,
 }
 
 impl Default for TaskFilter {
@@ -27,6 +28,7 @@ impl Default for TaskFilter {
             tag_match_all: true,
             search: None,
             overdue_only: false,
+            sort: SortOrder::Manual,
         }
     }
 }
@@ -200,11 +202,13 @@ fn save_store(store: &TaskStore, path: &Path) -> Result<(), String> {
 
 pub fn list_tasks(path: &Path, cfg: &AppConfig, filter: &TaskFilter) -> Result<Vec<Task>, String> {
     let store = load_store(path, cfg)?;
-    Ok(store
+    let mut tasks: Vec<Task> = store
         .tasks
         .into_iter()
         .filter(|t| matches_filter(t, filter, &cfg.sync))
-        .collect())
+        .collect();
+    sort_tasks(&mut tasks, filter.sort);
+    Ok(tasks)
 }
 
 pub fn board_snapshot(

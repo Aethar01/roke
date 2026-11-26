@@ -9,6 +9,15 @@ pub struct AppConfig {
     /// Optional editor command for editing Markdown task notes (overrides $VISUAL / $EDITOR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
+    /// Optional startup view ("todos" or "kanban").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_view: Option<String>,
+    /// Optional startup filter for Todo List ("all", "todo", "in-progress", "done").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_filter: Option<String>,
+    /// Optional startup sort order ("manual", "priority", "due", "updated").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sort: Option<String>,
     #[serde(default)]
     pub theme: ThemeConfig,
     #[serde(default)]
@@ -162,6 +171,9 @@ impl AppConfig {
     pub fn default_template_toml() -> String {
         let sample = AppConfig {
             editor: None,
+            default_view: Some("todos".into()),
+            default_filter: Some("all".into()),
+            default_sort: Some("manual".into()),
             theme: ThemeConfig::default_template(),
             sync: SyncConfig {
                 device_name: Some(detect_hostname()),

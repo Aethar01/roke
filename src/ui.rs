@@ -1,5 +1,5 @@
 use crate::app::{App, FormField, ModalRegions, Mode, TagModalRegions, TaskForm, TodoFilter, View};
-use crate::model::{today_ymd, DueState, Priority, Status, Task};
+use crate::model::{today_ymd, DueState, Priority, SortOrder, Status, Task};
 use crate::theme::Theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -176,6 +176,20 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
                         theme.subtle
                     }),
                 )),
+                rect,
+            );
+        }
+    }
+
+    if app.sort_order != SortOrder::Manual {
+        let sort_label = format!("↕ {}", app.sort_order.label());
+        let sort_w = sort_label.width() as u16;
+        if right_edge > x + sort_w + 1 {
+            right_edge -= sort_w + 2;
+            let rect = Rect::new(right_edge, y, sort_w, 1);
+            app.regions.sort_btn = rect;
+            frame.render_widget(
+                Paragraph::new(Span::styled(sort_label, Style::default().fg(theme.accent))),
                 rect,
             );
         }
@@ -1822,7 +1836,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
 
 fn render_help_modal(frame: &mut Frame, app: &mut App) {
     let theme = app.theme.clone();
-    let area = centered_rect(58, 25, frame.area());
+    let area = centered_rect(58, 26, frame.area());
     frame.render_widget(Clear, area);
     app.regions.help_modal = Some(area);
 
@@ -1846,6 +1860,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_row(&theme, "H / L  < / >", "Move column left / right"),
         help_row(&theme, "J / K", "Reorder down / up"),
         help_row(&theme, "s / p", "Cycle status / priority"),
+        help_row(&theme, "O", "Cycle sort (manual/priority/due/updated)"),
         help_row(&theme, "t / T", "Filter tags / edit tags"),
         help_row(&theme, "S", "Sync via SSH"),
         help_row(&theme, "d / x", "Delete task"),

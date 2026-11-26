@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::model::{parse_tags, Priority, Status};
+use crate::model::{parse_tags, Priority, SortOrder, Status};
 use crate::ops::{self, AddTaskInput, TaskFilter, UpdateTaskInput};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -209,6 +209,10 @@ impl McpServer {
             .get("overdue")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let sort = match optional_str(args, "sort")? {
+            Some(s) => SortOrder::parse(s)?,
+            None => SortOrder::Manual,
+        };
 
         let filter = TaskFilter {
             status,
@@ -217,6 +221,7 @@ impl McpServer {
             tag_match_all,
             search,
             overdue_only,
+            sort,
         };
         let snapshot = ops::board_snapshot(&self.storage_path, &self.config, &filter)?;
         serde_json::to_value(snapshot).map_err(|e| e.to_string())
@@ -443,6 +448,11 @@ fn tool_definitions() -> Value {
                     "overdue": {
                         "type": "boolean",
                         "description": "When true, return only overdue non-done tasks."
+                    },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["manual", "priority", "due", "updated"],
+                        "description": "Sort order for returned tasks (default: manual)."
                     }
                 }
             }

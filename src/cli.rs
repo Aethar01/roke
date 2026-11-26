@@ -2,7 +2,8 @@ use crate::config::{default_config_path, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
-    default_storage_path, parse_due_date, parse_tags, today_ymd, DueState, Priority, Status, Task,
+    default_storage_path, parse_due_date, parse_tags, today_ymd, DueState, Priority, SortOrder,
+    Status, Task,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
 use crate::theme::{to_crossterm_color, Theme};
@@ -211,6 +212,10 @@ pub struct ListArgs {
     #[arg(long = "overdue")]
     pub overdue: bool,
 
+    /// Sort tasks (manual, priority, due, updated)
+    #[arg(long = "sort", value_parser = SortOrder::parse, default_value = "manual")]
+    pub sort: SortOrder,
+
     /// Show descriptions and UIDs beneath each task
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
@@ -406,6 +411,7 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 tag_match_all: !args.any_tag,
                 search: args.search.clone(),
                 overdue_only: args.overdue,
+                sort: args.sort,
             };
             let tasks = ops::list_tasks(&path, cfg, &filter)?;
             if json {

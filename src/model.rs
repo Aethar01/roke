@@ -326,6 +326,118 @@ impl Priority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    #[default]
+    Manual,
+    Priority,
+    Due,
+    Updated,
+}
+
+impl SortOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            SortOrder::Manual => "manual",
+            SortOrder::Priority => "priority",
+            SortOrder::Due => "due",
+            SortOrder::Updated => "updated",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            SortOrder::Manual => SortOrder::Priority,
+            SortOrder::Priority => SortOrder::Due,
+            SortOrder::Due => SortOrder::Updated,
+            SortOrder::Updated => SortOrder::Manual,
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "manual" | "order" | "default" => Ok(SortOrder::Manual),
+            "priority" | "prio" | "p" => Ok(SortOrder::Priority),
+            "due" | "date" | "deadline" => Ok(SortOrder::Due),
+            "updated" | "recent" => Ok(SortOrder::Updated),
+            other => Err(format!(
+                "invalid sort '{other}' (expected: manual, priority, due, updated)"
+            )),
+        }
+    }
+}
+
+fn priority_rank(p: Priority) -> u8 {
+    match p {
+        Priority::High => 0,
+        Priority::Medium => 1,
+        Priority::Low => 2,
+    }
+}
+
+pub fn sort_task_refs(tasks: &mut [&Task], sort: SortOrder) {
+    match sort {
+        SortOrder::Manual => {}
+        SortOrder::Priority => {
+            tasks.sort_by(|a, b| {
+                priority_rank(a.priority)
+                    .cmp(&priority_rank(b.priority))
+                    .then_with(|| match (&a.due, &b.due) {
+                        (Some(da), Some(db)) => da.cmp(db),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    })
+            });
+        }
+        SortOrder::Due => {
+            tasks.sort_by(|a, b| match (&a.due, &b.due) {
+                (Some(da), Some(db)) => da
+                    .cmp(db)
+                    .then_with(|| priority_rank(a.priority).cmp(&priority_rank(b.priority))),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => priority_rank(a.priority).cmp(&priority_rank(b.priority)),
+            });
+        }
+        SortOrder::Updated => {
+            tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        }
+    }
+}
+
+pub fn sort_tasks(tasks: &mut [Task], sort: SortOrder) {
+    match sort {
+        SortOrder::Manual => {}
+        SortOrder::Priority => {
+            tasks.sort_by(|a, b| {
+                priority_rank(a.priority)
+                    .cmp(&priority_rank(b.priority))
+                    .then_with(|| match (&a.due, &b.due) {
+                        (Some(da), Some(db)) => da.cmp(db),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    })
+            });
+        }
+        SortOrder::Due => {
+            tasks.sort_by(|a, b| match (&a.due, &b.due) {
+                (Some(da), Some(db)) => da
+                    .cmp(db)
+                    .then_with(|| priority_rank(a.priority).cmp(&priority_rank(b.priority))),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => priority_rank(a.priority).cmp(&priority_rank(b.priority)),
+            });
+        }
+        SortOrder::Updated => {
+            tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     #[serde(default)]

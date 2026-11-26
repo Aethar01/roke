@@ -1,8 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
-    file_stamp, format_tags, now_millis, parse_due_date, parse_tags, FileLock, FileStamp, Priority,
-    Status, Task, TaskStore,
+    file_stamp, format_tags, now_millis, parse_due_date, parse_tags, sort_task_refs, FileLock,
+    FileStamp, Priority, SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -382,6 +382,7 @@ pub struct TagModalRegions {
 pub struct LayoutRegions {
     pub tab_todos: Rect,
     pub tab_kanban: Rect,
+    pub sort_btn: Rect,
     pub sync_btn: Rect,
     pub add_btn: Rect,
     pub help_btn: Rect,
@@ -407,6 +408,7 @@ impl LayoutRegions {
     pub fn clear(&mut self) {
         self.tab_todos = Rect::default();
         self.tab_kanban = Rect::default();
+        self.sort_btn = Rect::default();
         self.sync_btn = Rect::default();
         self.add_btn = Rect::default();
         self.help_btn = Rect::default();
@@ -453,6 +455,7 @@ pub struct App {
     pub view: View,
     pub mode: Mode,
     pub todo_filter: TodoFilter,
+    pub sort_order: SortOrder,
     pub tag_filters: Vec<String>,
     pub tag_match_mode: TagMatchMode,
     pub todo_selected: usize,
@@ -488,6 +491,33 @@ impl App {
         let theme = config.resolved_theme();
         let editor_label = editor_display_name(config.editor.as_deref());
         let last_file_stamp = storage_path.as_deref().and_then(file_stamp);
+        let initial_view = match config
+            .default_view
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("kanban") | Some("board") => View::Kanban,
+            _ => View::TodoList,
+        };
+        let initial_filter = match config
+            .default_filter
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("todo") | Some("to-do") | Some("to_do") => TodoFilter::Todo,
+            Some("in-progress") | Some("in_progress") | Some("doing") | Some("wip") => {
+                TodoFilter::InProgress
+            }
+            Some("done") | Some("completed") => TodoFilter::Done,
+            _ => TodoFilter::All,
+        };
+        let initial_sort = config
+            .default_sort
+            .as_deref()
+            .and_then(|s| SortOrder::parse(s).ok())
+            .unwrap_or(SortOrder::Manual);
         Self {
             store,
             storage_path,
@@ -498,9 +528,10 @@ impl App {
             sync_requested: false,
             syncing: false,
             pending_editor: None,
-            view: View::TodoList,
+            view: initial_view,
             mode: Mode::Normal,
-            todo_filter: TodoFilter::All,
+            todo_filter: initial_filter,
+            sort_order: initial_sort,
             tag_filters: Vec::new(),
             tag_match_mode: TagMatchMode::All,
             todo_selected: 0,
@@ -594,7 +625,8 @@ impl App {
     }
 
     pub fn filtered_todo_ids(&self) -> Vec<u64> {
-        self.store
+        let mut refs: Vec<&Task> = self
+            .store
             .tasks
             .iter()
             .filter(|t| {
@@ -602,17 +634,20 @@ impl App {
                     && self.matches_tag(t)
                     && self.matches_search(t)
             })
-            .map(|t| t.id)
-            .collect()
+            .collect();
+        sort_task_refs(&mut refs, self.sort_order);
+        refs.into_iter().map(|t| t.id).collect()
     }
 
     pub fn column_task_ids(&self, status: Status) -> Vec<u64> {
-        self.store
+        let mut refs: Vec<&Task> = self
+            .store
             .tasks
             .iter()
             .filter(|t| t.status == status && self.matches_tag(t) && self.matches_search(t))
-            .map(|t| t.id)
-            .collect()
+            .collect();
+        sort_task_refs(&mut refs, self.sort_order);
+        refs.into_iter().map(|t| t.id).collect()
     }
 
     pub fn selected_task_id(&self) -> Option<u64> {
@@ -1302,6 +1337,9 @@ impl App {
             KeyCode::Char('p') => {
                 self.cycle_selected_priority();
             }
+            KeyCode::Char('O') => {
+                self.cycle_sort_order();
+            }
             KeyCode::Char('t') => {
                 self.open_tag_filter_modal();
             }
@@ -1562,7 +1600,17 @@ impl App {
         self.set_message(format!("Moved to {}", target.label()));
     }
 
+    pub fn cycle_sort_order(&mut self) {
+        self.sort_order = self.sort_order.cycle();
+        self.clamp_selections();
+        self.set_message(format!("Sort: {}", self.sort_order.label()));
+    }
+
     fn reorder_selected_task(&mut self, down: bool) {
+        if self.sort_order != SortOrder::Manual {
+            self.set_message("Switch to manual sort (O) to reorder");
+            return;
+        }
         let visible = match self.view {
             View::TodoList => self.filtered_todo_ids(),
             View::Kanban => self.column_task_ids(self.current_kanban_status()),
@@ -1914,6 +1962,10 @@ impl App {
         }
         if rect_contains(self.regions.sync_btn, x, y) {
             self.request_sync();
+            return;
+        }
+        if rect_contains(self.regions.sort_btn, x, y) {
+            self.cycle_sort_order();
             return;
         }
         if rect_contains(self.regions.add_btn, x, y) {
@@ -2380,6 +2432,36 @@ inject_device_tag = true
         app.status_message_at = Some(Instant::now() - STATUS_TOAST_DURATION - Duration::from_secs(1));
         assert!(app.tick_status_message());
         assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn config_defaults_and_sorting_work() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+default_view = "kanban"
+default_filter = "todo"
+default_sort = "priority"
+"#,
+        )
+        .unwrap();
+        let mut store = TaskStore::new_empty();
+        let id1 = store.add("Low soon".into(), String::new(), Status::Todo, Priority::Low, Vec::new());
+        let id2 = store.add("High later".into(), String::new(), Status::Todo, Priority::High, Vec::new());
+        let id3 = store.add("Med earliest".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
+        store.get_mut(id1).unwrap().due = Some("2026-05-02".into());
+        store.get_mut(id2).unwrap().due = Some("2026-05-10".into());
+        store.get_mut(id3).unwrap().due = Some("2026-05-01".into());
+
+        let mut app = App::with_config(store, None, cfg);
+        assert_eq!(app.view, View::Kanban);
+        assert_eq!(app.todo_filter, TodoFilter::Todo);
+        assert_eq!(app.sort_order, SortOrder::Priority);
+        assert_eq!(app.column_task_ids(Status::Todo), vec![id2, id3, id1]);
+
+        // Press 'O' to switch Priority -> Due
+        app.handle_key(key(KeyCode::Char('O')));
+        assert_eq!(app.sort_order, SortOrder::Due);
+        assert_eq!(app.column_task_ids(Status::Todo), vec![id3, id1, id2]);
     }
 
     #[test]
