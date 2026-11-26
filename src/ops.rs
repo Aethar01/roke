@@ -1,8 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::model::{
-    append_tasks_to_archive, archive_path_for, now_millis, parse_due_date, parse_repeat,
-    parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority, SortOrder, Status, Task,
-    TaskStore,
+    append_tasks_to_archive, archive_path_for, matches_search_query, now_millis, parse_due_date,
+    parse_repeat, parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority, SortOrder,
+    Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, sync_all_peers};
 use serde::{Deserialize, Serialize};
@@ -192,15 +192,8 @@ fn matches_filter(task: &Task, filter: &TaskFilter, sync_cfg: &SyncConfig) -> bo
         }
     }
     if let Some(query) = &filter.search {
-        let q = query.trim().to_lowercase();
-        if !q.is_empty() {
-            let tag_q = q.trim_start_matches('#');
-            let matched = task.title.to_lowercase().contains(&q)
-                || task.description.to_lowercase().contains(&q)
-                || (!tag_q.is_empty() && eff_tags.iter().any(|t| t.contains(tag_q)));
-            if !matched {
-                return false;
-            }
+        if !matches_search_query(task, &eff_tags, query) {
+            return false;
         }
     }
     if filter.overdue_only {

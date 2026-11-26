@@ -1,9 +1,9 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
-    append_tasks_to_archive, archive_path_for, file_stamp, format_tags, now_millis, parse_due_date,
-    parse_quick_add, parse_repeat, parse_tags, sort_task_refs, today_ymd, DueState, FileLock,
-    FileStamp, Priority, SortOrder, Status, Task, TaskStore,
+    append_tasks_to_archive, archive_path_for, file_stamp, format_tags, matches_search_query,
+    now_millis, parse_due_date, parse_quick_add, parse_repeat, parse_tags, sort_task_refs,
+    today_ymd, DueState, FileLock, FileStamp, Priority, SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -653,15 +653,12 @@ impl App {
     }
 
     pub fn matches_search(&self, task: &Task) -> bool {
-        let q = self.active_search_text().trim().to_lowercase();
-        if q.is_empty() {
+        let q = self.active_search_text();
+        if q.trim().is_empty() {
             return true;
         }
-        let tag_q = q.trim_start_matches('#');
         let eff_tags = self.effective_tags(task);
-        task.title.to_lowercase().contains(&q)
-            || task.description.to_lowercase().contains(&q)
-            || (!tag_q.is_empty() && eff_tags.iter().any(|t| t.contains(tag_q)))
+        matches_search_query(task, &eff_tags, q)
     }
 
     pub fn matches_tag(&self, task: &Task) -> bool {

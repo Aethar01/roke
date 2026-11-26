@@ -854,6 +854,87 @@ pub fn parse_quick_add(raw: &str) -> Result<QuickAddParsed, String> {
     })
 }
 
+/// Evaluate a smart search query against a task.
+/// Supports operators (`p:high`, `s:todo`, `due:overdue|today|upcoming|any|none`,
+/// `repeat:any|none|weekly`, `#tag`, `-done`, `-#tag`, `-word`) alongside plain substring terms.
+pub fn matches_search_query(task: &Task, eff_tags: &[String], query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let title_lower = task.title.to_lowercase();
+    let desc_lower = task.description.to_lowercase();
+    let mut today_cache: Option<String> = None;
+
+    for raw_tok in trimmed.split_whitespace() {
+        let (negate, tok_raw) = match raw_tok.strip_prefix('-') {
+            Some(rest) if !rest.is_empty() => (true, rest),
+            _ => (false, raw_tok),
+        };
+        let tok = tok_raw.to_lowercase();
+
+        let matched = if let Some(val) = tok
+            .strip_prefix("p:")
+            .or_else(|| tok.strip_prefix("priority:"))
+        {
+            Priority::parse(val)
+                .map(|p| task.priority == p)
+                .unwrap_or(false)
+        } else if let Some(val) = tok
+            .strip_prefix("s:")
+            .or_else(|| tok.strip_prefix("status:"))
+        {
+            Status::parse(val)
+                .map(|s| task.status == s)
+                .unwrap_or(false)
+        } else if let Some(val) = tok.strip_prefix("due:") {
+            match val {
+                "overdue" | "late" => {
+                    let today = today_cache.get_or_insert_with(today_ymd);
+                    task.status != Status::Done && task.due_state(today) == Some(DueState::Overdue)
+                }
+                "today" => {
+                    let today = today_cache.get_or_insert_with(today_ymd);
+                    task.status != Status::Done && task.due_state(today) == Some(DueState::Today)
+                }
+                "upcoming" => {
+                    let today = today_cache.get_or_insert_with(today_ymd);
+                    task.due_state(today) == Some(DueState::Upcoming)
+                }
+                "any" | "set" => task.due.is_some(),
+                "none" => task.due.is_none(),
+                other => task.due.as_deref().is_some_and(|d| d.contains(other)),
+            }
+        } else if let Some(val) = tok
+            .strip_prefix("repeat:")
+            .or_else(|| tok.strip_prefix("rep:"))
+        {
+            match val {
+                "any" | "set" => task.repeat.is_some(),
+                "none" => task.repeat.is_none(),
+                other => task.repeat.as_deref().is_some_and(|r| r.contains(other)),
+            }
+        } else if let Some(tag_q) = tok.strip_prefix('#') {
+            !tag_q.is_empty() && eff_tags.iter().any(|t| t.contains(tag_q))
+        } else if negate && Status::parse(&tok).is_ok() {
+            Status::parse(&tok)
+                .map(|s| task.status == s)
+                .unwrap_or(false)
+        } else {
+            title_lower.contains(&tok)
+                || desc_lower.contains(&tok)
+                || eff_tags.iter().any(|t| t.contains(&tok))
+        };
+
+        let ok = if negate { !matched } else { matched };
+        if !ok {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn default_priority() -> Priority {
     Priority::Medium
 }
@@ -1493,5 +1574,37 @@ mod tests {
         assert_eq!(find_local_board(&nested), Some(board));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn smart_search_query_supports_operators_and_negation() {
+        let mut store = TaskStore::new_empty();
+        let id1 = store.add(
+            "Fix API latency".into(),
+            "Check Redis".into(),
+            Status::Todo,
+            Priority::High,
+            vec!["backend".into(), "ops".into()],
+        );
+        let id2 = store.add(
+            "Ship docs".into(),
+            String::new(),
+            Status::Done,
+            Priority::Low,
+            vec!["docs".into()],
+        );
+        store.get_mut(id1).unwrap().due = Some("2020-01-01".into());
+        store.get_mut(id1).unwrap().repeat = Some("weekly".into());
+
+        let t1 = store.get(id1).unwrap();
+        let t2 = store.get(id2).unwrap();
+
+        assert!(matches_search_query(t1, &t1.tags, "p:high due:overdue #backend"));
+        assert!(!matches_search_query(t2, &t2.tags, "p:high"));
+        assert!(matches_search_query(t1, &t1.tags, "repeat:weekly -done"));
+        assert!(!matches_search_query(t2, &t2.tags, "-done"));
+        assert!(!matches_search_query(t1, &t1.tags, "-#ops"));
+        assert!(matches_search_query(t1, &t1.tags, "api -mysql"));
+        assert!(!matches_search_query(t1, &t1.tags, "api -redis"));
     }
 }

@@ -1290,7 +1290,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.pending_g {
         "g…".to_string()
     } else if matches!(app.mode, Mode::Search) {
-        "search · enter apply · esc clear".to_string()
+        "search (p:high due:overdue #tag -done) · enter apply · esc clear".to_string()
     } else if matches!(app.mode, Mode::QuickAdd { .. }) {
         "quick add: #tag !high @due ~repeat · enter add · esc cancel".to_string()
     } else {
