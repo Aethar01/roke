@@ -2341,8 +2341,8 @@ impl App {
         let Some(task) = self.store.get(task_id) else {
             return;
         };
-        if let Some(url) = extract_first_url(&task.title)
-            .or_else(|| extract_first_url(&task.description))
+        if let Some(url) =
+            extract_first_url(&task.title).or_else(|| extract_first_url(&task.description))
         {
             self.set_message(format!("Opening {url}"));
             self.pending_open_url = Some(url);
@@ -3518,10 +3518,34 @@ default_sort = "priority"
     #[test]
     fn quick_due_edit_and_due_focus_filter() {
         let mut store = TaskStore::new_empty();
-        let id_overdue = store.add("Overdue".into(), String::new(), Status::Todo, Priority::High, Vec::new());
-        let id_today = store.add("Today".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
-        let id_future = store.add("Future".into(), String::new(), Status::Todo, Priority::Low, Vec::new());
-        let id_done = store.add("Done overdue".into(), String::new(), Status::Done, Priority::Low, Vec::new());
+        let id_overdue = store.add(
+            "Overdue".into(),
+            String::new(),
+            Status::Todo,
+            Priority::High,
+            Vec::new(),
+        );
+        let id_today = store.add(
+            "Today".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+        );
+        let id_future = store.add(
+            "Future".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Low,
+            Vec::new(),
+        );
+        let id_done = store.add(
+            "Done overdue".into(),
+            String::new(),
+            Status::Done,
+            Priority::Low,
+            Vec::new(),
+        );
         store.get_mut(id_overdue).unwrap().due = Some("2020-01-01".into());
         store.get_mut(id_today).unwrap().due = Some(today_ymd());
         store.get_mut(id_future).unwrap().due = Some("2099-12-31".into());

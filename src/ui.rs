@@ -209,9 +209,7 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     mark_label,
-                    Style::default()
-                        .fg(theme.drag)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.drag).add_modifier(Modifier::BOLD),
                 )),
                 rect,
             );

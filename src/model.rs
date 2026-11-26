@@ -1599,7 +1599,11 @@ mod tests {
         let t1 = store.get(id1).unwrap();
         let t2 = store.get(id2).unwrap();
 
-        assert!(matches_search_query(t1, &t1.tags, "p:high due:overdue #backend"));
+        assert!(matches_search_query(
+            t1,
+            &t1.tags,
+            "p:high due:overdue #backend"
+        ));
         assert!(!matches_search_query(t2, &t2.tags, "p:high"));
         assert!(matches_search_query(t1, &t1.tags, "repeat:weekly -done"));
         assert!(!matches_search_query(t2, &t2.tags, "-done"));
