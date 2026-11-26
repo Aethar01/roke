@@ -990,6 +990,19 @@ pub fn append_tasks_to_archive(archive_path: &Path, tasks: &[Task]) -> io::Resul
     Ok(())
 }
 
+pub const LOCAL_BOARD_FILENAME: &str = ".roke.jsonl";
+
+/// Walk upward from `start_dir` looking for a project-local `.roke.jsonl` board.
+pub fn find_local_board(start_dir: &Path) -> Option<PathBuf> {
+    for dir in start_dir.ancestors() {
+        let candidate = dir.join(LOCAL_BOARD_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 pub fn default_storage_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         if !xdg.trim().is_empty() {
@@ -1092,5 +1105,21 @@ mod tests {
         assert_eq!(store.get(id).unwrap().due_state("2026-06-01"), Some(DueState::Overdue));
         assert_eq!(store.get(id).unwrap().due_state("2026-01-01"), Some(DueState::Today));
         assert_eq!(store.get(id).unwrap().due_state("2025-12-31"), Some(DueState::Upcoming));
+    }
+
+    #[test]
+    fn find_local_board_walks_parent_directories() {
+        let root = std::env::temp_dir().join(format!("roke_local_find_{}", std::process::id()));
+        let nested = root.join("packages").join("sub");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(find_local_board(&nested), None);
+
+        let board = root.join(LOCAL_BOARD_FILENAME);
+        fs::write(&board, "").unwrap();
+        assert_eq!(find_local_board(&nested), Some(board));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -6,6 +6,7 @@ description = "A terminal todo and kanban app built with ratatui, vim keybinding
 
 [dependencies]
 clap = { version = "4", features = ["derive", "color", "suggestions"] }
+clap_complete = "4"
 crossterm = "0.28"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }

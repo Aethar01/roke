@@ -2,13 +2,14 @@ use crate::config::{default_config_path, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
-    default_storage_path, parse_due_date, parse_tags, today_ymd, DueState, Priority, SortOrder,
-    Status, Task,
+    default_storage_path, find_local_board, parse_due_date, parse_tags, today_ymd, DueState,
+    Priority, SortOrder, Status, Task, TaskStore, LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
 use crate::theme::{to_crossterm_color, Theme};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use crossterm::style::{Attribute, ContentStyle, StyledContent};
 use ratatui::style::Color;
 use serde::Deserialize;
@@ -85,6 +86,14 @@ pub struct Cli {
     #[arg(short = 'f', long = "file", value_name = "PATH", global = true)]
     pub file: Option<PathBuf>,
 
+    /// Use a project-local .roke.jsonl board in the current or nearest parent directory
+    #[arg(long = "local", global = true, conflicts_with = "global_board")]
+    pub local: bool,
+
+    /// Force the global board even when inside a directory containing .roke.jsonl
+    #[arg(long = "global", global = true, conflicts_with = "local")]
+    pub global_board: bool,
+
     /// Path to TOML config file (theme + SSH sync)
     #[arg(short = 'c', long = "config", value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
@@ -113,7 +122,20 @@ pub struct Cli {
 
 impl Cli {
     pub fn storage_path(&self) -> PathBuf {
-        self.file.clone().unwrap_or_else(default_storage_path)
+        if let Some(file) = &self.file {
+            return file.clone();
+        }
+        if !self.global_board {
+            if let Ok(cwd) = std::env::current_dir() {
+                if let Some(found) = find_local_board(&cwd) {
+                    return found;
+                }
+                if self.local {
+                    return cwd.join(LOCAL_BOARD_FILENAME);
+                }
+            }
+        }
+        default_storage_path()
     }
 
     pub fn config_path(&self) -> PathBuf {
@@ -191,6 +213,15 @@ pub enum SubCommand {
         /// Preview which tasks would be archived without modifying files
         #[arg(long = "dry-run")]
         dry_run: bool,
+    },
+
+    /// Create a project-local .roke.jsonl board in the current directory
+    Init,
+
+    /// Generate shell completion scripts (bash, zsh, fish, elvish, powershell)
+    Completions {
+        /// Target shell
+        shell: Shell,
     },
 
     /// Run built-in Model Context Protocol (MCP) server over stdio
@@ -764,6 +795,48 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 );
             }
         }
+        SubCommand::Init => {
+            let target = match &cli.file {
+                Some(p) => p.clone(),
+                None => std::env::current_dir()
+                    .map_err(|e| format!("failed to read current directory: {e}"))?
+                    .join(LOCAL_BOARD_FILENAME),
+            };
+            if target.exists() {
+                if json {
+                    print_json(&serde_json::json!({
+                        "path": target.display().to_string(),
+                        "created": false,
+                    }))?;
+                } else {
+                    println!(
+                        "{} Local board already exists: {}",
+                        painter.badge("·", painter.theme.subtle),
+                        target.display()
+                    );
+                }
+            } else {
+                TaskStore::new_empty()
+                    .save(&target)
+                    .map_err(|e| format!("failed to create {}: {e}", target.display()))?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "path": target.display().to_string(),
+                        "created": true,
+                    }))?;
+                } else {
+                    println!(
+                        "{} Initialized local board at {}",
+                        painter.badge("+", painter.theme.add),
+                        target.display()
+                    );
+                }
+            }
+        }
+        SubCommand::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(*shell, &mut cmd, "roke", &mut io::stdout());
+        }
         SubCommand::Mcp => {
             let server = McpServer::new(path, cfg.clone());
             server
@@ -1170,5 +1243,16 @@ mod tests {
             .is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generates_shell_completions_without_error() {
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        generate(Shell::Zsh, &mut cmd, "roke", &mut buf);
+        let script = String::from_utf8(buf).unwrap();
+        assert!(script.contains("#compdef roke"));
+        assert!(script.contains("archive"));
+        assert!(script.contains("completions"));
     }
 }
