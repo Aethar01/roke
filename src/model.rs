@@ -182,45 +182,219 @@ pub fn today_ymd() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn offset_ymd(days_offset: i64) -> String {
-    let (y, m, d) = local_today_ymd_tuple();
-    let days = days_from_civil(y, m, d) + days_offset;
-    let (ny, nm, nd) = civil_from_days(days);
-    format!("{ny:04}-{nm:02}-{nd:02}")
+fn add_months((y, m, d): (i64, u32, u32), months: i64) -> (i64, u32, u32) {
+    let total = (y * 12 + (m as i64 - 1)) + months;
+    let ny = total.div_euclid(12);
+    let nm = (total.rem_euclid(12) + 1) as u32;
+    let nd = d.min(days_in_month(ny, nm));
+    (ny, nm, nd)
 }
 
-/// Validate and normalize a due date (`YYYY-MM-DD`, `today`, or `tomorrow`).
-pub fn parse_due_date(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.eq_ignore_ascii_case("today") {
-        return Ok(today_ymd());
-    }
-    if trimmed.eq_ignore_ascii_case("tomorrow") {
-        return Ok(offset_ymd(1));
-    }
-    let parts: Vec<&str> = trimmed.split('-').collect();
+fn parse_ymd_tuple(ymd: &str) -> Option<(i64, u32, u32)> {
+    let parts: Vec<&str> = ymd.split('-').collect();
     if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
-        return Err(format!(
-            "invalid due date '{trimmed}' (expected YYYY-MM-DD, today, or tomorrow)"
-        ));
+        return None;
     }
-    let y: i64 = parts[0]
-        .parse()
-        .map_err(|_| format!("invalid year in due date '{trimmed}'"))?;
-    let m: u32 = parts[1]
-        .parse()
-        .map_err(|_| format!("invalid month in due date '{trimmed}'"))?;
-    let d: u32 = parts[2]
-        .parse()
-        .map_err(|_| format!("invalid day in due date '{trimmed}'"))?;
+    let y: i64 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
     if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) {
-        return Err(format!("invalid due date '{trimmed}'"));
+        return None;
     }
-    let max_d = days_in_month(y, m);
-    if d == 0 || d > max_d {
-        return Err(format!("invalid day in due date '{trimmed}'"));
+    if d == 0 || d > days_in_month(y, m) {
+        return None;
     }
-    Ok(format!("{y:04}-{m:02}-{d:02}"))
+    Some((y, m, d))
+}
+
+/// Weekday for days since 1970-01-01 (Thursday): 0 = Sun, 1 = Mon, ..., 6 = Sat.
+fn weekday_from_days(days: i64) -> i64 {
+    (days + 4).rem_euclid(7)
+}
+
+fn parse_weekday_name(s: &str) -> Option<i64> {
+    match s {
+        "sun" | "sunday" => Some(0),
+        "mon" | "monday" => Some(1),
+        "tue" | "tues" | "tuesday" => Some(2),
+        "wed" | "wednesday" => Some(3),
+        "thu" | "thur" | "thurs" | "thursday" => Some(4),
+        "fri" | "friday" => Some(5),
+        "sat" | "saturday" => Some(6),
+        _ => None,
+    }
+}
+
+/// Validate and normalize a due date (`YYYY-MM-DD`, `today`, `tomorrow`, `+3d`, `+2w`, `+1m`, `mon`..`sun`, `eow`, `eom`).
+pub fn parse_due_date(raw: &str) -> Result<String, String> {
+    parse_due_date_from(raw, local_today_ymd_tuple())
+}
+
+pub(crate) fn parse_due_date_from(raw: &str, base: (i64, u32, u32)) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let base_days = days_from_civil(base.0, base.1, base.2);
+
+    if lower == "today" || lower == "tod" {
+        return Ok(format!("{:04}-{:02}-{:02}", base.0, base.1, base.2));
+    }
+    if lower == "tomorrow" || lower == "tom" {
+        let (ny, nm, nd) = civil_from_days(base_days + 1);
+        return Ok(format!("{ny:04}-{nm:02}-{nd:02}"));
+    }
+    if lower == "eow" {
+        // Friday of this week (or next Friday if Sat/Sun)
+        let wd = weekday_from_days(base_days);
+        let delta = if wd <= 5 { 5 - wd } else { 6 };
+        let (ny, nm, nd) = civil_from_days(base_days + delta);
+        return Ok(format!("{ny:04}-{nm:02}-{nd:02}"));
+    }
+    if lower == "eom" {
+        let last_d = days_in_month(base.0, base.1);
+        return Ok(format!("{:04}-{:02}-{last_d:02}", base.0, base.1));
+    }
+    if let Some(target_wd) = parse_weekday_name(&lower) {
+        let cur_wd = weekday_from_days(base_days);
+        let mut delta = (target_wd - cur_wd).rem_euclid(7);
+        if delta == 0 {
+            delta = 7;
+        }
+        let (ny, nm, nd) = civil_from_days(base_days + delta);
+        return Ok(format!("{ny:04}-{nm:02}-{nd:02}"));
+    }
+    if let Some(rest) = lower.strip_prefix('+') {
+        if let Some(num_str) = rest.strip_suffix('d') {
+            if let Ok(n) = num_str.parse::<i64>() {
+                if n > 0 && n <= 36_500 {
+                    let (ny, nm, nd) = civil_from_days(base_days + n);
+                    return Ok(format!("{ny:04}-{nm:02}-{nd:02}"));
+                }
+            }
+        } else if let Some(num_str) = rest.strip_suffix('w') {
+            if let Ok(n) = num_str.parse::<i64>() {
+                if n > 0 && n <= 5_200 {
+                    let (ny, nm, nd) = civil_from_days(base_days + n * 7);
+                    return Ok(format!("{ny:04}-{nm:02}-{nd:02}"));
+                }
+            }
+        } else if let Some(num_str) = rest.strip_suffix('m') {
+            if let Ok(n) = num_str.parse::<i64>() {
+                if n > 0 && n <= 1_200 {
+                    let (ny, nm, nd) = add_months(base, n);
+                    return Ok(format!("{ny:04}-{nm:02}-{nd:02}"));
+                }
+            }
+        }
+    }
+
+    if let Some((y, m, d)) = parse_ymd_tuple(trimmed) {
+        return Ok(format!("{y:04}-{m:02}-{d:02}"));
+    }
+    Err(format!(
+        "invalid due date '{trimmed}' (expected YYYY-MM-DD, today, tomorrow, +Nd/+Nw/+Nm, mon..sun, eow, or eom)"
+    ))
+}
+
+/// Validate and normalize a recurrence rule (`daily`, `weekdays`, `weekly`, `monthly`, `every Nd`/`Nw`/`Nm`).
+pub fn parse_repeat(raw: &str) -> Result<String, String> {
+    let lower = raw
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    match lower.as_str() {
+        "daily" | "day" | "1d" | "every day" | "every 1d" => return Ok("daily".into()),
+        "weekdays" | "weekday" | "workdays" | "every weekday" => return Ok("weekdays".into()),
+        "weekly" | "week" | "1w" | "every week" | "every 1w" => return Ok("weekly".into()),
+        "biweekly" | "2w" | "every 2w" | "every 2 weeks" => return Ok("every 2w".into()),
+        "monthly" | "month" | "1m" | "every month" | "every 1m" => return Ok("monthly".into()),
+        _ => {}
+    }
+    let body = lower.strip_prefix("every ").unwrap_or(&lower);
+    let compact = body.replace(' ', "");
+    if let Some(num) = compact
+        .strip_suffix("days")
+        .or_else(|| compact.strip_suffix("day"))
+        .or_else(|| compact.strip_suffix('d'))
+    {
+        if let Ok(n) = num.parse::<u32>() {
+            if n == 1 {
+                return Ok("daily".into());
+            } else if n > 1 && n <= 3650 {
+                return Ok(format!("every {n}d"));
+            }
+        }
+    }
+    if let Some(num) = compact
+        .strip_suffix("weeks")
+        .or_else(|| compact.strip_suffix("week"))
+        .or_else(|| compact.strip_suffix('w'))
+    {
+        if let Ok(n) = num.parse::<u32>() {
+            if n == 1 {
+                return Ok("weekly".into());
+            } else if n > 1 && n <= 520 {
+                return Ok(format!("every {n}w"));
+            }
+        }
+    }
+    if let Some(num) = compact
+        .strip_suffix("months")
+        .or_else(|| compact.strip_suffix("month"))
+        .or_else(|| compact.strip_suffix('m'))
+    {
+        if let Ok(n) = num.parse::<u32>() {
+            if n == 1 {
+                return Ok("monthly".into());
+            } else if n > 1 && n <= 120 {
+                return Ok(format!("every {n}m"));
+            }
+        }
+    }
+    Err(format!(
+        "invalid repeat rule '{raw}' (expected: daily, weekdays, weekly, monthly, or every Nd/Nw/Nm)"
+    ))
+}
+
+pub(crate) fn next_due_for_repeat(
+    current_due: Option<&str>,
+    repeat: &str,
+    today: (i64, u32, u32),
+) -> String {
+    let today_days = days_from_civil(today.0, today.1, today.2);
+    let base = match current_due.and_then(parse_ymd_tuple) {
+        Some(due_t) if days_from_civil(due_t.0, due_t.1, due_t.2) > today_days => due_t,
+        _ => today,
+    };
+    let base_days = days_from_civil(base.0, base.1, base.2);
+
+    let norm = parse_repeat(repeat).unwrap_or_else(|_| "daily".into());
+    let (ny, nm, nd) = match norm.as_str() {
+        "daily" => civil_from_days(base_days + 1),
+        "weekdays" => {
+            let mut next = base_days + 1;
+            while matches!(weekday_from_days(next), 0 | 6) {
+                next += 1;
+            }
+            civil_from_days(next)
+        }
+        "weekly" => civil_from_days(base_days + 7),
+        "monthly" => add_months(base, 1),
+        other => {
+            let body = other.strip_prefix("every ").unwrap_or(other);
+            if let Some(n) = body.strip_suffix('d').and_then(|s| s.parse::<i64>().ok()) {
+                civil_from_days(base_days + n)
+            } else if let Some(n) = body.strip_suffix('w').and_then(|s| s.parse::<i64>().ok()) {
+                civil_from_days(base_days + n * 7)
+            } else if let Some(n) = body.strip_suffix('m').and_then(|s| s.parse::<i64>().ok()) {
+                add_months(base, n)
+            } else {
+                civil_from_days(base_days + 1)
+            }
+        }
+    };
+    format!("{ny:04}-{nm:02}-{nd:02}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,6 +666,8 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
     #[serde(default)]
     pub updated_at: u64,
@@ -531,6 +707,17 @@ impl Task {
             std::cmp::Ordering::Equal => Some(DueState::Today),
             std::cmp::Ordering::Greater => Some(DueState::Upcoming),
         }
+    }
+
+    /// If this task has a recurrence rule, advance `due` to the next occurrence, reset status to
+    /// `Todo`, bump `updated_at`, and return the new due date.
+    pub fn complete_if_recurring(&mut self) -> Option<String> {
+        let rep = self.repeat.clone()?;
+        let next_due = next_due_for_repeat(self.due.as_deref(), &rep, local_today_ymd_tuple());
+        self.due = Some(next_due.clone());
+        self.status = Status::Todo;
+        self.touch();
+        Some(next_due)
     }
 
     /// Count Markdown checklist items (`- [ ]` / `- [x]`) in `description`.
@@ -666,6 +853,7 @@ impl TaskStore {
             priority,
             tags,
             due: None,
+            repeat: None,
             created_at: Some(now),
             updated_at: now,
             origin: origin_opt,
@@ -1137,6 +1325,35 @@ mod tests {
         // Round-trip days_from_civil <-> civil_from_days including leap year
         assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
         assert_eq!(civil_from_days(days_from_civil(2026, 11, 26)), (2026, 11, 26));
+
+        // Natural due dates anchored at Thursday 2026-11-26
+        let base = (2026, 11, 26);
+        assert_eq!(parse_due_date_from("+3d", base).unwrap(), "2026-11-29");
+        assert_eq!(parse_due_date_from("+2w", base).unwrap(), "2026-12-10");
+        assert_eq!(parse_due_date_from("+1m", (2026, 1, 31)).unwrap(), "2026-02-28");
+        assert_eq!(parse_due_date_from("fri", base).unwrap(), "2026-11-27");
+        assert_eq!(parse_due_date_from("thu", base).unwrap(), "2026-12-03");
+        assert_eq!(parse_due_date_from("eow", base).unwrap(), "2026-11-27");
+        assert_eq!(parse_due_date_from("eom", base).unwrap(), "2026-11-30");
+
+        // Recurrence rules & next-due computation
+        assert_eq!(parse_repeat("daily").unwrap(), "daily");
+        assert_eq!(parse_repeat("every 3 days").unwrap(), "every 3d");
+        assert_eq!(parse_repeat("biweekly").unwrap(), "every 2w");
+        assert!(parse_repeat("hourly").is_err());
+
+        assert_eq!(
+            next_due_for_repeat(Some("2026-11-26"), "weekly", base),
+            "2026-12-03"
+        );
+        assert_eq!(
+            next_due_for_repeat(Some("2026-11-27"), "weekdays", (2026, 11, 27)),
+            "2026-11-30"
+        );
+        assert_eq!(
+            next_due_for_repeat(Some("2026-01-01"), "daily", base),
+            "2026-11-27"
+        );
 
         let mut store = TaskStore::new_empty();
         let id = store.add(

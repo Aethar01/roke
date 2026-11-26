@@ -287,6 +287,7 @@ impl McpServer {
         };
         let tags = optional_tags(args, "tags")?;
         let due = optional_str(args, "due")?.map(str::to_string);
+        let repeat = optional_str(args, "repeat")?.map(str::to_string);
         let origin = optional_str(args, "origin")?.map(str::to_string);
         Ok(AddTaskInput {
             title,
@@ -295,6 +296,7 @@ impl McpServer {
             priority,
             tags,
             due,
+            repeat,
             origin,
         })
     }
@@ -358,7 +360,14 @@ impl McpServer {
             Some(Value::Null) => Some(None),
             Some(Value::String(s)) if s.trim().is_empty() => Some(None),
             Some(Value::String(s)) => Some(Some(s.clone())),
-            Some(_) => return Err("argument 'due' must be a YYYY-MM-DD string or null".into()),
+            Some(_) => return Err("argument 'due' must be a date string or null".into()),
+        };
+        let repeat = match args.get("repeat") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(s)) if s.trim().is_empty() => Some(None),
+            Some(Value::String(s)) => Some(Some(s.clone())),
+            Some(_) => return Err("argument 'repeat' must be a recurrence string or null".into()),
         };
 
         let updated = ops::update_task(
@@ -374,6 +383,7 @@ impl McpServer {
                 add_tags,
                 remove_tags,
                 due,
+                repeat,
             },
         )?;
         serde_json::to_value(updated).map_err(|e| e.to_string())
@@ -609,7 +619,11 @@ fn tool_definitions(read_only: bool) -> Value {
                 },
                 "due": {
                     "type": "string",
-                    "description": "Optional due date (YYYY-MM-DD, 'today', or 'tomorrow')."
+                    "description": "Optional due date (YYYY-MM-DD, 'today', 'tomorrow', '+3d', '+2w', 'fri', 'eow', 'eom')."
+                },
+                "repeat": {
+                    "type": "string",
+                    "description": "Optional recurrence rule ('daily', 'weekdays', 'weekly', 'monthly', 'every 3d/2w/2m')."
                 },
                 "origin": {
                     "type": "string",
@@ -705,7 +719,11 @@ fn tool_definitions(read_only: bool) -> Value {
                     },
                     "due": {
                         "type": ["string", "null"],
-                        "description": "Set due date (YYYY-MM-DD, 'today', 'tomorrow'), or pass '' / null to clear."
+                        "description": "Set due date (YYYY-MM-DD, 'today', 'tomorrow', '+3d', 'fri', etc.), or pass '' / null to clear."
+                    },
+                    "repeat": {
+                        "type": ["string", "null"],
+                        "description": "Set recurrence rule ('daily', 'weekdays', 'weekly', 'monthly', 'every 3d'), or pass '' / null to clear."
                     }
                 }
             }

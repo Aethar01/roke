@@ -1402,7 +1402,11 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
 
     let meta_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(rows[3]);
 
     let status_active = form.active_field == FormField::Status;
@@ -1457,6 +1461,32 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
             ]),
         ]),
         meta_cols[1],
+    );
+
+    let repeat_active = form.active_field == FormField::Repeat;
+    let repeat_w = meta_cols[2].width as usize;
+    let (repeat_slice, repeat_cursor_off) =
+        visible_text_slice(&form.repeat.value, form.repeat.cursor, repeat_w);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Repeat",
+                field_label_style(&theme, repeat_active),
+            )),
+            Line::from(Span::styled(
+                if repeat_slice.is_empty() && !repeat_active {
+                    "daily, weekly"
+                } else {
+                    repeat_slice
+                },
+                Style::default().fg(if repeat_slice.is_empty() {
+                    theme.muted
+                } else {
+                    theme.text
+                }),
+            )),
+        ]),
+        meta_cols[2],
     );
 
     if let Some(err) = &form.error {
@@ -1522,6 +1552,12 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         if cx < tags_due_cols[1].right() && cy < tags_due_cols[1].bottom() {
             frame.set_cursor_position(Position::new(cx, cy));
         }
+    } else if repeat_active {
+        let cx = meta_cols[2].x + (repeat_cursor_off as u16);
+        let cy = meta_cols[2].y + 1;
+        if cx < meta_cols[2].right() && cy < meta_cols[2].bottom() {
+            frame.set_cursor_position(Position::new(cx, cy));
+        }
     }
 
     app.regions.modal = Some(ModalRegions {
@@ -1532,6 +1568,7 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         due: tags_due_cols[1],
         status: meta_cols[0],
         priority: meta_cols[1],
+        repeat: meta_cols[2],
         save_btn: save_rect,
         cancel_btn: cancel_rect,
     });
@@ -2218,7 +2255,9 @@ fn tags_border_line<'a>(
 }
 
 fn due_border_line(theme: &Theme, task: &Task) -> Option<Line<'static>> {
-    let due = task.due.as_deref()?;
+    if task.due.is_none() && task.repeat.is_none() {
+        return None;
+    }
     let today = today_ymd();
     let style = match task.due_state(&today) {
         Some(DueState::Overdue) => Style::default()
@@ -2227,7 +2266,13 @@ fn due_border_line(theme: &Theme, task: &Task) -> Option<Line<'static>> {
         Some(DueState::Today) => Style::default().fg(theme.in_progress),
         _ => Style::default().fg(theme.muted),
     };
-    Some(Line::from(Span::styled(format!(" {due} "), style)))
+    let text = match (&task.due, &task.repeat) {
+        (Some(due), Some(rep)) => format!(" {due} ↻ {rep} "),
+        (Some(due), None) => format!(" {due} "),
+        (None, Some(rep)) => format!(" ↻ {rep} "),
+        (None, None) => return None,
+    };
+    Some(Line::from(Span::styled(text, style)))
 }
 
 fn priority_tag_style(theme: &Theme, priority: Priority, selected: bool) -> Style {

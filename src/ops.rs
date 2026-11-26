@@ -1,7 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::model::{
-    append_tasks_to_archive, archive_path_for, now_millis, parse_due_date, parse_tags, sort_tasks,
-    today_ymd, DueState, FileLock, Priority, SortOrder, Status, Task, TaskStore,
+    append_tasks_to_archive, archive_path_for, now_millis, parse_due_date, parse_repeat,
+    parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority, SortOrder, Status, Task,
+    TaskStore,
 };
 use crate::sync::{merge_stores, sync_all_peers};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,7 @@ pub struct AddTaskInput {
     pub priority: Priority,
     pub tags: Vec<String>,
     pub due: Option<String>,
+    pub repeat: Option<String>,
     pub origin: Option<String>,
 }
 
@@ -53,6 +55,7 @@ impl Default for AddTaskInput {
             priority: Priority::Medium,
             tags: Vec::new(),
             due: None,
+            repeat: None,
             origin: None,
         }
     }
@@ -68,6 +71,7 @@ pub struct UpdateTaskInput {
     pub add_tags: Vec<String>,
     pub remove_tags: Vec<String>,
     pub due: Option<Option<String>>,
+    pub repeat: Option<Option<String>>,
 }
 
 impl UpdateTaskInput {
@@ -80,6 +84,7 @@ impl UpdateTaskInput {
             && self.add_tags.is_empty()
             && self.remove_tags.is_empty()
             && self.due.is_none()
+            && self.repeat.is_none()
     }
 }
 
@@ -297,6 +302,15 @@ pub fn add_tasks_batch(
             Some(raw) => Some(parse_due_date(raw)?),
             None => None,
         };
+        let repeat = match input
+            .repeat
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(parse_repeat(raw)?),
+            None => None,
+        };
         let origin = input
             .origin
             .as_deref()
@@ -313,6 +327,7 @@ pub fn add_tasks_batch(
         );
         if let Some(task) = store.get_mut(id) {
             task.due = due;
+            task.repeat = repeat;
         }
         created_ids.push(id);
     }
@@ -343,6 +358,7 @@ pub fn update_task(
         .get_mut(id)
         .ok_or_else(|| format!("task not found: '{selector}'"))?;
 
+    let was_done = task.status == Status::Done;
     if let Some(title) = input.title {
         let trimmed = title.trim().to_string();
         if trimmed.is_empty() {
@@ -356,9 +372,6 @@ pub fn update_task(
         } else {
             desc.replace("\r\n", "\n").trim_end().to_string()
         };
-    }
-    if let Some(status) = input.status {
-        task.status = status;
     }
     if let Some(priority) = input.priority {
         task.priority = priority;
@@ -383,6 +396,20 @@ pub fn update_task(
             Some(raw) if raw.trim().is_empty() => None,
             Some(raw) => Some(parse_due_date(&raw)?),
         };
+    }
+    if let Some(repeat_update) = input.repeat {
+        task.repeat = match repeat_update {
+            None => None,
+            Some(raw) if raw.trim().is_empty() => None,
+            Some(raw) => Some(parse_repeat(&raw)?),
+        };
+    }
+    if let Some(status) = input.status {
+        if status == Status::Done && !was_done && task.repeat.is_some() {
+            task.complete_if_recurring();
+        } else {
+            task.status = status;
+        }
     }
 
     task.touch();
@@ -535,6 +562,7 @@ mod tests {
                 priority: Priority::High,
                 tags: vec!["#agent".into(), "rust".into()],
                 due: Some("2026-12-01".into()),
+                repeat: None,
                 origin: None,
             },
         )
@@ -553,6 +581,7 @@ mod tests {
                 priority: Priority::Low,
                 tags: vec!["personal".into()],
                 due: None,
+                repeat: None,
                 origin: None,
             },
         )
@@ -729,6 +758,40 @@ mod tests {
         let archive_store = TaskStore::load_or_empty(Path::new(&report.archive_path)).unwrap();
         assert_eq!(archive_store.tasks.len(), 1);
         assert_eq!(archive_store.tasks[0].uid, done.uid);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn completing_recurring_task_rolls_due_date_and_resets_to_todo() {
+        let path = temp_store_path("recurring");
+        let cfg = AppConfig::default();
+
+        let task = add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Weekly standup prep".into(),
+                due: Some("2099-01-01".into()),
+                repeat: Some("weekly".into()),
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(task.repeat.as_deref(), Some("weekly"));
+
+        let updated = update_task(
+            &path,
+            &cfg,
+            &task.uid,
+            UpdateTaskInput {
+                status: Some(Status::Done),
+                ..UpdateTaskInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.status, Status::Todo);
+        assert_eq!(updated.due.as_deref(), Some("2099-01-08"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

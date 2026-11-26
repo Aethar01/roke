@@ -2,7 +2,8 @@ use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
     append_tasks_to_archive, archive_path_for, file_stamp, format_tags, now_millis, parse_due_date,
-    parse_tags, sort_task_refs, FileLock, FileStamp, Priority, SortOrder, Status, Task, TaskStore,
+    parse_repeat, parse_tags, sort_task_refs, FileLock, FileStamp, Priority, SortOrder, Status,
+    Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -87,6 +88,7 @@ pub enum FormField {
     Due,
     Status,
     Priority,
+    Repeat,
 }
 
 impl FormField {
@@ -97,18 +99,20 @@ impl FormField {
             FormField::Tags => FormField::Due,
             FormField::Due => FormField::Status,
             FormField::Status => FormField::Priority,
-            FormField::Priority => FormField::Title,
+            FormField::Priority => FormField::Repeat,
+            FormField::Repeat => FormField::Title,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            FormField::Title => FormField::Priority,
+            FormField::Title => FormField::Repeat,
             FormField::Description => FormField::Title,
             FormField::Tags => FormField::Description,
             FormField::Due => FormField::Tags,
             FormField::Status => FormField::Due,
             FormField::Priority => FormField::Status,
+            FormField::Repeat => FormField::Priority,
         }
     }
 }
@@ -269,6 +273,7 @@ pub struct TaskForm {
     pub description: TextInput,
     pub tags: TextInput,
     pub due: TextInput,
+    pub repeat: TextInput,
     pub status: Status,
     pub priority: Priority,
     pub active_field: FormField,
@@ -283,6 +288,7 @@ impl TaskForm {
             description: TextInput::new(""),
             tags: TextInput::new(default_tag.unwrap_or("")),
             due: TextInput::new(""),
+            repeat: TextInput::new(""),
             status: default_status,
             priority: Priority::Medium,
             active_field: FormField::Title,
@@ -297,6 +303,7 @@ impl TaskForm {
             description: TextInput::new(task.description.clone()),
             tags: TextInput::new(format_tags(&task.tags)),
             due: TextInput::new(task.due.clone().unwrap_or_default()),
+            repeat: TextInput::new(task.repeat.clone().unwrap_or_default()),
             status: task.status,
             priority: task.priority,
             active_field: FormField::Title,
@@ -367,6 +374,7 @@ pub struct ModalRegions {
     pub due: Rect,
     pub status: Rect,
     pub priority: Rect,
+    pub repeat: Rect,
     pub save_btn: Rect,
     pub cancel_btn: Rect,
 }
@@ -1177,6 +1185,11 @@ impl App {
                     }
                     _ => {}
                 },
+                FormField::Repeat => {
+                    if form.repeat.handle_key(key, false) {
+                        form.error = None;
+                    }
+                }
             },
         }
 
@@ -1211,6 +1224,12 @@ impl App {
         } else {
             Some(parse_due_date(due_raw)?)
         };
+        let repeat_raw = form.repeat.value.trim();
+        let repeat = if repeat_raw.is_empty() {
+            None
+        } else {
+            Some(parse_repeat(repeat_raw)?)
+        };
         self.push_undo();
 
         let target_id = if let Some(id) = form.editing_id {
@@ -1221,6 +1240,7 @@ impl App {
                 task.priority = form.priority;
                 task.tags = tags;
                 task.due = due;
+                task.repeat = repeat;
                 task.touch();
             }
             self.set_message("Task updated");
@@ -1237,6 +1257,7 @@ impl App {
             );
             if let Some(task) = self.store.get_mut(id) {
                 task.due = due;
+                task.repeat = repeat;
             }
             self.set_message("Task added");
             id
@@ -1566,16 +1587,25 @@ impl App {
             Status::Done
         };
         self.push_undo();
+        let mut rolled_due: Option<String> = None;
         if let Some(task) = self.store.get_mut(task_id) {
-            task.status = next_status;
-            task.touch();
+            if next_status == Status::Done && task.repeat.is_some() {
+                rolled_due = task.complete_if_recurring();
+            } else {
+                task.status = next_status;
+                task.touch();
+            }
         }
         self.persist();
         self.clamp_selections();
         if self.view == View::TodoList && self.todo_filter == TodoFilter::All {
             self.select_task_by_id(task_id);
         }
-        self.set_message(format!("Marked as {}", next_status.label()));
+        if let Some(next_due) = rolled_due {
+            self.set_message(format!("Completed — next due {next_due}"));
+        } else {
+            self.set_message(format!("Marked as {}", next_status.label()));
+        }
     }
 
     fn toggle_or_advance_selected(&mut self) {
@@ -1620,16 +1650,25 @@ impl App {
             return;
         }
         self.push_undo();
+        let mut rolled_due: Option<String> = None;
         if let Some(task) = self.store.get_mut(task_id) {
-            task.status = target;
-            task.touch();
+            if target == Status::Done && task.repeat.is_some() {
+                rolled_due = task.complete_if_recurring();
+            } else {
+                task.status = target;
+                task.touch();
+            }
         }
         self.persist();
         self.clamp_selections();
         if follow {
             self.select_task_by_id(task_id);
         }
-        self.set_message(format!("Moved to {}", target.label()));
+        if let Some(next_due) = rolled_due {
+            self.set_message(format!("Completed — next due {next_due}"));
+        } else {
+            self.set_message(format!("Moved to {}", target.label()));
+        }
     }
 
     pub fn cycle_sort_order(&mut self) {
@@ -2005,6 +2044,8 @@ impl App {
         } else if rect_contains(modal_regions.priority, x, y) {
             form.active_field = FormField::Priority;
             form.priority = form.priority.cycle();
+        } else if rect_contains(modal_regions.repeat, x, y) {
+            form.active_field = FormField::Repeat;
         }
 
         self.mode = Mode::TaskModal(form);
@@ -2213,11 +2254,16 @@ impl App {
                 let before_id = self.drop_before_task_in_column(target, drag.task_id, y);
                 if target != drag.origin_status {
                     self.push_undo();
+                    let mut rolled_due: Option<String> = None;
                     if let Some(task) = self.store.get_mut(drag.task_id) {
-                        task.status = target;
-                        task.touch();
+                        if target == Status::Done && task.repeat.is_some() {
+                            rolled_due = task.complete_if_recurring();
+                        } else {
+                            task.status = target;
+                            task.touch();
+                        }
                     }
-                    if self.sort_order == SortOrder::Manual {
+                    if rolled_due.is_none() && self.sort_order == SortOrder::Manual {
                         if let Some(from_pos) =
                             self.store.tasks.iter().position(|t| t.id == drag.task_id)
                         {
@@ -2233,7 +2279,11 @@ impl App {
                     self.persist();
                     self.clamp_selections();
                     self.select_task_by_id(drag.task_id);
-                    self.set_message(format!("Moved to {}", target.label()));
+                    if let Some(next_due) = rolled_due {
+                        self.set_message(format!("Completed — next due {next_due}"));
+                    } else {
+                        self.set_message(format!("Moved to {}", target.label()));
+                    }
                 } else if self.sort_order != SortOrder::Manual {
                     self.set_message("Switch to manual sort (O) to reorder");
                 } else if let Some(from_pos) =

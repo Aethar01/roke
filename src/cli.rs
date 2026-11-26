@@ -2,8 +2,8 @@ use crate::config::{default_config_path, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
-    default_storage_path, find_local_board, parse_due_date, parse_tags, today_ymd, DueState,
-    Priority, SortOrder, Status, Task, TaskStore, LOCAL_BOARD_FILENAME,
+    default_storage_path, find_local_board, parse_due_date, parse_repeat, parse_tags, today_ymd,
+    DueState, Priority, SortOrder, Status, Task, TaskStore, LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
 use crate::theme::{to_crossterm_color, Theme};
@@ -294,9 +294,13 @@ pub struct AddArgs {
     #[arg(short = 't', long = "tag", visible_alias = "tags")]
     pub tags: Vec<String>,
 
-    /// Optional due date (YYYY-MM-DD, today, or tomorrow)
+    /// Optional due date (YYYY-MM-DD, today, tomorrow, +3d, +2w, fri, eow, eom)
     #[arg(long = "due", value_parser = parse_due_date)]
     pub due: Option<String>,
+
+    /// Optional recurrence rule (daily, weekdays, weekly, monthly, every 3d/2w/2m)
+    #[arg(long = "repeat", value_parser = parse_repeat)]
+    pub repeat: Option<String>,
 
     /// Override task origin (defaults to local device_name)
     #[arg(long = "origin")]
@@ -340,13 +344,21 @@ pub struct EditArgs {
     #[arg(long = "rm-tag", visible_alias = "remove-tag")]
     pub remove_tags: Vec<String>,
 
-    /// Set due date (YYYY-MM-DD, today, or tomorrow)
+    /// Set due date (YYYY-MM-DD, today, tomorrow, +3d, +2w, fri, eow, eom)
     #[arg(long = "due", value_parser = parse_due_date)]
     pub due: Option<String>,
 
     /// Clear the task's due date
     #[arg(long = "clear-due")]
     pub clear_due: bool,
+
+    /// Set recurrence rule (daily, weekdays, weekly, monthly, every 3d/2w/2m)
+    #[arg(long = "repeat", value_parser = parse_repeat)]
+    pub repeat: Option<String>,
+
+    /// Clear the task's recurrence rule
+    #[arg(long = "clear-repeat")]
+    pub clear_repeat: bool,
 
     /// Open the task's Markdown notes in $EDITOR (nvim, etc.)
     #[arg(short = 'e', long = "editor")]
@@ -388,6 +400,8 @@ struct StdinTaskSpec {
     tags: Vec<String>,
     #[serde(default)]
     due: Option<String>,
+    #[serde(default)]
+    repeat: Option<String>,
     #[serde(default)]
     origin: Option<String>,
 }
@@ -434,6 +448,7 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
             spec.description
         };
         let due = spec.due.or_else(|| defaults.due.clone());
+        let repeat = spec.repeat.or_else(|| defaults.repeat.clone());
         let origin = spec.origin.or_else(|| defaults.origin.clone());
         out.push(AddTaskInput {
             title: spec.title,
@@ -442,6 +457,7 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
             priority,
             tags,
             due,
+            repeat,
             origin,
         });
     }
@@ -507,6 +523,7 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 priority: args.priority,
                 tags: args.tags.iter().flat_map(|t| parse_tags(t)).collect(),
                 due: args.due.clone(),
+                repeat: args.repeat.clone(),
                 origin: args.origin.clone(),
             };
             if args.from_stdin {
@@ -562,6 +579,8 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     && args.remove_tags.is_empty()
                     && args.due.is_none()
                     && !args.clear_due
+                    && args.repeat.is_none()
+                    && !args.clear_repeat
                 {
                     if json {
                         print_json(&existing)?;
@@ -576,6 +595,11 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
             } else {
                 args.due.clone().map(Some)
             };
+            let repeat_update = if args.clear_repeat {
+                Some(None)
+            } else {
+                args.repeat.clone().map(Some)
+            };
             let input = UpdateTaskInput {
                 title: args.title.clone(),
                 description,
@@ -589,9 +613,10 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     .flat_map(|t| parse_tags(t))
                     .collect(),
                 due: due_update,
+                repeat: repeat_update,
             };
             if input.is_empty() {
-                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --due, --clear-due, --editor.".into());
+                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --due, --clear-due, --repeat, --clear-repeat, --editor.".into());
             }
             let task = ops::update_task(&path, cfg, &args.selector, input)?;
             if json {
@@ -1000,7 +1025,13 @@ impl Painter {
             String::new()
         };
 
-        format!("{id_styled} {status_styled} {prio_styled} {title_styled}{due_str}{tags_str}")
+        let repeat_str = if let Some(rep) = &task.repeat {
+            format!("  {}", self.colored(&format!("↻ {rep}"), self.theme.subtle))
+        } else {
+            String::new()
+        };
+
+        format!("{id_styled} {status_styled} {prio_styled} {title_styled}{due_str}{repeat_str}{tags_str}")
     }
 
     pub fn format_task_detail(&self, task: &Task, eff_tags: &[String]) -> String {
@@ -1051,6 +1082,13 @@ impl Painter {
                 "  {} {}\n",
                 self.muted("due:     "),
                 self.colored(due, color)
+            ));
+        }
+        if let Some(rep) = &task.repeat {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("repeat:  "),
+                self.colored(&format!("↻ {rep}"), self.theme.subtle)
             ));
         }
         if !eff_tags.is_empty() {
@@ -1138,6 +1176,7 @@ mod tests {
             priority: Priority::High,
             tags: vec!["work".into()],
             due: None,
+            repeat: None,
             created_at: Some(1),
             updated_at: 1,
             origin: Some("local".into()),
