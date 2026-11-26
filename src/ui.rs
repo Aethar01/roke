@@ -2039,7 +2039,12 @@ fn render_notes_preview_modal(
                     let screen_y = body_rect.y + (visual_y - clamped_scroll);
                     app.regions.notes_check_rows.push((
                         check_idx,
-                        Rect::new(body_rect.x, screen_y, body_rect.width, rows.min(body_rect.bottom().saturating_sub(screen_y))),
+                        Rect::new(
+                            body_rect.x,
+                            screen_y,
+                            body_rect.width,
+                            rows.min(body_rect.bottom().saturating_sub(screen_y)),
+                        ),
                     ));
                 }
             }
@@ -2220,10 +2225,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
 
     let inner_h = area.height.saturating_sub(2);
     let inner_w = area.width.saturating_sub(4);
-    let total_visual: u16 = lines
-        .iter()
-        .map(|l| visual_line_rows(l, inner_w))
-        .sum();
+    let total_visual: u16 = lines.iter().map(|l| visual_line_rows(l, inner_w)).sum();
     let body_h = inner_h.saturating_sub(1);
     let max_scroll = total_visual.saturating_sub(body_h);
     let clamped_scroll = scroll.min(max_scroll);
@@ -2243,7 +2245,11 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         let indicator = format!(
             " {}{} ",
             if clamped_scroll > 0 { "↑" } else { " " },
-            if clamped_scroll < max_scroll { "↓" } else { " " }
+            if clamped_scroll < max_scroll {
+                "↓"
+            } else {
+                " "
+            }
         );
         block = block.title(
             Line::from(Span::styled(indicator, Style::default().fg(theme.accent)))

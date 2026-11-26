@@ -405,13 +405,15 @@ pub fn sync_all_peers(local_store: TaskStore, config: SyncConfig) -> SyncOutcome
                 match pull_peer_store(peer) {
                     Ok(latest) => {
                         if let Some(ref remote_store) = latest.store {
-                            working =
-                                merge_stores(&working, remote_store, &local_name, &peer.name);
+                            working = merge_stores(&working, remote_store, &local_name, &peer.name);
                         }
                         match push_peer_store(peer, &working, Some(&latest.cksum)) {
                             Ok(()) => synced_peers += 1,
                             Err(PushError::Conflict) => {
-                                errors.push(format!("{}: remote file changed concurrently", peer.name));
+                                errors.push(format!(
+                                    "{}: remote file changed concurrently",
+                                    peer.name
+                                ));
                             }
                             Err(PushError::Other(err)) => {
                                 errors.push(format!("{}: {err}", peer.name));
@@ -739,7 +741,11 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .collect();
-        assert_eq!(entries.len(), 1, "temp file must be cleaned up on CAS conflict");
+        assert_eq!(
+            entries.len(),
+            1,
+            "temp file must be cleaned up on CAS conflict"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

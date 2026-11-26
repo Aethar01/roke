@@ -1481,11 +1481,23 @@ mod tests {
         run(&["roke", "-f", &file_str, "add", "Batch A"]);
         run(&["roke", "-f", &file_str, "add", "Batch B"]);
         run(&["roke", "-f", &file_str, "move", "1", "2", "in-progress"]);
-        assert_eq!(ops::get_task(&file, &cfg, "1").unwrap().status, Status::InProgress);
-        assert_eq!(ops::get_task(&file, &cfg, "2").unwrap().status, Status::InProgress);
+        assert_eq!(
+            ops::get_task(&file, &cfg, "1").unwrap().status,
+            Status::InProgress
+        );
+        assert_eq!(
+            ops::get_task(&file, &cfg, "2").unwrap().status,
+            Status::InProgress
+        );
         run(&["roke", "-f", &file_str, "done", "1", "2"]);
-        assert_eq!(ops::get_task(&file, &cfg, "1").unwrap().status, Status::Done);
-        assert_eq!(ops::get_task(&file, &cfg, "2").unwrap().status, Status::Done);
+        assert_eq!(
+            ops::get_task(&file, &cfg, "1").unwrap().status,
+            Status::Done
+        );
+        assert_eq!(
+            ops::get_task(&file, &cfg, "2").unwrap().status,
+            Status::Done
+        );
         run(&["roke", "-f", &file_str, "rm", "1", "2"]);
         assert!(ops::list_tasks(&file, &cfg, &TaskFilter::default())
             .unwrap()

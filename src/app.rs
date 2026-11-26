@@ -1238,41 +1238,39 @@ impl App {
             KeyCode::Esc => {
                 return;
             }
-            KeyCode::Enter => {
-                match parse_quick_add(&input.value) {
-                    Ok(parsed) => {
-                        let status = self.default_new_task_status();
-                        let mut tags = self.tag_filters.clone();
-                        for t in parsed.tags {
-                            if !tags.contains(&t) {
-                                tags.push(t);
-                            }
+            KeyCode::Enter => match parse_quick_add(&input.value) {
+                Ok(parsed) => {
+                    let status = self.default_new_task_status();
+                    let mut tags = self.tag_filters.clone();
+                    for t in parsed.tags {
+                        if !tags.contains(&t) {
+                            tags.push(t);
                         }
-                        self.push_undo();
-                        let device = self.sync_config.effective_device_name();
-                        let id = self.store.add_with_origin(
-                            parsed.title.clone(),
-                            String::new(),
-                            status,
-                            parsed.priority.unwrap_or(Priority::Medium),
-                            tags,
-                            &device,
-                        );
-                        if let Some(task) = self.store.get_mut(id) {
-                            task.due = parsed.due;
-                            task.repeat = parsed.repeat;
-                        }
-                        self.persist();
-                        self.clamp_selections();
-                        self.select_task_by_id(id);
-                        self.set_message(format!("Added \"{}\"", parsed.title));
-                        return;
                     }
-                    Err(msg) => {
-                        error = Some(msg);
+                    self.push_undo();
+                    let device = self.sync_config.effective_device_name();
+                    let id = self.store.add_with_origin(
+                        parsed.title.clone(),
+                        String::new(),
+                        status,
+                        parsed.priority.unwrap_or(Priority::Medium),
+                        tags,
+                        &device,
+                    );
+                    if let Some(task) = self.store.get_mut(id) {
+                        task.due = parsed.due;
+                        task.repeat = parsed.repeat;
                     }
+                    self.persist();
+                    self.clamp_selections();
+                    self.select_task_by_id(id);
+                    self.set_message(format!("Added \"{}\"", parsed.title));
+                    return;
                 }
-            }
+                Err(msg) => {
+                    error = Some(msg);
+                }
+            },
             _ => {
                 if input.handle_key(key, true) {
                     error = None;
@@ -2060,7 +2058,11 @@ impl App {
             self.set_message("Yanked title");
             return;
         }
-        let check = if task.status == Status::Done { "x" } else { " " };
+        let check = if task.status == Status::Done {
+            "x"
+        } else {
+            " "
+        };
         let mut out = format!("- [{check}] {}", task.title);
         let eff_tags = self.effective_tags(&task);
         if !eff_tags.is_empty() {
@@ -3168,7 +3170,8 @@ default_sort = "priority"
         std::fs::write(&cfg_path, "[theme]\npreset = \"nord\"\n").unwrap();
 
         let cfg = AppConfig::load_or_default(&cfg_path).unwrap();
-        let mut app = App::with_config_and_path(TaskStore::new_empty(), None, Some(cfg_path.clone()), cfg);
+        let mut app =
+            App::with_config_and_path(TaskStore::new_empty(), None, Some(cfg_path.clone()), cfg);
         assert_eq!(app.theme, Theme::preset("nord").unwrap());
         assert!(!app.reload_config_if_changed());
 
@@ -3191,8 +3194,20 @@ default_sort = "priority"
         let path = dir.join("todos.jsonl");
 
         let mut store = TaskStore::new_empty();
-        store.add("Open".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
-        store.add("Finished".into(), String::new(), Status::Done, Priority::Low, vec!["ship".into()]);
+        store.add(
+            "Open".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+        );
+        store.add(
+            "Finished".into(),
+            String::new(),
+            Status::Done,
+            Priority::Low,
+            vec!["ship".into()],
+        );
         store.save(&path).unwrap();
 
         let mut app = App::with_config(store, Some(path.clone()), AppConfig::default());
@@ -3554,12 +3569,22 @@ default_sort = "priority"
         // Space toggles item 0 (`- [ ] Step 1` -> `- [x] Step 1`)
         app.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(app.store.get(1).unwrap().checklist_progress(), Some((2, 2)));
-        assert!(app.store.get(1).unwrap().description.contains("- [x] Step 1"));
+        assert!(app
+            .store
+            .get(1)
+            .unwrap()
+            .description
+            .contains("- [x] Step 1"));
         // Tab moves to item 1 (`- [x] Step 2`) and Space unchecks it
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(app.store.get(1).unwrap().checklist_progress(), Some((1, 2)));
-        assert!(app.store.get(1).unwrap().description.contains("- [ ] Step 2"));
+        assert!(app
+            .store
+            .get(1)
+            .unwrap()
+            .description
+            .contains("- [ ] Step 2"));
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Normal));

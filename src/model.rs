@@ -159,6 +159,7 @@ fn local_today_ymd_tuple() -> (i64, u32, u32) {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ptr = unsafe { libc::localtime_r(&secs, &mut tm) };
     if ptr.is_null() {
+        #[allow(clippy::unnecessary_cast)]
         return civil_from_days((secs as i64).div_euclid(86_400));
     }
     (
@@ -1418,13 +1419,19 @@ mod tests {
         assert_eq!(parse_due_date("tomorrow").unwrap().len(), 10);
         // Round-trip days_from_civil <-> civil_from_days including leap year
         assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
-        assert_eq!(civil_from_days(days_from_civil(2026, 11, 26)), (2026, 11, 26));
+        assert_eq!(
+            civil_from_days(days_from_civil(2026, 11, 26)),
+            (2026, 11, 26)
+        );
 
         // Natural due dates anchored at Thursday 2026-11-26
         let base = (2026, 11, 26);
         assert_eq!(parse_due_date_from("+3d", base).unwrap(), "2026-11-29");
         assert_eq!(parse_due_date_from("+2w", base).unwrap(), "2026-12-10");
-        assert_eq!(parse_due_date_from("+1m", (2026, 1, 31)).unwrap(), "2026-02-28");
+        assert_eq!(
+            parse_due_date_from("+1m", (2026, 1, 31)).unwrap(),
+            "2026-02-28"
+        );
         assert_eq!(parse_due_date_from("fri", base).unwrap(), "2026-11-27");
         assert_eq!(parse_due_date_from("thu", base).unwrap(), "2026-12-03");
         assert_eq!(parse_due_date_from("eow", base).unwrap(), "2026-11-27");
