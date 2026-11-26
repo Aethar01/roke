@@ -467,6 +467,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

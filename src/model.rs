@@ -123,8 +123,20 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
-/// Convert days since 1970-01-01 (UTC) to `(year, month, day)` using Howard Hinnant's algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// Convert `(year, month, day)` to days since 1970-01-01 using Howard Hinnant's algorithm.
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = m as u64;
+    let d = d as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + (doe as i64) - 719_468
+}
+
+/// Convert days since 1970-01-01 to `(year, month, day)` using Howard Hinnant's algorithm.
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -138,22 +150,43 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, m as u32, d as u32)
 }
 
-pub fn today_ymd() -> String {
+#[cfg(unix)]
+fn local_today_ymd_tuple() -> (i64, u32, u32) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ptr = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if ptr.is_null() {
+        return civil_from_days((secs as i64).div_euclid(86_400));
+    }
+    (
+        (tm.tm_year as i64) + 1900,
+        (tm.tm_mon as u32) + 1,
+        tm.tm_mday as u32,
+    )
+}
+
+#[cfg(not(unix))]
+fn local_today_ymd_tuple() -> (i64, u32, u32) {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    civil_from_days(secs.div_euclid(86_400))
+}
+
+pub fn today_ymd() -> String {
+    let (y, m, d) = local_today_ymd_tuple();
     format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn offset_ymd(days_offset: i64) -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400) + days_offset);
-    format!("{y:04}-{m:02}-{d:02}")
+    let (y, m, d) = local_today_ymd_tuple();
+    let days = days_from_civil(y, m, d) + days_offset;
+    let (ny, nm, nd) = civil_from_days(days);
+    format!("{ny:04}-{nm:02}-{nd:02}")
 }
 
 /// Validate and normalize a due date (`YYYY-MM-DD`, `today`, or `tomorrow`).
@@ -1101,6 +1134,9 @@ mod tests {
         assert!(parse_due_date("not-a-date").is_err());
         assert_eq!(parse_due_date("today").unwrap().len(), 10);
         assert_eq!(parse_due_date("tomorrow").unwrap().len(), 10);
+        // Round-trip days_from_civil <-> civil_from_days including leap year
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
+        assert_eq!(civil_from_days(days_from_civil(2026, 11, 26)), (2026, 11, 26));
 
         let mut store = TaskStore::new_empty();
         let id = store.add(
