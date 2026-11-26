@@ -15,6 +15,7 @@ pub struct McpServer {
 }
 
 impl McpServer {
+    #[allow(dead_code)]
     pub fn new(storage_path: PathBuf, config: AppConfig) -> Self {
         Self::with_options(storage_path, config, false)
     }
@@ -80,9 +81,7 @@ impl McpServer {
                 json_rpc_result(id, json!({ "tools": tool_definitions(self.read_only) }))
             }
             "tools/call" => self.handle_tool_call(id, &params),
-            "resources/list" => {
-                json_rpc_result(id, json!({ "resources": resource_definitions() }))
-            }
+            "resources/list" => json_rpc_result(id, json!({ "resources": resource_definitions() })),
             "resources/templates/list" => json_rpc_result(
                 id,
                 json!({ "resourceTemplates": resource_template_definitions() }),
@@ -134,7 +133,12 @@ impl McpServer {
 
         let is_mutating = matches!(
             name,
-            "add_task" | "add_tasks" | "update_task" | "delete_task" | "archive_done" | "sync_tasks"
+            "add_task"
+                | "add_tasks"
+                | "update_task"
+                | "delete_task"
+                | "archive_done"
+                | "sync_tasks"
         );
         if self.read_only && is_mutating {
             return json_rpc_result(
@@ -187,12 +191,10 @@ impl McpServer {
         };
 
         let content = match uri {
-            "roke://tasks" => ops::board_snapshot(
-                &self.storage_path,
-                &self.config,
-                &TaskFilter::default(),
-            )
-            .and_then(|snap| serde_json::to_string_pretty(&snap).map_err(|e| e.to_string())),
+            "roke://tasks" => {
+                ops::board_snapshot(&self.storage_path, &self.config, &TaskFilter::default())
+                    .and_then(|snap| serde_json::to_string_pretty(&snap).map_err(|e| e.to_string()))
+            }
             "roke://tags" => ops::list_tags(&self.storage_path, &self.config)
                 .and_then(|tags| serde_json::to_string_pretty(&tags).map_err(|e| e.to_string())),
             other if other.starts_with("roke://task/") => {
@@ -784,14 +786,17 @@ mod tests {
 
     fn temp_server(name: &str) -> (McpServer, PathBuf) {
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("roke_mcp_{name}_{}_{seq}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("roke_mcp_{name}_{}_{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("todos.jsonl");
         (McpServer::new(path, AppConfig::default()), dir)
     }
 
     fn call(server: &McpServer, req: Value) -> Value {
-        let reply = server.handle_line(&req.to_string()).expect("expected reply");
+        let reply = server
+            .handle_line(&req.to_string())
+            .expect("expected reply");
         serde_json::from_str(&reply).unwrap()
     }
 
@@ -973,10 +978,9 @@ mod tests {
                 "params": { "uri": format!("roke://task/{uid2}") }
             }),
         );
-        let fetched: Value = serde_json::from_str(
-            task_res["result"]["contents"][0]["text"].as_str().unwrap(),
-        )
-        .unwrap();
+        let fetched: Value =
+            serde_json::from_str(task_res["result"]["contents"][0]["text"].as_str().unwrap())
+                .unwrap();
         assert_eq!(fetched["title"], "Task Two");
         assert_eq!(fetched["due"], "2026-12-31");
 
@@ -995,7 +999,8 @@ mod tests {
         assert_eq!(arch_data["archived"], 1);
 
         // Read-only server hides and rejects mutating tools
-        let ro_server = McpServer::with_options(dir.join("todos.jsonl"), AppConfig::default(), true);
+        let ro_server =
+            McpServer::with_options(dir.join("todos.jsonl"), AppConfig::default(), true);
         let ro_tools = call(
             &ro_server,
             json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" }),
@@ -1007,7 +1012,10 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert_eq!(ro_names, vec!["list_tasks", "get_task", "list_tags"]);
-        assert_eq!(ro_tools["result"]["tools"][0]["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            ro_tools["result"]["tools"][0]["annotations"]["readOnlyHint"],
+            true
+        );
 
         let blocked = call(
             &ro_server,

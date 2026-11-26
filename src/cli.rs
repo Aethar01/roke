@@ -274,7 +274,12 @@ pub struct AddArgs {
     pub title: Vec<String>,
 
     /// Task description or notes
-    #[arg(short = 'd', long = "desc", visible_alias = "description", default_value = "")]
+    #[arg(
+        short = 'd',
+        long = "desc",
+        visible_alias = "description",
+        default_value = ""
+    )]
     pub description: String,
 
     /// Initial status (todo, in-progress, done)
@@ -545,11 +550,9 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
             if args.open_editor {
                 let existing = ops::get_task(&path, cfg, &args.selector)?;
                 let seed = description.as_deref().unwrap_or(&existing.description);
-                if let Some(updated_md) = editor::edit_markdown_in_editor(
-                    seed,
-                    &existing.title,
-                    cfg.editor.as_deref(),
-                )? {
+                if let Some(updated_md) =
+                    editor::edit_markdown_in_editor(seed, &existing.title, cfg.editor.as_deref())?
+                {
                     description = Some(updated_md);
                 } else if args.title.is_none()
                     && args.status.is_none()
@@ -580,7 +583,11 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 priority: args.priority,
                 tags: args.tags.as_deref().map(parse_tags),
                 add_tags: args.add_tags.iter().flat_map(|t| parse_tags(t)).collect(),
-                remove_tags: args.remove_tags.iter().flat_map(|t| parse_tags(t)).collect(),
+                remove_tags: args
+                    .remove_tags
+                    .iter()
+                    .flat_map(|t| parse_tags(t))
+                    .collect(),
                 due: due_update,
             };
             if input.is_empty() {
@@ -751,10 +758,7 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     painter.muted(&format!("({} tasks total)", report.total_tasks))
                 );
                 for err in &report.errors {
-                    eprintln!(
-                        "{} {err}",
-                        painter.badge("!", painter.theme.error)
-                    );
+                    eprintln!("{} {err}", painter.badge("!", painter.theme.error));
                 }
             }
             if !report.errors.is_empty() && report.synced_peers == 0 {
@@ -770,7 +774,11 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     "{} Pruned {} tombstone{} {}",
                     painter.badge("✓", painter.theme.done),
                     report.pruned_tombstones,
-                    if report.pruned_tombstones == 1 { "" } else { "s" },
+                    if report.pruned_tombstones == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                     painter.muted(&format!(
                         "({} remaining, {} tasks)",
                         report.remaining_tombstones, report.total_tasks
@@ -1071,10 +1079,7 @@ impl Painter {
             } else {
                 out.push_str(&format!("  {}\n", self.muted("notes:")));
                 for line in lines {
-                    out.push_str(&format!(
-                        "    {}\n",
-                        self.colored(line, self.theme.text)
-                    ));
+                    out.push_str(&format!("    {}\n", self.colored(line, self.theme.text)));
                 }
             }
         }

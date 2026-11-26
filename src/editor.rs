@@ -125,10 +125,8 @@ pub fn edit_markdown_in_editor(
         short_slug
     };
     let seq = EDITOR_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = std::env::temp_dir().join(format!(
-        "roke-{label}-{}-{seq}.md",
-        std::process::id()
-    ));
+    let tmp_path =
+        std::env::temp_dir().join(format!("roke-{label}-{}-{seq}.md", std::process::id()));
 
     let initial_norm = normalize_markdown(initial);
     let file_contents = if initial_norm.is_empty() {

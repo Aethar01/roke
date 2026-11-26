@@ -220,9 +220,7 @@ fn push_peer_store(peer: &PeerConfig, store: &TaskStore) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to run ssh: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("failed to run ssh: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(payload.as_bytes())
@@ -441,8 +439,22 @@ mod tests {
     #[test]
     fn merge_propagates_task_reordering() {
         let mut local = TaskStore::new_empty();
-        local.add_with_origin("First".into(), String::new(), Status::Todo, Priority::Medium, Vec::new(), "mac");
-        local.add_with_origin("Second".into(), String::new(), Status::Todo, Priority::Medium, Vec::new(), "mac");
+        local.add_with_origin(
+            "First".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+            "mac",
+        );
+        local.add_with_origin(
+            "Second".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+            "mac",
+        );
         local.ensure_orders();
 
         let mut remote = local.clone();
@@ -516,10 +528,8 @@ mod tests {
 
     #[test]
     fn remote_shell_commands_handle_quotes_and_spaces_under_sh_and_fish() {
-        let dir = std::env::temp_dir().join(format!(
-            "roke_sync_quote's dir_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("roke_sync_quote's dir_{}", std::process::id()));
         let file = dir.join("my'todos\\list.jsonl");
         let _ = std::fs::remove_dir_all(&dir);
         let file_str = file.to_string_lossy().to_string();

@@ -631,9 +631,7 @@ impl App {
             .tasks
             .iter()
             .filter(|t| {
-                self.todo_filter.matches(t.status)
-                    && self.matches_tag(t)
-                    && self.matches_search(t)
+                self.todo_filter.matches(t.status) && self.matches_tag(t) && self.matches_search(t)
             })
             .collect();
         sort_task_refs(&mut refs, self.sort_order);
@@ -733,8 +731,7 @@ impl App {
                 if let Ok(mut disk_store) = TaskStore::load_or_empty(&path) {
                     let local_name = self.sync_config.effective_device_name();
                     disk_store.ensure_sync_metadata(&local_name);
-                    self.store =
-                        merge_stores(&self.store, &disk_store, &local_name, &local_name);
+                    self.store = merge_stores(&self.store, &disk_store, &local_name, &local_name);
                 }
             }
             if let Err(err) = self.store.save(&path) {
@@ -878,7 +875,11 @@ impl App {
     }
 
     fn handle_notes_preview_key(&mut self, key: KeyEvent) {
-        let Mode::NotesPreview { task_id, mut scroll } = self.mode else {
+        let Mode::NotesPreview {
+            task_id,
+            mut scroll,
+        } = self.mode
+        else {
             return;
         };
         match key.code {
@@ -1975,10 +1976,9 @@ impl App {
 
     fn is_double_click(&mut self, task_id: u64) -> bool {
         let now = Instant::now();
-        let is_double = self
-            .last_click
-            .as_ref()
-            .is_some_and(|c| c.task_id == task_id && now.duration_since(c.at) < Duration::from_millis(400));
+        let is_double = self.last_click.as_ref().is_some_and(|c| {
+            c.task_id == task_id && now.duration_since(c.at) < Duration::from_millis(400)
+        });
         if is_double {
             self.last_click = None;
         } else {
@@ -2102,7 +2102,12 @@ impl App {
             .map(|(status, _)| *status)
     }
 
-    fn drop_before_task_in_column(&self, target_status: Status, drag_task_id: u64, y: u16) -> Option<u64> {
+    fn drop_before_task_in_column(
+        &self,
+        target_status: Status,
+        drag_task_id: u64,
+        y: u16,
+    ) -> Option<u64> {
         self.regions
             .kanban_cards
             .iter()
@@ -2198,12 +2203,8 @@ impl App {
                 } else if let Some(from_pos) =
                     self.store.tasks.iter().position(|t| t.id == drag.task_id)
                 {
-                    let to_pos = self.compute_store_insert_index(
-                        from_pos,
-                        target,
-                        before_id,
-                        drag.task_id,
-                    );
+                    let to_pos =
+                        self.compute_store_insert_index(from_pos, target, before_id, drag.task_id);
                     if to_pos != from_pos {
                         self.push_undo();
                         self.store.move_to_position(from_pos, to_pos);
@@ -2368,7 +2369,13 @@ mod tests {
     fn tag_filter_modal_scrolls_when_many_tags() {
         let mut store = TaskStore::new_empty();
         let tags: Vec<String> = (1..=20).map(|i| format!("tag{i:02}")).collect();
-        store.add("Many tags".into(), String::new(), Status::Todo, Priority::Medium, tags);
+        store.add(
+            "Many tags".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            tags,
+        );
         let mut app = App::new(store, None);
 
         app.handle_key(key(KeyCode::Char('t')));
@@ -2546,20 +2553,33 @@ inject_device_tag = true
     #[test]
     fn readline_shortcuts_and_status_toast_expiry() {
         let mut input = TextInput::new("alpha beta gamma");
-        input.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), true);
+        input.handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            true,
+        );
         assert_eq!(input.value, "alpha beta ");
-        input.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), true);
+        input.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            true,
+        );
         assert_eq!(input.cursor, 0);
         input.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT), true);
         assert_eq!(input.cursor, 5);
-        input.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL), true);
+        input.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            true,
+        );
         assert_eq!(input.value, "alpha");
-        input.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), true);
+        input.handle_key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            true,
+        );
         assert_eq!(input.value, "");
 
         let mut app = sample_app();
         app.set_message("Transient");
-        app.status_message_at = Some(Instant::now() - STATUS_TOAST_DURATION - Duration::from_secs(1));
+        app.status_message_at =
+            Some(Instant::now() - STATUS_TOAST_DURATION - Duration::from_secs(1));
         assert!(app.tick_status_message());
         assert!(app.status_message.is_none());
     }
@@ -2575,9 +2595,27 @@ default_sort = "priority"
         )
         .unwrap();
         let mut store = TaskStore::new_empty();
-        let id1 = store.add("Low soon".into(), String::new(), Status::Todo, Priority::Low, Vec::new());
-        let id2 = store.add("High later".into(), String::new(), Status::Todo, Priority::High, Vec::new());
-        let id3 = store.add("Med earliest".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
+        let id1 = store.add(
+            "Low soon".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Low,
+            Vec::new(),
+        );
+        let id2 = store.add(
+            "High later".into(),
+            String::new(),
+            Status::Todo,
+            Priority::High,
+            Vec::new(),
+        );
+        let id3 = store.add(
+            "Med earliest".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+        );
         store.get_mut(id1).unwrap().due = Some("2026-05-02".into());
         store.get_mut(id2).unwrap().due = Some("2026-05-10".into());
         store.get_mut(id3).unwrap().due = Some("2026-05-01".into());
@@ -2680,9 +2718,18 @@ default_sort = "priority"
         let buf = terminal.backend().buffer();
         let row_y = app.regions.filter_pills[0].1.y;
         let line: String = (0..80).map(|x| buf[(x, row_y)].symbol()).collect();
-        assert!(line.contains("All 1"), "expected 'All 1' in filter bar, got: {line}");
-        assert!(line.contains("To Do 1"), "expected 'To Do 1' in filter bar, got: {line}");
-        assert!(line.contains("Done 0"), "expected 'Done 0' in filter bar, got: {line}");
+        assert!(
+            line.contains("All 1"),
+            "expected 'All 1' in filter bar, got: {line}"
+        );
+        assert!(
+            line.contains("To Do 1"),
+            "expected 'To Do 1' in filter bar, got: {line}"
+        );
+        assert!(
+            line.contains("Done 0"),
+            "expected 'Done 0' in filter bar, got: {line}"
+        );
     }
 
     #[test]
@@ -2903,7 +2950,13 @@ default_sort = "priority"
 
         // Open read-only Markdown notes preview with 'v' and scroll/close
         app.handle_key(key(KeyCode::Char('v')));
-        assert!(matches!(app.mode, Mode::NotesPreview { task_id: 1, scroll: 0 }));
+        assert!(matches!(
+            app.mode,
+            Mode::NotesPreview {
+                task_id: 1,
+                scroll: 0
+            }
+        ));
         let preview_backend = TestBackend::new(80, 24);
         let mut preview_terminal = Terminal::new(preview_backend).unwrap();
         preview_terminal.draw(|f| ui::render(f, &mut app)).unwrap();
@@ -2936,7 +2989,10 @@ default_sort = "priority"
         }
 
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.store.get(1).unwrap().description, "# Updated\nMore lines");
+        assert_eq!(
+            app.store.get(1).unwrap().description,
+            "# Updated\nMore lines"
+        );
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         app.handle_key(key(KeyCode::Char('2')));
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();

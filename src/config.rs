@@ -124,7 +124,9 @@ pub fn normalize_device_tag(raw: &str) -> String {
 
 pub fn detect_hostname() -> String {
     static CACHED_HOSTNAME: OnceLock<String> = OnceLock::new();
-    CACHED_HOSTNAME.get_or_init(detect_hostname_uncached).clone()
+    CACHED_HOSTNAME
+        .get_or_init(detect_hostname_uncached)
+        .clone()
 }
 
 fn detect_hostname_uncached() -> String {

@@ -103,13 +103,21 @@ fn main() -> io::Result<()> {
 
 fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()
 }
 
 fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     terminal.clear()
 }
 
@@ -125,11 +133,8 @@ fn run_loop(
         if let Some(target) = app.pending_editor.take() {
             if let Some((initial, title)) = app.editor_initial_content(target) {
                 suspend_terminal(terminal)?;
-                let edit_res = editor::edit_markdown_in_editor(
-                    &initial,
-                    &title,
-                    app.editor_config.as_deref(),
-                );
+                let edit_res =
+                    editor::edit_markdown_in_editor(&initial, &title, app.editor_config.as_deref());
                 resume_terminal(terminal)?;
                 app.apply_editor_result(target, edit_res);
                 needs_draw = true;

@@ -281,10 +281,19 @@ pub fn add_tasks_batch(
         let description = if input.description.trim().is_empty() {
             String::new()
         } else {
-            input.description.replace("\r\n", "\n").trim_end().to_string()
+            input
+                .description
+                .replace("\r\n", "\n")
+                .trim_end()
+                .to_string()
         };
         let tags = normalize_tags(&input.tags);
-        let due = match input.due.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let due = match input
+            .due
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(raw) => Some(parse_due_date(raw)?),
             None => None,
         };
@@ -420,7 +429,12 @@ pub fn sync_tasks(path: &Path, cfg: &AppConfig) -> Result<SyncReport, String> {
     // Re-read disk under lock in case another process edited the file while SSH ran
     let _lock = acquire_lock(path)?;
     let latest_disk = load_store(path, cfg)?;
-    let merged = merge_stores(&latest_disk, &outcome.merged_store, &local_name, &local_name);
+    let merged = merge_stores(
+        &latest_disk,
+        &outcome.merged_store,
+        &local_name,
+        &local_name,
+    );
     save_store(&merged, path)?;
 
     Ok(SyncReport {
@@ -457,16 +471,14 @@ pub fn archive_done(
 ) -> Result<ArchiveReport, String> {
     let _lock = acquire_lock(path)?;
     let mut store = load_store(path, cfg)?;
-    let cutoff = older_than_days
-        .map(|d| now_millis().saturating_sub(d.saturating_mul(24 * 60 * 60 * 1000)));
+    let cutoff =
+        older_than_days.map(|d| now_millis().saturating_sub(d.saturating_mul(24 * 60 * 60 * 1000)));
     let archive_path = archive_path_for(path);
 
     let target_ids: Vec<u64> = store
         .tasks
         .iter()
-        .filter(|t| {
-            t.status == Status::Done && cutoff.is_none_or(|c| t.updated_at <= c)
-        })
+        .filter(|t| t.status == Status::Done && cutoff.is_none_or(|c| t.updated_at <= c))
         .map(|t| t.id)
         .collect();
 
@@ -502,10 +514,8 @@ mod tests {
 
     fn temp_store_path(name: &str) -> std::path::PathBuf {
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "roke_ops_{name}_{}_{seq}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("roke_ops_{name}_{}_{seq}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir.join("todos.jsonl")
     }
@@ -648,7 +658,13 @@ mod tests {
         let cfg = AppConfig::default();
 
         let mut store = TaskStore::new_empty();
-        store.add("Keep".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
+        store.add(
+            "Keep".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+        );
         let now = now_millis();
         let old_ts = now.saturating_sub(120 * 24 * 60 * 60 * 1000);
         let fresh_ts = now.saturating_sub(2 * 24 * 60 * 60 * 1000);
@@ -695,7 +711,12 @@ mod tests {
 
         let dry = archive_done(&path, &cfg, None, true).unwrap();
         assert_eq!(dry.archived, 1);
-        assert_eq!(list_tasks(&path, &cfg, &TaskFilter::default()).unwrap().len(), 2);
+        assert_eq!(
+            list_tasks(&path, &cfg, &TaskFilter::default())
+                .unwrap()
+                .len(),
+            2
+        );
 
         let report = archive_done(&path, &cfg, None, false).unwrap();
         assert_eq!(report.archived, 1);

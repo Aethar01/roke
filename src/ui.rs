@@ -161,7 +161,11 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     if !app.sync_config.peers.is_empty() {
-        let sync_label = if app.syncing { "↻ syncing" } else { "↻ sync" };
+        let sync_label = if app.syncing {
+            "↻ syncing"
+        } else {
+            "↻ sync"
+        };
         let sync_w = sync_label.width() as u16;
         if right_edge > x + sync_w + 1 {
             right_edge -= sync_w + 2;
@@ -337,8 +341,8 @@ fn render_todo_view(frame: &mut Frame, app: &mut App, area: Rect) {
     let status_w = status_filter_row_width(app);
     let inline_tags_w = tag_pills_total_width(app, &all_tags, false);
     // Separator "   │  " takes 6 columns
-    let tags_fit_inline =
-        !all_tags.is_empty() && status_w.saturating_add(6).saturating_add(inline_tags_w) <= area.width;
+    let tags_fit_inline = !all_tags.is_empty()
+        && status_w.saturating_add(6).saturating_add(inline_tags_w) <= area.width;
 
     let max_tag_rows = if area.height >= 10 { 2 } else { 1 };
     let extra_tag_rows = if all_tags.is_empty() || tags_fit_inline {
@@ -502,7 +506,10 @@ fn render_tag_pills_wrapped(
             }
         }
 
-        if x.saturating_add(w) > area.right().saturating_sub(reserve_right) && x == area.x && y == last_y {
+        if x.saturating_add(w) > area.right().saturating_sub(reserve_right)
+            && x == area.x
+            && y == last_y
+        {
             // Even at start of last row it doesn't fit with reserve; show overflow if tags remain
             if remaining_after > 0 || w > area.width {
                 hidden_count = all_tags.len() - idx;
@@ -769,9 +776,7 @@ fn render_todo_card(
             .fg(theme.muted)
             .add_modifier(Modifier::CROSSED_OUT)
     } else if selected {
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.subtle)
     };
@@ -871,10 +876,9 @@ fn render_kanban_view(frame: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let is_focused = app.kanban_col == col_idx;
-        let is_drag_target = app
-            .drag
-            .as_ref()
-            .is_some_and(|d| d.active && d.hover_status == Some(status) && d.origin_status != status);
+        let is_drag_target = app.drag.as_ref().is_some_and(|d| {
+            d.active && d.hover_status == Some(status) && d.origin_status != status
+        });
         let is_same_col_reorder = app.drag.as_ref().is_some_and(|d| {
             d.active
                 && d.hover_status == Some(status)
@@ -1089,9 +1093,7 @@ fn render_kanban_card(
             .fg(theme.muted)
             .add_modifier(Modifier::CROSSED_OUT)
     } else if selected {
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.subtle)
     };
@@ -1212,9 +1214,7 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         .border_style(Style::default().fg(theme.muted))
         .title(Span::styled(
             title,
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
@@ -1315,10 +1315,7 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         visible_text_slice(&form.tags.value, form.tags.cursor, tags_w);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Tags",
-                field_label_style(&theme, tags_active),
-            )),
+            Line::from(Span::styled("Tags", field_label_style(&theme, tags_active))),
             Line::from(Span::styled(
                 if tags_slice.is_empty() && !tags_active {
                     "work, personal"
@@ -1429,8 +1426,7 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
     let save_w = (save_label.width() as u16).min(rows[5].width);
     let save_rect = Rect::new(rows[5].x, btn_y, save_w, 1);
     let cancel_x = rows[5].x.saturating_add(save_w + 3);
-    let cancel_w =
-        (cancel_label.width() as u16).min(rows[5].right().saturating_sub(cancel_x));
+    let cancel_w = (cancel_label.width() as u16).min(rows[5].right().saturating_sub(cancel_x));
     let cancel_rect = Rect::new(cancel_x, btn_y, cancel_w, 1);
 
     frame.render_widget(
@@ -1513,9 +1509,7 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
         .border_style(Style::default().fg(theme.muted))
         .title(Span::styled(
             " Filter Tags ",
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ))
         .title(
             Line::from(Span::styled(mode_text, Style::default().fg(theme.accent)))
@@ -1568,9 +1562,7 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
             Span::styled("○ ", Style::default().fg(theme.muted))
         };
         let label_style = if is_active || is_cursor {
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.subtle)
         };
@@ -1622,7 +1614,12 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
     if inner.right().saturating_sub(1) > clear_x + clear_w + hint_w + 1 {
         frame.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(theme.muted))),
-            Rect::new(inner.right().saturating_sub(1 + hint_w), footer_y, hint_w, 1),
+            Rect::new(
+                inner.right().saturating_sub(1 + hint_w),
+                footer_y,
+                hint_w,
+                1,
+            ),
         );
     }
 
@@ -1645,17 +1642,23 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
     frame.render_widget(Clear, area);
     app.regions.notes_modal = Some(area);
 
-    let title_label = format!(" {} ", truncate_to_width(&task.title, area.width.saturating_sub(24) as usize));
-    let meta_badge = format!(" {} {} · {} ", task.status.glyph(), task.status.label(), task.priority.label());
+    let title_label = format!(
+        " {} ",
+        truncate_to_width(&task.title, area.width.saturating_sub(24) as usize)
+    );
+    let meta_badge = format!(
+        " {} {} · {} ",
+        task.status.glyph(),
+        task.status.label(),
+        task.priority.label()
+    );
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
         .title(Span::styled(
             title_label,
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ))
         .title(
             Line::from(Span::styled(
@@ -1717,7 +1720,10 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
 
     if task.description.trim().is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("No notes yet. Press 'n' to write Markdown in {}.", app.editor_label),
+            format!(
+                "No notes yet. Press 'n' to write Markdown in {}.",
+                app.editor_label
+            ),
             Style::default().fg(theme.muted),
         )));
     } else {
@@ -1752,9 +1758,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
             {
                 lines.push(Line::from(Span::styled(
                     heading.to_string(),
-                    Style::default()
-                        .fg(theme.text)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 )));
             } else if let Some(rest) = trimmed
                 .strip_prefix("- [x] ")
@@ -1822,12 +1826,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
         };
     }
 
-    let body_rect = Rect::new(
-        inner.x + 1,
-        inner.y,
-        inner.width.saturating_sub(2),
-        body_h,
-    );
+    let body_rect = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), body_h);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1883,7 +1882,11 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_section(&theme, "Mouse"),
         help_row(&theme, "Click", "Tabs, filters, #tags, status, cards"),
         help_row(&theme, "Double-click", "Edit task"),
-        help_row(&theme, "Drag card", "Reorder or move between Kanban columns"),
+        help_row(
+            &theme,
+            "Drag card",
+            "Reorder or move between Kanban columns",
+        ),
     ];
 
     let block = Block::default()
@@ -1892,9 +1895,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(theme.muted))
         .title(Span::styled(
             " Shortcuts ",
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1912,9 +1913,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
 fn help_section(theme: &Theme, title: &'static str) -> Line<'static> {
     Line::from(Span::styled(
         title,
-        Style::default()
-            .fg(theme.text)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -2083,7 +2082,9 @@ fn due_border_line(theme: &Theme, task: &Task) -> Option<Line<'static>> {
     let due = task.due.as_deref()?;
     let today = today_ymd();
     let style = match task.due_state(&today) {
-        Some(DueState::Overdue) => Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+        Some(DueState::Overdue) => Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD),
         Some(DueState::Today) => Style::default().fg(theme.in_progress),
         _ => Style::default().fg(theme.muted),
     };

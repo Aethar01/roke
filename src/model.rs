@@ -48,10 +48,7 @@ impl FileLock {
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                     if let Ok(meta) = fs::metadata(&lock_path) {
                         if let Ok(modified) = meta.modified() {
-                            if modified
-                                .elapsed()
-                                .is_ok_and(|age| age >= STALE_LOCK_AGE)
-                            {
+                            if modified.elapsed().is_ok_and(|age| age >= STALE_LOCK_AGE) {
                                 let _ = fs::remove_file(&lock_path);
                                 continue;
                             }
@@ -115,7 +112,13 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap_year(y) { 29 } else { 28 },
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
         _ => 0,
     }
 }
@@ -402,7 +405,7 @@ pub fn sort_task_refs(tasks: &mut [&Task], sort: SortOrder) {
             });
         }
         SortOrder::Updated => {
-            tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            tasks.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         }
     }
 }
@@ -433,7 +436,7 @@ pub fn sort_tasks(tasks: &mut [Task], sort: SortOrder) {
             });
         }
         SortOrder::Updated => {
-            tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            tasks.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         }
     }
 }
@@ -1100,11 +1103,26 @@ mod tests {
         assert_eq!(parse_due_date("tomorrow").unwrap().len(), 10);
 
         let mut store = TaskStore::new_empty();
-        let id = store.add("Tax".into(), String::new(), Status::Todo, Priority::High, Vec::new());
+        let id = store.add(
+            "Tax".into(),
+            String::new(),
+            Status::Todo,
+            Priority::High,
+            Vec::new(),
+        );
         store.get_mut(id).unwrap().due = Some("2026-01-01".into());
-        assert_eq!(store.get(id).unwrap().due_state("2026-06-01"), Some(DueState::Overdue));
-        assert_eq!(store.get(id).unwrap().due_state("2026-01-01"), Some(DueState::Today));
-        assert_eq!(store.get(id).unwrap().due_state("2025-12-31"), Some(DueState::Upcoming));
+        assert_eq!(
+            store.get(id).unwrap().due_state("2026-06-01"),
+            Some(DueState::Overdue)
+        );
+        assert_eq!(
+            store.get(id).unwrap().due_state("2026-01-01"),
+            Some(DueState::Today)
+        );
+        assert_eq!(
+            store.get(id).unwrap().due_state("2025-12-31"),
+            Some(DueState::Upcoming)
+        );
     }
 
     #[test]
