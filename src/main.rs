@@ -54,6 +54,32 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    let _ = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 fn copy_to_clipboard(text: &str, out: &mut impl Write) {
     // 1. Emit OSC 52 escape sequence (works locally and over SSH/tmux)
     let encoded = base64_encode(text.as_bytes());
@@ -193,6 +219,10 @@ fn run_loop(
     loop {
         if let Some(text) = app.pending_yank.take() {
             copy_to_clipboard(&text, terminal.backend_mut());
+        }
+
+        if let Some(url) = app.pending_open_url.take() {
+            open_url_in_browser(&url);
         }
 
         if let Some(target) = app.pending_editor.take() {

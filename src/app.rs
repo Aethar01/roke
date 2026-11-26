@@ -463,6 +463,25 @@ pub fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
         && y < rect.y.saturating_add(rect.height)
 }
 
+/// Extract the first `http://` or `https://` URL from plain text or Markdown links.
+pub fn extract_first_url(text: &str) -> Option<String> {
+    for prefix in ["https://", "http://"] {
+        if let Some(start) = text.find(prefix) {
+            let slice = &text[start..];
+            let end = slice
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | '`')
+                })
+                .unwrap_or(slice.len());
+            let cleaned = slice[..end].trim_end_matches(['.', ',', ';', ':']);
+            if cleaned.len() > prefix.len() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 struct LastClick {
     task_id: u64,
@@ -481,6 +500,7 @@ pub struct App {
     pub syncing: bool,
     pub pending_editor: Option<PendingEditor>,
     pub pending_yank: Option<String>,
+    pub pending_open_url: Option<String>,
     pub view: View,
     pub mode: Mode,
     pub todo_filter: TodoFilter,
@@ -570,6 +590,7 @@ impl App {
             syncing: false,
             pending_editor: None,
             pending_yank: None,
+            pending_open_url: None,
             view: initial_view,
             mode: Mode::Normal,
             todo_filter: initial_filter,
@@ -1032,6 +1053,9 @@ impl App {
                         self.set_message("Yanked notes");
                     }
                 }
+            }
+            KeyCode::Char('o') => {
+                self.open_url_for_task(task_id);
             }
             KeyCode::Char('e') => {
                 self.mode = Mode::Normal;
@@ -1557,6 +1581,12 @@ impl App {
                     self.clamp_selections();
                     return;
                 }
+                KeyCode::Char('x') => {
+                    if let Some(id) = self.selected_task_id() {
+                        self.open_url_for_task(id);
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -2043,6 +2073,20 @@ impl App {
             self.persist();
             self.clamp_selections();
             self.set_message(format!("Deleted \"{}\" (press u to undo)", removed.title));
+        }
+    }
+
+    pub fn open_url_for_task(&mut self, task_id: u64) {
+        let Some(task) = self.store.get(task_id) else {
+            return;
+        };
+        if let Some(url) = extract_first_url(&task.title)
+            .or_else(|| extract_first_url(&task.description))
+        {
+            self.set_message(format!("Opening {url}"));
+            self.pending_open_url = Some(url);
+        } else {
+            self.set_message("No URL found in task");
         }
     }
 
@@ -3159,6 +3203,31 @@ default_sort = "priority"
         app.handle_key(key(KeyCode::Char('v')));
         app.handle_key(key(KeyCode::Char('y')));
         assert_eq!(app.pending_yank.take().as_deref(), Some("First task"));
+    }
+
+    #[test]
+    fn gx_extracts_and_opens_first_url_from_task_or_markdown() {
+        assert_eq!(
+            extract_first_url("See [PR](https://github.com/a/b/pull/42).").as_deref(),
+            Some("https://github.com/a/b/pull/42")
+        );
+        assert_eq!(extract_first_url("no links here"), None);
+
+        let mut store = TaskStore::new_empty();
+        store.add(
+            "Review PR".into(),
+            "Check https://example.com/pr/123, please!".into(),
+            Status::Todo,
+            Priority::Medium,
+            Vec::new(),
+        );
+        let mut app = App::new(store, None);
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.pending_open_url.take().as_deref(),
+            Some("https://example.com/pr/123")
+        );
     }
 
     #[test]

@@ -2205,6 +2205,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(&theme, "A", "Archive all Done tasks"),
         help_row(&theme, "V", "Browse & restore archived tasks"),
         help_row(&theme, "y / Y", "Yank title (or notes) / full task"),
+        help_row(&theme, "gx", "Open first URL in browser (o in preview)"),
         help_row(&theme, "u / Ctrl-R", "Undo / Redo"),
         help_row(&theme, "/   Esc", "Search   Clear filter"),
         Line::raw(""),
