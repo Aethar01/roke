@@ -96,6 +96,12 @@ pub fn merge_stores(
         merged_tasks.push(task);
     }
 
+    if merged_tasks.iter().any(|t| t.order.is_some()) {
+        let mut indexed: Vec<(usize, Task)> = merged_tasks.into_iter().enumerate().collect();
+        indexed.sort_by_key(|(idx, t)| (t.order.unwrap_or(i64::MAX), *idx));
+        merged_tasks = indexed.into_iter().map(|(_, t)| t).collect();
+    }
+
     TaskStore {
         next_id,
         tasks: merged_tasks,
@@ -245,6 +251,7 @@ fn stores_semantically_equal(a: &TaskStore, b: &TaskStore) -> bool {
                 && at.tags == bt.tags
                 && at.updated_at == bt.updated_at
                 && at.origin == bt.origin
+                && at.order == bt.order
         })
     })
 }
@@ -427,6 +434,21 @@ mod tests {
         let from_vps = merged.tasks.iter().find(|t| t.title == "From VPS").unwrap();
         assert_eq!(from_vps.origin.as_deref(), Some("vps"));
         assert!(!merged.tasks.iter().any(|t| t.uid == del_uid));
+    }
+
+    #[test]
+    fn merge_propagates_task_reordering() {
+        let mut local = TaskStore::new_empty();
+        local.add_with_origin("First".into(), String::new(), Status::Todo, Priority::Medium, Vec::new(), "mac");
+        local.add_with_origin("Second".into(), String::new(), Status::Todo, Priority::Medium, Vec::new(), "mac");
+        local.ensure_orders();
+
+        let mut remote = local.clone();
+        remote.swap_order(0, 1);
+
+        let merged = merge_stores(&local, &remote, "mac", "vps");
+        let titles: Vec<&str> = merged.tasks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["Second", "First"]);
     }
 
     #[test]

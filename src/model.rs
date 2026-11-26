@@ -258,6 +258,8 @@ pub struct Task {
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i64>,
 }
 
 fn default_status() -> Status {
@@ -374,6 +376,12 @@ impl TaskStore {
         let slug = normalize_device_tag(origin);
         let origin_opt = if slug.is_empty() { None } else { Some(slug) };
         let uid = generate_uid(origin);
+        let next_order = self
+            .tasks
+            .iter()
+            .filter_map(|t| t.order)
+            .max()
+            .map(|m| m.saturating_add(1000));
         self.tasks.push(Task {
             id,
             uid,
@@ -384,8 +392,68 @@ impl TaskStore {
             tags,
             updated_at: now_millis(),
             origin: origin_opt,
+            order: next_order,
         });
         id
+    }
+
+    pub fn ensure_orders(&mut self) {
+        if self.tasks.iter().all(|t| t.order.is_some()) {
+            return;
+        }
+        for (idx, task) in self.tasks.iter_mut().enumerate() {
+            if task.order.is_none() {
+                task.order = Some(((idx + 1) as i64) * 1000);
+            }
+        }
+    }
+
+    pub fn swap_order(&mut self, pos_a: usize, pos_b: usize) {
+        if pos_a == pos_b || pos_a >= self.tasks.len() || pos_b >= self.tasks.len() {
+            return;
+        }
+        self.ensure_orders();
+        let ord_a = self.tasks[pos_a].order;
+        let ord_b = self.tasks[pos_b].order;
+        self.tasks.swap(pos_a, pos_b);
+        self.tasks[pos_a].order = ord_a;
+        self.tasks[pos_b].order = ord_b;
+        self.tasks[pos_a].touch();
+        self.tasks[pos_b].touch();
+    }
+
+    pub fn move_to_position(&mut self, from_pos: usize, to_pos: usize) {
+        if from_pos == to_pos || from_pos >= self.tasks.len() || to_pos >= self.tasks.len() {
+            return;
+        }
+        self.ensure_orders();
+        let mut task = self.tasks.remove(from_pos);
+        self.tasks.insert(to_pos, task.clone());
+        let prev_ord = to_pos
+            .checked_sub(1)
+            .and_then(|i| self.tasks.get(i))
+            .and_then(|t| t.order);
+        let next_ord = self.tasks.get(to_pos + 1).and_then(|t| t.order);
+        let new_order = match (prev_ord, next_ord) {
+            (Some(a), Some(b)) if b - a > 1 => Some(a + (b - a) / 2),
+            (None, Some(b)) => Some(b.saturating_sub(1000)),
+            (Some(a), None) => Some(a.saturating_add(1000)),
+            _ => None,
+        };
+        if let Some(ord) = new_order {
+            task.order = Some(ord);
+            task.touch();
+            self.tasks[to_pos] = task;
+        } else {
+            // Rebalance orders cleanly when adjacent slots collided
+            for (idx, t) in self.tasks.iter_mut().enumerate() {
+                let target = ((idx + 1) as i64) * 1000;
+                if t.order != Some(target) {
+                    t.order = Some(target);
+                    t.touch();
+                }
+            }
+        }
     }
 
     pub fn ensure_sync_metadata(&mut self, default_origin: &str) {

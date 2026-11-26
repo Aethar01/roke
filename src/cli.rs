@@ -962,6 +962,7 @@ mod tests {
             tags: vec!["work".into()],
             updated_at: 1,
             origin: Some("local".into()),
+            order: None,
         };
 
         let plain = Painter::new(Theme::default(), false);

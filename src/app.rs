@@ -1458,7 +1458,7 @@ impl App {
         };
 
         self.push_undo();
-        self.store.tasks.swap(pos_a, pos_b);
+        self.store.swap_order(pos_a, pos_b);
         self.persist();
 
         match self.view {
