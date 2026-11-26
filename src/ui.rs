@@ -1369,7 +1369,7 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         if cx < rows[0].right() && cy < rows[0].bottom() {
             frame.set_cursor_position(Position::new(cx, cy));
         }
-    } else if desc_active {
+    } else if desc_active && !form.description.value.contains('\n') {
         let cx = rows[1].x + (desc_cursor_off as u16);
         let cy = rows[1].y + 1;
         if cx < rows[1].right() && cy < rows[1].bottom() {

@@ -918,18 +918,36 @@ impl App {
                     }
                     _ => {}
                 },
-                FormField::Description => match key.code {
-                    KeyCode::Backspace => form.description.backspace(),
-                    KeyCode::Delete => form.description.delete(),
-                    KeyCode::Left => form.description.move_left(),
-                    KeyCode::Right => form.description.move_right(),
-                    KeyCode::Home => form.description.move_home(),
-                    KeyCode::End => form.description.move_end(),
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        form.description.insert_char(c);
+                FormField::Description => {
+                    if form.description.value.contains('\n') {
+                        match key.code {
+                            KeyCode::Backspace
+                            | KeyCode::Delete
+                            | KeyCode::Char(_)
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                form.error = Some(format!(
+                                    "Multi-line notes: press Ctrl-E to edit in {}",
+                                    self.editor_label
+                                ));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Backspace => form.description.backspace(),
+                            KeyCode::Delete => form.description.delete(),
+                            KeyCode::Left => form.description.move_left(),
+                            KeyCode::Right => form.description.move_right(),
+                            KeyCode::Home => form.description.move_home(),
+                            KeyCode::End => form.description.move_end(),
+                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                form.description.insert_char(c);
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => {}
-                },
+                }
                 FormField::Tags => match key.code {
                     KeyCode::Backspace => form.tags.backspace(),
                     KeyCode::Delete => form.tags.delete(),
@@ -2351,6 +2369,18 @@ inject_device_tag = true
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        // Focusing multi-line notes and pressing Backspace/Char must not corrupt the hidden note
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Char('x')));
+        if let Mode::TaskModal(form) = &app.mode {
+            assert_eq!(form.description.value, "# Updated\nMore lines");
+            assert!(form.error.is_some());
+        } else {
+            panic!("expected modal to remain open");
+        }
+
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.store.get(1).unwrap().description, "# Updated\nMore lines");
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
