@@ -2,8 +2,9 @@ use crate::config::{default_config_path, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
-    default_storage_path, find_local_board, parse_due_date, parse_repeat, parse_tags, today_ymd,
-    DueState, Priority, SortOrder, Status, Task, TaskStore, LOCAL_BOARD_FILENAME,
+    default_storage_path, find_local_board, parse_due_date, parse_quick_add, parse_repeat,
+    parse_tags, today_ymd, DueState, Priority, SortOrder, Status, Task, TaskStore,
+    LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
 use crate::theme::{to_crossterm_color, Theme};
@@ -306,6 +307,10 @@ pub struct AddArgs {
     #[arg(long = "origin")]
     pub origin: Option<String>,
 
+    /// Parse quick-add shorthand in title (#tag !high @tomorrow ~weekly)
+    #[arg(short = 'Q', long = "quick")]
+    pub quick: bool,
+
     /// Read a JSON object, JSON array, or JSONL of tasks from stdin
     #[arg(long = "stdin")]
     pub from_stdin: bool,
@@ -546,8 +551,27 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     }
                 }
             } else {
+                let mut input = input;
                 if input.title.is_empty() {
                     return Err("missing task title. Usage: roke add <TITLE> [OPTIONS]".into());
+                }
+                if args.quick {
+                    let parsed = parse_quick_add(&input.title)?;
+                    input.title = parsed.title;
+                    if let Some(p) = parsed.priority {
+                        input.priority = p;
+                    }
+                    for tag in parsed.tags {
+                        if !input.tags.contains(&tag) {
+                            input.tags.push(tag);
+                        }
+                    }
+                    if input.due.is_none() {
+                        input.due = parsed.due;
+                    }
+                    if input.repeat.is_none() {
+                        input.repeat = parsed.repeat;
+                    }
                 }
                 let task = ops::add_task(&path, cfg, input)?;
                 if json {

@@ -794,6 +794,65 @@ pub fn format_tags(tags: &[String]) -> String {
     tags.join(", ")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickAddParsed {
+    pub title: String,
+    pub priority: Option<Priority>,
+    pub tags: Vec<String>,
+    pub due: Option<String>,
+    pub repeat: Option<String>,
+}
+
+/// Parse quick-add shorthand: `Ship release #ops #release !high @tomorrow ~weekly`.
+pub fn parse_quick_add(raw: &str) -> Result<QuickAddParsed, String> {
+    let mut title_parts: Vec<&str> = Vec::new();
+    let mut priority: Option<Priority> = None;
+    let mut tags: Vec<String> = Vec::new();
+    let mut due: Option<String> = None;
+    let mut repeat: Option<String> = None;
+
+    for token in raw.split_whitespace() {
+        if let Some(tag_raw) = token.strip_prefix('#') {
+            if !tag_raw.is_empty() {
+                for t in parse_tags(tag_raw) {
+                    if !tags.contains(&t) {
+                        tags.push(t);
+                    }
+                }
+                continue;
+            }
+        } else if let Some(prio_raw) = token.strip_prefix('!') {
+            if let Ok(p) = Priority::parse(prio_raw) {
+                priority = Some(p);
+                continue;
+            }
+        } else if let Some(due_raw) = token.strip_prefix('@') {
+            if !due_raw.is_empty() {
+                due = Some(parse_due_date(due_raw)?);
+                continue;
+            }
+        } else if let Some(rep_raw) = token.strip_prefix('~') {
+            if !rep_raw.is_empty() {
+                repeat = Some(parse_repeat(rep_raw)?);
+                continue;
+            }
+        }
+        title_parts.push(token);
+    }
+
+    let title = title_parts.join(" ");
+    if title.is_empty() {
+        return Err("title cannot be empty".into());
+    }
+    Ok(QuickAddParsed {
+        title,
+        priority,
+        tags,
+        due,
+        repeat,
+    })
+}
+
 fn default_priority() -> Priority {
     Priority::Medium
 }

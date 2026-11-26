@@ -2,8 +2,8 @@ use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
     append_tasks_to_archive, archive_path_for, file_stamp, format_tags, now_millis, parse_due_date,
-    parse_repeat, parse_tags, sort_task_refs, FileLock, FileStamp, Priority, SortOrder, Status,
-    Task, TaskStore,
+    parse_quick_add, parse_repeat, parse_tags, sort_task_refs, FileLock, FileStamp, Priority,
+    SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -346,6 +346,10 @@ pub enum PendingEditor {
 pub enum Mode {
     Normal,
     Search,
+    QuickAdd {
+        input: TextInput,
+        error: Option<String>,
+    },
     TaskModal(TaskForm),
     TagFilter(usize),
     NotesPreview {
@@ -881,6 +885,7 @@ impl App {
         match self.mode {
             Mode::Normal => self.handle_normal_key(key),
             Mode::Search => self.handle_search_key(key),
+            Mode::QuickAdd { .. } => self.handle_quick_add_key(key),
             Mode::TaskModal(_) => self.handle_modal_key(key),
             Mode::TagFilter(_) => self.handle_tag_filter_key(key),
             Mode::NotesPreview { .. } => self.handle_notes_preview_key(key),
@@ -1057,6 +1062,63 @@ impl App {
             _ => {}
         }
         self.mode = Mode::Help(scroll);
+    }
+
+    fn handle_quick_add_key(&mut self, key: KeyEvent) {
+        let Mode::QuickAdd {
+            mut input,
+            mut error,
+        } = std::mem::replace(&mut self.mode, Mode::Normal)
+        else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                return;
+            }
+            KeyCode::Enter => {
+                match parse_quick_add(&input.value) {
+                    Ok(parsed) => {
+                        let status = self.default_new_task_status();
+                        let mut tags = self.tag_filters.clone();
+                        for t in parsed.tags {
+                            if !tags.contains(&t) {
+                                tags.push(t);
+                            }
+                        }
+                        self.push_undo();
+                        let device = self.sync_config.effective_device_name();
+                        let id = self.store.add_with_origin(
+                            parsed.title.clone(),
+                            String::new(),
+                            status,
+                            parsed.priority.unwrap_or(Priority::Medium),
+                            tags,
+                            &device,
+                        );
+                        if let Some(task) = self.store.get_mut(id) {
+                            task.due = parsed.due;
+                            task.repeat = parsed.repeat;
+                        }
+                        self.persist();
+                        self.clamp_selections();
+                        self.select_task_by_id(id);
+                        self.set_message(format!("Added \"{}\"", parsed.title));
+                        return;
+                    }
+                    Err(msg) => {
+                        error = Some(msg);
+                    }
+                }
+            }
+            _ => {
+                if input.handle_key(key, true) {
+                    error = None;
+                }
+            }
+        }
+        self.mode = Mode::QuickAdd { input, error };
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
@@ -1415,6 +1477,12 @@ impl App {
             KeyCode::Char('a') | KeyCode::Char('o') => {
                 self.open_add_modal();
             }
+            KeyCode::Char('Q') => {
+                self.mode = Mode::QuickAdd {
+                    input: TextInput::new(""),
+                    error: None,
+                };
+            }
             KeyCode::Char('e') | KeyCode::Char('i') | KeyCode::Enter => {
                 self.open_edit_modal();
             }
@@ -1536,15 +1604,19 @@ impl App {
         }
     }
 
-    pub fn open_add_modal(&mut self) {
-        let default_status = match self.view {
+    fn default_new_task_status(&self) -> Status {
+        match self.view {
             View::Kanban => self.current_kanban_status(),
             View::TodoList => match self.todo_filter {
                 TodoFilter::All | TodoFilter::Todo => Status::Todo,
                 TodoFilter::InProgress => Status::InProgress,
                 TodoFilter::Done => Status::Done,
             },
-        };
+        }
+    }
+
+    pub fn open_add_modal(&mut self) {
+        let default_status = self.default_new_task_status();
         let default_tags = format_tags(&self.tag_filters);
         let default_tag = if default_tags.is_empty() {
             None
@@ -2031,6 +2103,12 @@ impl App {
                         };
                     }
                     _ => {}
+                }
+                return;
+            }
+            Mode::QuickAdd { .. } => {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.mode = Mode::Normal;
                 }
                 return;
             }
@@ -2790,6 +2868,28 @@ default_sort = "priority"
         app.handle_key(key(KeyCode::Char('O')));
         assert_eq!(app.sort_order, SortOrder::Due);
         assert_eq!(app.column_task_ids(Status::Todo), vec![id3, id1, id2]);
+    }
+
+    #[test]
+    fn quick_add_shorthand_parses_tags_priority_due_and_repeat() {
+        let mut app = sample_app();
+        app.handle_key(key(KeyCode::Char('Q')));
+        for ch in "Ship v0.3 #ops #release !high @2026-12-15 ~weekly".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        let created = app
+            .store
+            .tasks
+            .iter()
+            .find(|t| t.title == "Ship v0.3")
+            .expect("quick-added task should exist");
+        assert_eq!(created.priority, Priority::High);
+        assert_eq!(created.tags, vec!["ops", "release"]);
+        assert_eq!(created.due.as_deref(), Some("2026-12-15"));
+        assert_eq!(created.repeat.as_deref(), Some("weekly"));
     }
 
     #[test]

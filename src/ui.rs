@@ -23,11 +23,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         area
     };
 
-    let show_search = matches!(app.mode, Mode::Search) || !app.search_query.is_empty();
-    let constraints = if show_search {
+    let show_quick_add = matches!(app.mode, Mode::QuickAdd { .. });
+    let show_search =
+        !show_quick_add && (matches!(app.mode, Mode::Search) || !app.search_query.is_empty());
+    let show_top_bar = show_quick_add || show_search;
+    let constraints = if show_top_bar {
         vec![
             Constraint::Length(2), // Minimal header + hairline
-            Constraint::Length(1), // Search line
+            Constraint::Length(1), // Search or Quick-add line
             Constraint::Min(4),    // Body
             Constraint::Length(1), // Single-line footer
         ]
@@ -46,7 +49,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_header(frame, app, chunks[0]);
 
-    let (body_area, footer_area) = if show_search {
+    let (body_area, footer_area) = if show_quick_add {
+        render_quick_add_bar(frame, app, chunks[1]);
+        (chunks[2], chunks[3])
+    } else if show_search {
         render_search_bar(frame, app, chunks[1]);
         (chunks[2], chunks[3])
     } else {
@@ -219,6 +225,46 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(Span::styled(rule, Style::default().fg(theme.muted))),
             Rect::new(area.x, area.y + 1, area.width, 1),
         );
+    }
+}
+
+fn render_quick_add_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let Mode::QuickAdd { input, error } = &app.mode else {
+        return;
+    };
+    let theme = &app.theme;
+    let avail_w = area.width.saturating_sub(2) as usize;
+    let (visible, cursor_off) = visible_text_slice(&input.value, input.cursor, avail_w);
+
+    let mut spans = vec![Span::styled(
+        "+ ",
+        Style::default().fg(theme.add).add_modifier(Modifier::BOLD),
+    )];
+    if input.value.is_empty() {
+        spans.push(Span::styled(
+            truncate_to_width("title #tag !high @tomorrow ~weekly", avail_w),
+            Style::default().fg(theme.muted),
+        ));
+    } else {
+        spans.push(Span::styled(visible, Style::default().fg(theme.text)));
+    }
+    if let Some(err) = error {
+        spans.push(Span::styled(
+            format!("  ({err})"),
+            Style::default().fg(theme.error),
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let cursor_x = area.x + 2 + (cursor_off as u16);
+    if cursor_x < area.right() {
+        frame.set_cursor_position(Position::new(cursor_x, area.y));
     }
 }
 
@@ -1209,6 +1255,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         "g…".to_string()
     } else if matches!(app.mode, Mode::Search) {
         "search · enter apply · esc clear".to_string()
+    } else if matches!(app.mode, Mode::QuickAdd { .. }) {
+        "quick add: #tag !high @due ~repeat · enter add · esc cancel".to_string()
     } else {
         app.status_message.clone().unwrap_or_default()
     };
@@ -2031,6 +2079,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         Line::raw(""),
         help_section(&theme, "Tasks"),
         help_row(&theme, "a / o", "New task"),
+        help_row(&theme, "Q", "Quick add (title #tag !high @due ~repeat)"),
         help_row(&theme, "e / i / Enter", "Edit task"),
         help_row(&theme, "v", "Preview task & Markdown notes"),
         help_row(
