@@ -200,6 +200,25 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
+    if app.due_focus {
+        let due_label = "@ due";
+        let due_w = due_label.width() as u16;
+        if right_edge > x + due_w + 1 {
+            right_edge -= due_w + 2;
+            let rect = Rect::new(right_edge, y, due_w, 1);
+            app.regions.due_btn = rect;
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    due_label,
+                    Style::default()
+                        .fg(theme.in_progress)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                rect,
+            );
+        }
+    }
+
     if app.sort_order != SortOrder::Manual {
         let sort_label = format!("↕ {}", app.sort_order.label());
         let sort_w = sort_label.width() as u16;
@@ -321,7 +340,12 @@ fn status_filter_row_width(app: &App) -> u16 {
             .store
             .tasks
             .iter()
-            .filter(|t| filter.matches(t.status) && app.matches_tag(t) && app.matches_search(t))
+            .filter(|t| {
+                filter.matches(t.status)
+                    && app.matches_due_focus(t)
+                    && app.matches_tag(t)
+                    && app.matches_search(t)
+            })
             .count();
         let label_w = (filter.label().len() + 1 + count.to_string().len()) as u16;
         if idx > 0 {
@@ -435,7 +459,12 @@ fn render_filter_bar(
             .store
             .tasks
             .iter()
-            .filter(|t| filter.matches(t.status) && app.matches_tag(t) && app.matches_search(t))
+            .filter(|t| {
+                filter.matches(t.status)
+                    && app.matches_due_focus(t)
+                    && app.matches_tag(t)
+                    && app.matches_search(t)
+            })
             .count();
         let label = format!("{} {}", filter.label(), count);
         let w = label.len() as u16;
@@ -703,7 +732,10 @@ fn render_todo_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme.clone();
     let ids = app.filtered_todo_ids();
     if ids.is_empty() {
-        let msg = if app.active_search_text().trim().is_empty() && app.tag_filters.is_empty() {
+        let msg = if app.active_search_text().trim().is_empty()
+            && app.tag_filters.is_empty()
+            && !app.due_focus
+        {
             "No tasks yet. Press 'a' to add one."
         } else {
             "No matching tasks. Press Esc to clear filters."
@@ -2200,6 +2232,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(&theme, "s / p", "Cycle status / priority"),
         help_row(&theme, "O", "Cycle sort (manual/priority/due/updated)"),
         help_row(&theme, "t / T", "Filter tags / edit tags"),
+        help_row(&theme, "D / @", "Edit due date / toggle due-today focus"),
         help_row(&theme, "S", "Sync via SSH"),
         help_row(&theme, "d / x", "Delete task"),
         help_row(&theme, "A", "Archive all Done tasks"),

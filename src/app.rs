@@ -2,8 +2,8 @@ use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
     append_tasks_to_archive, archive_path_for, file_stamp, format_tags, now_millis, parse_due_date,
-    parse_quick_add, parse_repeat, parse_tags, sort_task_refs, FileLock, FileStamp, Priority,
-    SortOrder, Status, Task, TaskStore,
+    parse_quick_add, parse_repeat, parse_tags, sort_task_refs, today_ymd, DueState, FileLock,
+    FileStamp, Priority, SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -403,6 +403,7 @@ pub struct TagModalRegions {
 pub struct LayoutRegions {
     pub tab_todos: Rect,
     pub tab_kanban: Rect,
+    pub due_btn: Rect,
     pub sort_btn: Rect,
     pub sync_btn: Rect,
     pub add_btn: Rect,
@@ -432,6 +433,7 @@ impl LayoutRegions {
     pub fn clear(&mut self) {
         self.tab_todos = Rect::default();
         self.tab_kanban = Rect::default();
+        self.due_btn = Rect::default();
         self.sort_btn = Rect::default();
         self.sync_btn = Rect::default();
         self.add_btn = Rect::default();
@@ -505,6 +507,7 @@ pub struct App {
     pub mode: Mode,
     pub todo_filter: TodoFilter,
     pub sort_order: SortOrder,
+    pub due_focus: bool,
     pub tag_filters: Vec<String>,
     pub tag_match_mode: TagMatchMode,
     pub todo_selected: usize,
@@ -595,6 +598,7 @@ impl App {
             mode: Mode::Normal,
             todo_filter: initial_filter,
             sort_order: initial_sort,
+            due_focus: false,
             tag_filters: Vec::new(),
             tag_match_mode: TagMatchMode::All,
             todo_selected: 0,
@@ -688,13 +692,30 @@ impl App {
         }
     }
 
+    pub fn matches_due_focus(&self, task: &Task) -> bool {
+        if !self.due_focus {
+            return true;
+        }
+        if task.status == Status::Done {
+            return false;
+        }
+        let today = today_ymd();
+        matches!(
+            task.due_state(&today),
+            Some(DueState::Overdue | DueState::Today)
+        )
+    }
+
     pub fn filtered_todo_ids(&self) -> Vec<u64> {
         let mut refs: Vec<&Task> = self
             .store
             .tasks
             .iter()
             .filter(|t| {
-                self.todo_filter.matches(t.status) && self.matches_tag(t) && self.matches_search(t)
+                self.todo_filter.matches(t.status)
+                    && self.matches_due_focus(t)
+                    && self.matches_tag(t)
+                    && self.matches_search(t)
             })
             .collect();
         sort_task_refs(&mut refs, self.sort_order);
@@ -706,7 +727,12 @@ impl App {
             .store
             .tasks
             .iter()
-            .filter(|t| t.status == status && self.matches_tag(t) && self.matches_search(t))
+            .filter(|t| {
+                t.status == status
+                    && self.matches_due_focus(t)
+                    && self.matches_tag(t)
+                    && self.matches_search(t)
+            })
             .collect();
         sort_task_refs(&mut refs, self.sort_order);
         refs.into_iter().map(|t| t.id).collect()
@@ -1720,6 +1746,12 @@ impl App {
             KeyCode::Char('T') => {
                 self.open_edit_tags_modal();
             }
+            KeyCode::Char('D') => {
+                self.open_edit_due_modal();
+            }
+            KeyCode::Char('@') => {
+                self.toggle_due_focus();
+            }
             KeyCode::Char('d') | KeyCode::Char('x') => {
                 self.delete_selected_task();
             }
@@ -1747,6 +1779,11 @@ impl App {
             }
             KeyCode::Esc if !self.tag_filters.is_empty() => {
                 self.clear_tag_filters();
+            }
+            KeyCode::Esc if self.due_focus => {
+                self.due_focus = false;
+                self.clamp_selections();
+                self.set_message("Showing all dates");
             }
             _ => {}
         }
@@ -1839,6 +1876,30 @@ impl App {
                 form.active_field = FormField::Tags;
                 self.mode = Mode::TaskModal(form);
             }
+        }
+    }
+
+    pub fn open_edit_due_modal(&mut self) {
+        if let Some(id) = self.selected_task_id() {
+            if let Some(task) = self.store.get(id).cloned() {
+                let mut form = TaskForm::edit_task(&task);
+                form.active_field = FormField::Due;
+                self.mode = Mode::TaskModal(form);
+            }
+        }
+    }
+
+    pub fn toggle_due_focus(&mut self) {
+        self.due_focus = !self.due_focus;
+        self.todo_selected = 0;
+        self.todo_scroll = 0;
+        self.kanban_selected = [0, 0, 0];
+        self.kanban_scroll = [0, 0, 0];
+        self.clamp_selections();
+        if self.due_focus {
+            self.set_message("Focus: due today & overdue");
+        } else {
+            self.set_message("Showing all dates");
         }
     }
 
@@ -2532,6 +2593,10 @@ impl App {
         }
         if rect_contains(self.regions.sort_btn, x, y) {
             self.cycle_sort_order();
+            return;
+        }
+        if rect_contains(self.regions.due_btn, x, y) {
+            self.toggle_due_focus();
             return;
         }
         if rect_contains(self.regions.add_btn, x, y) {
@@ -3228,6 +3293,39 @@ default_sort = "priority"
             app.pending_open_url.take().as_deref(),
             Some("https://example.com/pr/123")
         );
+    }
+
+    #[test]
+    fn quick_due_edit_and_due_focus_filter() {
+        let mut store = TaskStore::new_empty();
+        let id_overdue = store.add("Overdue".into(), String::new(), Status::Todo, Priority::High, Vec::new());
+        let id_today = store.add("Today".into(), String::new(), Status::Todo, Priority::Medium, Vec::new());
+        let id_future = store.add("Future".into(), String::new(), Status::Todo, Priority::Low, Vec::new());
+        let id_done = store.add("Done overdue".into(), String::new(), Status::Done, Priority::Low, Vec::new());
+        store.get_mut(id_overdue).unwrap().due = Some("2020-01-01".into());
+        store.get_mut(id_today).unwrap().due = Some(today_ymd());
+        store.get_mut(id_future).unwrap().due = Some("2099-12-31".into());
+        store.get_mut(id_done).unwrap().due = Some("2020-01-01".into());
+
+        let mut app = App::new(store, None);
+        // '@' focuses only non-done overdue + due-today tasks
+        app.handle_key(key(KeyCode::Char('@')));
+        assert!(app.due_focus);
+        assert_eq!(app.filtered_todo_ids(), vec![id_overdue, id_today]);
+
+        // 'D' opens task modal focused directly on Due field
+        app.handle_key(key(KeyCode::Char('D')));
+        if let Mode::TaskModal(ref form) = app.mode {
+            assert_eq!(form.active_field, FormField::Due);
+        } else {
+            panic!("expected TaskModal on Due field");
+        }
+        app.handle_key(key(KeyCode::Esc));
+
+        // Esc clears due_focus
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.due_focus);
+        assert_eq!(app.filtered_todo_ids().len(), 4);
     }
 
     #[test]
