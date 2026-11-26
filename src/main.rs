@@ -157,6 +157,10 @@ fn run_loop(
             needs_draw = true;
         }
 
+        if app.tick_status_message() {
+            needs_draw = true;
+        }
+
         if needs_draw {
             terminal.draw(|frame| ui::render(frame, app))?;
             needs_draw = false;

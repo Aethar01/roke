@@ -1536,7 +1536,7 @@ fn render_tag_filter_modal(frame: &mut Frame, app: &mut App, selected: usize) {
 
 fn render_help_modal(frame: &mut Frame, app: &mut App) {
     let theme = app.theme.clone();
-    let area = centered_rect(58, 23, frame.area());
+    let area = centered_rect(58, 24, frame.area());
     frame.render_widget(Clear, area);
     app.regions.help_modal = Some(area);
 
@@ -1561,7 +1561,8 @@ fn render_help_modal(frame: &mut Frame, app: &mut App) {
         help_row(&theme, "s / p", "Cycle status / priority"),
         help_row(&theme, "t / T", "Filter tags / edit tags"),
         help_row(&theme, "S", "Sync via SSH"),
-        help_row(&theme, "d / x   u", "Delete   Undo"),
+        help_row(&theme, "d / x", "Delete task"),
+        help_row(&theme, "u / Ctrl-R", "Undo / Redo"),
         help_row(&theme, "/   Esc", "Search   Clear filter"),
         Line::raw(""),
         help_section(&theme, "Mouse"),

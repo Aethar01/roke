@@ -176,6 +176,87 @@ impl TextInput {
     pub fn move_end(&mut self) {
         self.cursor = self.value.chars().count();
     }
+
+    pub fn move_word_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.cursor = i;
+    }
+
+    pub fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.value.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.cursor = i;
+    }
+
+    pub fn delete_word_backward(&mut self) {
+        let end_cursor = self.cursor;
+        self.move_word_left();
+        if self.cursor < end_cursor {
+            let start = self.byte_index(self.cursor);
+            let end = self.byte_index(end_cursor);
+            self.value.replace_range(start..end, "");
+        }
+    }
+
+    pub fn clear_to_start(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_index(self.cursor);
+        self.value.replace_range(0..end, "");
+        self.cursor = 0;
+    }
+
+    pub fn clear_to_end(&mut self) {
+        let start = self.byte_index(self.cursor);
+        if start < self.value.len() {
+            self.value.truncate(start);
+        }
+    }
+
+    /// Handle standard single-line editing & readline shortcuts.
+    /// Returns `true` if the text value was modified.
+    pub fn handle_key(&mut self, key: KeyEvent, allow_ctrl_e: bool) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let before = self.value.clone();
+        match key.code {
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Left if ctrl => self.move_word_left(),
+            KeyCode::Right if ctrl => self.move_word_right(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.move_home(),
+            KeyCode::End => self.move_end(),
+            KeyCode::Char('a') if ctrl => self.move_home(),
+            KeyCode::Char('e') if ctrl && allow_ctrl_e => self.move_end(),
+            KeyCode::Char('w') if ctrl => self.delete_word_backward(),
+            KeyCode::Char('u') if ctrl => self.clear_to_start(),
+            KeyCode::Char('k') if ctrl => self.clear_to_end(),
+            KeyCode::Char('b') if alt => self.move_word_left(),
+            KeyCode::Char('f') if alt => self.move_word_right(),
+            KeyCode::Char(c) if !ctrl && !alt => self.insert_char(c),
+            _ => {}
+        }
+        self.value != before
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -373,7 +454,9 @@ pub struct App {
     pub search_input: TextInput,
     pub pending_g: bool,
     pub undo_stack: Vec<TaskStore>,
+    pub redo_stack: Vec<TaskStore>,
     pub status_message: Option<String>,
+    status_message_at: Option<Instant>,
     pub drag: Option<DragState>,
     pub regions: LayoutRegions,
     pub should_quit: bool,
@@ -383,6 +466,7 @@ pub struct App {
 }
 
 const MAX_UNDO: usize = 50;
+const STATUS_TOAST_DURATION: Duration = Duration::from_secs(4);
 
 impl App {
     #[allow(dead_code)]
@@ -418,7 +502,9 @@ impl App {
             search_input: TextInput::new(""),
             pending_g: false,
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             status_message: None,
+            status_message_at: None,
             drag: None,
             regions: LayoutRegions::default(),
             should_quit: false,
@@ -579,6 +665,7 @@ impl App {
         if self.undo_stack.len() > MAX_UNDO {
             self.undo_stack.remove(0);
         }
+        self.redo_stack.clear();
     }
 
     pub fn persist(&mut self) {
@@ -591,7 +678,7 @@ impl App {
             let _lock = match FileLock::acquire(&path) {
                 Ok(lock) => lock,
                 Err(err) => {
-                    self.status_message = Some(format!("Save failed: {err}"));
+                    self.set_message(format!("Save failed: {err}"));
                     return;
                 }
             };
@@ -605,7 +692,7 @@ impl App {
                 }
             }
             if let Err(err) = self.store.save(&path) {
-                self.status_message = Some(format!("Save failed: {err}"));
+                self.set_message(format!("Save failed: {err}"));
                 return;
             }
             self.last_file_stamp = file_stamp(&path);
@@ -708,6 +795,21 @@ impl App {
 
     fn set_message(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
+        self.status_message_at = Some(Instant::now());
+    }
+
+    pub fn tick_status_message(&mut self) -> bool {
+        if self.syncing {
+            return false;
+        }
+        if let Some(at) = self.status_message_at {
+            if at.elapsed() >= STATUS_TOAST_DURATION {
+                self.status_message = None;
+                self.status_message_at = None;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -802,23 +904,11 @@ impl App {
                     self.set_message(format!("Filter: /{}", self.search_query));
                 }
             }
-            KeyCode::Backspace => {
-                self.search_input.backspace();
-                self.clamp_selections();
+            _ => {
+                if self.search_input.handle_key(key, true) {
+                    self.clamp_selections();
+                }
             }
-            KeyCode::Delete => {
-                self.search_input.delete();
-                self.clamp_selections();
-            }
-            KeyCode::Left => self.search_input.move_left(),
-            KeyCode::Right => self.search_input.move_right(),
-            KeyCode::Home => self.search_input.move_home(),
-            KeyCode::End => self.search_input.move_end(),
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search_input.insert_char(c);
-                self.clamp_selections();
-            }
-            _ => {}
         }
     }
 
@@ -919,25 +1009,15 @@ impl App {
                 form.active_field = form.active_field.prev();
             }
             _ => match form.active_field {
-                FormField::Title => match key.code {
-                    KeyCode::Backspace => form.title.backspace(),
-                    KeyCode::Delete => form.title.delete(),
-                    KeyCode::Left => form.title.move_left(),
-                    KeyCode::Right => form.title.move_right(),
-                    KeyCode::Home => form.title.move_home(),
-                    KeyCode::End => form.title.move_end(),
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        form.title.insert_char(c);
+                FormField::Title => {
+                    if form.title.handle_key(key, false) {
                         form.error = None;
                     }
-                    _ => {}
-                },
+                }
                 FormField::Description => {
                     if form.description.value.contains('\n') {
                         match key.code {
-                            KeyCode::Backspace
-                            | KeyCode::Delete
-                            | KeyCode::Char(_)
+                            KeyCode::Backspace | KeyCode::Delete | KeyCode::Char(_)
                                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
                             {
                                 form.error = Some(format!(
@@ -948,32 +1028,12 @@ impl App {
                             _ => {}
                         }
                     } else {
-                        match key.code {
-                            KeyCode::Backspace => form.description.backspace(),
-                            KeyCode::Delete => form.description.delete(),
-                            KeyCode::Left => form.description.move_left(),
-                            KeyCode::Right => form.description.move_right(),
-                            KeyCode::Home => form.description.move_home(),
-                            KeyCode::End => form.description.move_end(),
-                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                form.description.insert_char(c);
-                            }
-                            _ => {}
-                        }
+                        form.description.handle_key(key, false);
                     }
                 }
-                FormField::Tags => match key.code {
-                    KeyCode::Backspace => form.tags.backspace(),
-                    KeyCode::Delete => form.tags.delete(),
-                    KeyCode::Left => form.tags.move_left(),
-                    KeyCode::Right => form.tags.move_right(),
-                    KeyCode::Home => form.tags.move_home(),
-                    KeyCode::End => form.tags.move_end(),
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        form.tags.insert_char(c);
-                    }
-                    _ => {}
-                },
+                FormField::Tags => {
+                    form.tags.handle_key(key, false);
+                }
                 FormField::Status => match key.code {
                     KeyCode::Left | KeyCode::Char('h') => {
                         form.status = form.status.prev().unwrap_or(Status::Done);
@@ -1178,6 +1238,9 @@ impl App {
             }
             KeyCode::Char('u') => {
                 self.undo();
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.redo();
             }
             KeyCode::Char('f') if self.view == View::TodoList => {
                 self.todo_filter = self.todo_filter.next();
@@ -1562,12 +1625,31 @@ impl App {
 
     fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.store.clone());
+            if self.redo_stack.len() > MAX_UNDO {
+                self.redo_stack.remove(0);
+            }
             self.store = Self::reconcile_restored_store(&self.store, prev);
             self.persist();
             self.clamp_selections();
             self.set_message("Undid last change");
         } else {
             self.set_message("Nothing to undo");
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.store.clone());
+            if self.undo_stack.len() > MAX_UNDO {
+                self.undo_stack.remove(0);
+            }
+            self.store = Self::reconcile_restored_store(&self.store, next);
+            self.persist();
+            self.clamp_selections();
+            self.set_message("Redid change");
+        } else {
+            self.set_message("Nothing to redo");
         }
     }
 
@@ -2169,6 +2251,31 @@ inject_device_tag = true
         // Undo delete
         app.handle_key(key(KeyCode::Char('u')));
         assert_eq!(app.filtered_todo_ids(), vec![2, 1, 3, 4]);
+
+        // Redo delete with Ctrl-R
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.filtered_todo_ids(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn readline_shortcuts_and_status_toast_expiry() {
+        let mut input = TextInput::new("alpha beta gamma");
+        input.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL), true);
+        assert_eq!(input.value, "alpha beta ");
+        input.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), true);
+        assert_eq!(input.cursor, 0);
+        input.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT), true);
+        assert_eq!(input.cursor, 5);
+        input.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL), true);
+        assert_eq!(input.value, "alpha");
+        input.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), true);
+        assert_eq!(input.value, "");
+
+        let mut app = sample_app();
+        app.set_message("Transient");
+        app.status_message_at = Some(Instant::now() - STATUS_TOAST_DURATION - Duration::from_secs(1));
+        assert!(app.tick_status_message());
+        assert!(app.status_message.is_none());
     }
 
     #[test]
