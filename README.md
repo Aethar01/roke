@@ -74,6 +74,7 @@ roke done 1 2 3                          # mark one or more tasks done
 roke rm 4 5                              # delete one or more tasks
 roke tags
 roke stats                               # compact board summary & 7-day velocity
+roke stats --oneline                     # single-line segment for tmux / shell prompts (`○3 ◐1 !1`)
 roke archive --dry-run                   # preview archiving Done tasks into archive.jsonl
 roke archive                             # move Done tasks to archive.jsonl
 roke archive --list                      # browse archived tasks
@@ -121,13 +122,16 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 | `s` / `p` | Cycle status / cycle priority |
 | `O` | Cycle sort order (`manual` / `priority` / `due` / `updated`) |
 | `t` / `T` | Multi-tag filter picker / edit tags on selected task |
+| `D` / `@` | Edit due date / toggle due-today & overdue focus |
+| `m` / `M` | Mark task / mark all visible or clear marks (batch `Space`/`H`/`L`/`p`/`d`/`y`) |
 | `S` | Sync now via SSH |
-| `d` / `x` | Delete selected task |
+| `d` / `x` | Delete selected (or marked) task(s) |
 | `A` / `V` | Archive all Done tasks / Browse & restore archive |
 | `y` / `Y` | Yank title (or notes in preview) / Yank full task as Markdown |
+| `gx` | Open first URL in browser (`o` inside preview) |
 | `u` / `Ctrl-R` | Undo / Redo last change (up to 50 steps) |
 | `f` | Cycle status filter (Todos) |
-| `/` / `Esc` | Live search / clear search or tag filters |
+| `/` / `Esc` | Smart search (`p:high due:overdue #tag -done`) / clear marks & filters |
 | `?` | Toggle in-app shortcuts overlay |
 | `q` / `Ctrl-C` | Quit |
 
