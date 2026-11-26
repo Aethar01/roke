@@ -1,7 +1,9 @@
 use crate::config::{default_config_path, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
-use crate::model::{default_storage_path, parse_tags, Priority, Status, Task};
+use crate::model::{
+    default_storage_path, parse_due_date, parse_tags, today_ymd, DueState, Priority, Status, Task,
+};
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
 use crate::theme::{to_crossterm_color, Theme};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
@@ -205,6 +207,10 @@ pub struct ListArgs {
     #[arg(short = 'q', long = "search")]
     pub search: Option<String>,
 
+    /// Show only overdue (non-done) tasks
+    #[arg(long = "overdue")]
+    pub overdue: bool,
+
     /// Show descriptions and UIDs beneath each task
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
@@ -231,6 +237,10 @@ pub struct AddArgs {
     /// Tag(s); repeatable or comma-separated
     #[arg(short = 't', long = "tag", visible_alias = "tags")]
     pub tags: Vec<String>,
+
+    /// Optional due date (YYYY-MM-DD, today, or tomorrow)
+    #[arg(long = "due", value_parser = parse_due_date)]
+    pub due: Option<String>,
 
     /// Override task origin (defaults to local device_name)
     #[arg(long = "origin")]
@@ -274,6 +284,14 @@ pub struct EditArgs {
     #[arg(long = "rm-tag", visible_alias = "remove-tag")]
     pub remove_tags: Vec<String>,
 
+    /// Set due date (YYYY-MM-DD, today, or tomorrow)
+    #[arg(long = "due", value_parser = parse_due_date)]
+    pub due: Option<String>,
+
+    /// Clear the task's due date
+    #[arg(long = "clear-due")]
+    pub clear_due: bool,
+
     /// Open the task's Markdown notes in $EDITOR (nvim, etc.)
     #[arg(short = 'e', long = "editor")]
     pub open_editor: bool,
@@ -312,6 +330,8 @@ struct StdinTaskSpec {
     priority: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    due: Option<String>,
     #[serde(default)]
     origin: Option<String>,
 }
@@ -357,6 +377,7 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
         } else {
             spec.description
         };
+        let due = spec.due.or_else(|| defaults.due.clone());
         let origin = spec.origin.or_else(|| defaults.origin.clone());
         out.push(AddTaskInput {
             title: spec.title,
@@ -364,6 +385,7 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
             status,
             priority,
             tags,
+            due,
             origin,
         });
     }
@@ -383,6 +405,7 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 tags: args.tags.iter().flat_map(|t| parse_tags(t)).collect(),
                 tag_match_all: !args.any_tag,
                 search: args.search.clone(),
+                overdue_only: args.overdue,
             };
             let tasks = ops::list_tasks(&path, cfg, &filter)?;
             if json {
@@ -426,6 +449,7 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 status: args.status,
                 priority: args.priority,
                 tags: args.tags.iter().flat_map(|t| parse_tags(t)).collect(),
+                due: args.due.clone(),
                 origin: args.origin.clone(),
             };
             if args.from_stdin {
@@ -481,6 +505,8 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     && args.tags.is_none()
                     && args.add_tags.is_empty()
                     && args.remove_tags.is_empty()
+                    && args.due.is_none()
+                    && !args.clear_due
                 {
                     if json {
                         print_json(&existing)?;
@@ -490,6 +516,11 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     return Ok(());
                 }
             }
+            let due_update = if args.clear_due {
+                Some(None)
+            } else {
+                args.due.clone().map(Some)
+            };
             let input = UpdateTaskInput {
                 title: args.title.clone(),
                 description,
@@ -498,9 +529,10 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 tags: args.tags.as_deref().map(parse_tags),
                 add_tags: args.add_tags.iter().flat_map(|t| parse_tags(t)).collect(),
                 remove_tags: args.remove_tags.iter().flat_map(|t| parse_tags(t)).collect(),
+                due: due_update,
             };
             if input.is_empty() {
-                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --editor.".into());
+                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --due, --clear-due, --editor.".into());
             }
             let task = ops::update_task(&path, cfg, &args.selector, input)?;
             if json {
@@ -833,7 +865,19 @@ impl Painter {
             format!("  {joined}")
         };
 
-        format!("{id_styled} {status_styled} {prio_styled} {title_styled}{tags_str}")
+        let due_str = if let Some(due) = &task.due {
+            let today = today_ymd();
+            let color = match task.due_state(&today) {
+                Some(DueState::Overdue) => self.theme.error,
+                Some(DueState::Today) => self.theme.in_progress,
+                _ => self.theme.muted,
+            };
+            format!("  {}", self.colored(&format!("due:{due}"), color))
+        } else {
+            String::new()
+        };
+
+        format!("{id_styled} {status_styled} {prio_styled} {title_styled}{due_str}{tags_str}")
     }
 
     pub fn format_task_detail(&self, task: &Task, eff_tags: &[String]) -> String {
@@ -873,6 +917,19 @@ impl Painter {
                 prio_color
             )
         ));
+        if let Some(due) = &task.due {
+            let today = today_ymd();
+            let color = match task.due_state(&today) {
+                Some(DueState::Overdue) => self.theme.error,
+                Some(DueState::Today) => self.theme.in_progress,
+                _ => self.theme.subtle,
+            };
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("due:     "),
+                self.colored(due, color)
+            ));
+        }
         if !eff_tags.is_empty() {
             let tags = eff_tags
                 .iter()
@@ -960,6 +1017,8 @@ mod tests {
             status: Status::Todo,
             priority: Priority::High,
             tags: vec!["work".into()],
+            due: None,
+            created_at: Some(1),
             updated_at: 1,
             origin: Some("local".into()),
             order: None,

@@ -1,8 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
-    file_stamp, format_tags, now_millis, parse_tags, FileLock, FileStamp, Priority, Status, Task,
-    TaskStore,
+    file_stamp, format_tags, now_millis, parse_due_date, parse_tags, FileLock, FileStamp, Priority,
+    Status, Task, TaskStore,
 };
 use crate::sync::{merge_stores, SyncOutcome};
 use crate::theme::Theme;
@@ -84,6 +84,7 @@ pub enum FormField {
     Title,
     Description,
     Tags,
+    Due,
     Status,
     Priority,
 }
@@ -93,7 +94,8 @@ impl FormField {
         match self {
             FormField::Title => FormField::Description,
             FormField::Description => FormField::Tags,
-            FormField::Tags => FormField::Status,
+            FormField::Tags => FormField::Due,
+            FormField::Due => FormField::Status,
             FormField::Status => FormField::Priority,
             FormField::Priority => FormField::Title,
         }
@@ -104,7 +106,8 @@ impl FormField {
             FormField::Title => FormField::Priority,
             FormField::Description => FormField::Title,
             FormField::Tags => FormField::Description,
-            FormField::Status => FormField::Tags,
+            FormField::Due => FormField::Tags,
+            FormField::Status => FormField::Due,
             FormField::Priority => FormField::Status,
         }
     }
@@ -265,6 +268,7 @@ pub struct TaskForm {
     pub title: TextInput,
     pub description: TextInput,
     pub tags: TextInput,
+    pub due: TextInput,
     pub status: Status,
     pub priority: Priority,
     pub active_field: FormField,
@@ -278,6 +282,7 @@ impl TaskForm {
             title: TextInput::new(""),
             description: TextInput::new(""),
             tags: TextInput::new(default_tag.unwrap_or("")),
+            due: TextInput::new(""),
             status: default_status,
             priority: Priority::Medium,
             active_field: FormField::Title,
@@ -291,6 +296,7 @@ impl TaskForm {
             title: TextInput::new(task.title.clone()),
             description: TextInput::new(task.description.clone()),
             tags: TextInput::new(format_tags(&task.tags)),
+            due: TextInput::new(task.due.clone().unwrap_or_default()),
             status: task.status,
             priority: task.priority,
             active_field: FormField::Title,
@@ -357,6 +363,7 @@ pub struct ModalRegions {
     pub title: Rect,
     pub description: Rect,
     pub tags: Rect,
+    pub due: Rect,
     pub status: Rect,
     pub priority: Rect,
     pub save_btn: Rect,
@@ -1079,6 +1086,11 @@ impl App {
                 FormField::Tags => {
                     form.tags.handle_key(key, false);
                 }
+                FormField::Due => {
+                    if form.due.handle_key(key, false) {
+                        form.error = None;
+                    }
+                }
                 FormField::Status => match key.code {
                     KeyCode::Left | KeyCode::Char('h') => {
                         form.status = form.status.prev().unwrap_or(Status::Done);
@@ -1129,6 +1141,12 @@ impl App {
                 .to_string()
         };
         let tags = parse_tags(&form.tags.value);
+        let due_raw = form.due.value.trim();
+        let due = if due_raw.is_empty() {
+            None
+        } else {
+            Some(parse_due_date(due_raw)?)
+        };
         self.push_undo();
 
         let target_id = if let Some(id) = form.editing_id {
@@ -1138,6 +1156,7 @@ impl App {
                 task.status = form.status;
                 task.priority = form.priority;
                 task.tags = tags;
+                task.due = due;
                 task.touch();
             }
             self.set_message("Task updated");
@@ -1152,6 +1171,9 @@ impl App {
                 tags,
                 &device,
             );
+            if let Some(task) = self.store.get_mut(id) {
+                task.due = due;
+            }
             self.set_message("Task added");
             id
         };
@@ -1850,6 +1872,8 @@ impl App {
             form.active_field = FormField::Description;
         } else if rect_contains(modal_regions.tags, x, y) {
             form.active_field = FormField::Tags;
+        } else if rect_contains(modal_regions.due, x, y) {
+            form.active_field = FormField::Due;
         } else if rect_contains(modal_regions.status, x, y) {
             form.active_field = FormField::Status;
             form.status = form.status.cycle();

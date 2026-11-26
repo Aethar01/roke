@@ -107,6 +107,93 @@ pub fn now_millis() -> u64 {
         .unwrap_or(1)
 }
 
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap_year(y) { 29 } else { 28 },
+        _ => 0,
+    }
+}
+
+/// Convert days since 1970-01-01 (UTC) to `(year, month, day)` using Howard Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m as u32, d as u32)
+}
+
+pub fn today_ymd() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn offset_ymd(days_offset: i64) -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400) + days_offset);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Validate and normalize a due date (`YYYY-MM-DD`, `today`, or `tomorrow`).
+pub fn parse_due_date(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("today") {
+        return Ok(today_ymd());
+    }
+    if trimmed.eq_ignore_ascii_case("tomorrow") {
+        return Ok(offset_ymd(1));
+    }
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+        return Err(format!(
+            "invalid due date '{trimmed}' (expected YYYY-MM-DD, today, or tomorrow)"
+        ));
+    }
+    let y: i64 = parts[0]
+        .parse()
+        .map_err(|_| format!("invalid year in due date '{trimmed}'"))?;
+    let m: u32 = parts[1]
+        .parse()
+        .map_err(|_| format!("invalid month in due date '{trimmed}'"))?;
+    let d: u32 = parts[2]
+        .parse()
+        .map_err(|_| format!("invalid day in due date '{trimmed}'"))?;
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) {
+        return Err(format!("invalid due date '{trimmed}'"));
+    }
+    let max_d = days_in_month(y, m);
+    if d == 0 || d > max_d {
+        return Err(format!("invalid day in due date '{trimmed}'"));
+    }
+    Ok(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DueState {
+    Overdue,
+    Today,
+    Upcoming,
+}
+
 pub fn generate_uid(origin: &str) -> String {
     let ts = now_millis();
     let seq = UID_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -254,6 +341,10 @@ pub struct Task {
     pub priority: Priority,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
     #[serde(default)]
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,6 +371,18 @@ impl Task {
         } else {
             now
         };
+    }
+
+    pub fn due_state(&self, today: &str) -> Option<DueState> {
+        let due = self.due.as_deref()?;
+        if self.status == Status::Done {
+            return Some(DueState::Upcoming);
+        }
+        match due.cmp(today) {
+            std::cmp::Ordering::Less => Some(DueState::Overdue),
+            std::cmp::Ordering::Equal => Some(DueState::Today),
+            std::cmp::Ordering::Greater => Some(DueState::Upcoming),
+        }
     }
 
     /// Count Markdown checklist items (`- [ ]` / `- [x]`) in `description`.
@@ -405,6 +508,7 @@ impl TaskStore {
             .filter_map(|t| t.order)
             .max()
             .map(|m| m.saturating_add(1000));
+        let now = now_millis();
         self.tasks.push(Task {
             id,
             uid,
@@ -413,7 +517,9 @@ impl TaskStore {
             status,
             priority,
             tags,
-            updated_at: now_millis(),
+            due: None,
+            created_at: Some(now),
+            updated_at: now,
             origin: origin_opt,
             order: next_order,
         });
@@ -822,5 +928,23 @@ mod tests {
         assert_eq!(parsed.tasks[2].status, Status::Todo);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn due_date_parsing_and_state() {
+        assert_eq!(parse_due_date("2026-02-28").unwrap(), "2026-02-28");
+        assert_eq!(parse_due_date("2024-02-29").unwrap(), "2024-02-29");
+        assert!(parse_due_date("2026-02-29").is_err());
+        assert!(parse_due_date("2026-13-01").is_err());
+        assert!(parse_due_date("not-a-date").is_err());
+        assert_eq!(parse_due_date("today").unwrap().len(), 10);
+        assert_eq!(parse_due_date("tomorrow").unwrap().len(), 10);
+
+        let mut store = TaskStore::new_empty();
+        let id = store.add("Tax".into(), String::new(), Status::Todo, Priority::High, Vec::new());
+        store.get_mut(id).unwrap().due = Some("2026-01-01".into());
+        assert_eq!(store.get(id).unwrap().due_state("2026-06-01"), Some(DueState::Overdue));
+        assert_eq!(store.get(id).unwrap().due_state("2026-01-01"), Some(DueState::Today));
+        assert_eq!(store.get(id).unwrap().due_state("2025-12-31"), Some(DueState::Upcoming));
     }
 }

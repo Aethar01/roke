@@ -1,5 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
-use crate::model::{now_millis, parse_tags, FileLock, Priority, Status, Task, TaskStore};
+use crate::model::{
+    now_millis, parse_due_date, parse_tags, today_ymd, DueState, FileLock, Priority, Status, Task,
+    TaskStore,
+};
 use crate::sync::{merge_stores, sync_all_peers};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -12,6 +15,7 @@ pub struct TaskFilter {
     pub tags: Vec<String>,
     pub tag_match_all: bool,
     pub search: Option<String>,
+    pub overdue_only: bool,
 }
 
 impl Default for TaskFilter {
@@ -22,6 +26,7 @@ impl Default for TaskFilter {
             tags: Vec::new(),
             tag_match_all: true,
             search: None,
+            overdue_only: false,
         }
     }
 }
@@ -33,6 +38,7 @@ pub struct AddTaskInput {
     pub status: Status,
     pub priority: Priority,
     pub tags: Vec<String>,
+    pub due: Option<String>,
     pub origin: Option<String>,
 }
 
@@ -44,6 +50,7 @@ impl Default for AddTaskInput {
             status: Status::Todo,
             priority: Priority::Medium,
             tags: Vec::new(),
+            due: None,
             origin: None,
         }
     }
@@ -58,6 +65,7 @@ pub struct UpdateTaskInput {
     pub tags: Option<Vec<String>>,
     pub add_tags: Vec<String>,
     pub remove_tags: Vec<String>,
+    pub due: Option<Option<String>>,
 }
 
 impl UpdateTaskInput {
@@ -69,6 +77,7 @@ impl UpdateTaskInput {
             && self.tags.is_none()
             && self.add_tags.is_empty()
             && self.remove_tags.is_empty()
+            && self.due.is_none()
     }
 }
 
@@ -161,6 +170,12 @@ fn matches_filter(task: &Task, filter: &TaskFilter, sync_cfg: &SyncConfig) -> bo
             if !matched {
                 return false;
             }
+        }
+    }
+    if filter.overdue_only {
+        let today = today_ymd();
+        if task.due_state(&today) != Some(DueState::Overdue) {
+            return false;
         }
     }
     true
@@ -257,6 +272,10 @@ pub fn add_tasks_batch(
             input.description.replace("\r\n", "\n").trim_end().to_string()
         };
         let tags = normalize_tags(&input.tags);
+        let due = match input.due.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => Some(parse_due_date(raw)?),
+            None => None,
+        };
         let origin = input
             .origin
             .as_deref()
@@ -271,6 +290,9 @@ pub fn add_tasks_batch(
             tags,
             &origin,
         );
+        if let Some(task) = store.get_mut(id) {
+            task.due = due;
+        }
         created_ids.push(id);
     }
 
@@ -333,6 +355,13 @@ pub fn update_task(
     if !input.remove_tags.is_empty() {
         let to_remove = normalize_tags(&input.remove_tags);
         task.tags.retain(|t| !to_remove.contains(t));
+    }
+    if let Some(due_update) = input.due {
+        task.due = match due_update {
+            None => None,
+            Some(raw) if raw.trim().is_empty() => None,
+            Some(raw) => Some(parse_due_date(&raw)?),
+        };
     }
 
     task.touch();
@@ -440,12 +469,14 @@ mod tests {
                 status: Status::Todo,
                 priority: Priority::High,
                 tags: vec!["#agent".into(), "rust".into()],
+                due: Some("2026-12-01".into()),
                 origin: None,
             },
         )
         .unwrap();
         assert_eq!(t1.id, 1);
         assert_eq!(t1.tags, vec!["agent", "rust"]);
+        assert_eq!(t1.due.as_deref(), Some("2026-12-01"));
 
         let t2 = add_task(
             &path,
@@ -456,6 +487,7 @@ mod tests {
                 status: Status::InProgress,
                 priority: Priority::Low,
                 tags: vec!["personal".into()],
+                due: None,
                 origin: None,
             },
         )

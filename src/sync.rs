@@ -249,6 +249,8 @@ fn stores_semantically_equal(a: &TaskStore, b: &TaskStore) -> bool {
                 && at.status == bt.status
                 && at.priority == bt.priority
                 && at.tags == bt.tags
+                && at.due == bt.due
+                && at.created_at == bt.created_at
                 && at.updated_at == bt.updated_at
                 && at.origin == bt.origin
                 && at.order == bt.order

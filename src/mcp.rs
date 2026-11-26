@@ -205,6 +205,10 @@ impl McpServer {
             }
         };
         let search = optional_str(args, "search")?.map(str::to_string);
+        let overdue_only = args
+            .get("overdue")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let filter = TaskFilter {
             status,
@@ -212,6 +216,7 @@ impl McpServer {
             tags,
             tag_match_all,
             search,
+            overdue_only,
         };
         let snapshot = ops::board_snapshot(&self.storage_path, &self.config, &filter)?;
         serde_json::to_value(snapshot).map_err(|e| e.to_string())
@@ -239,6 +244,7 @@ impl McpServer {
             None => Priority::Medium,
         };
         let tags = optional_tags(args, "tags")?;
+        let due = optional_str(args, "due")?.map(str::to_string);
         let origin = optional_str(args, "origin")?.map(str::to_string);
 
         let task = ops::add_task(
@@ -250,6 +256,7 @@ impl McpServer {
                 status,
                 priority,
                 tags,
+                due,
                 origin,
             },
         )?;
@@ -275,6 +282,13 @@ impl McpServer {
         };
         let add_tags = optional_tags(args, "add_tags")?;
         let remove_tags = optional_tags(args, "remove_tags")?;
+        let due = match args.get("due") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(s)) if s.trim().is_empty() => Some(None),
+            Some(Value::String(s)) => Some(Some(s.clone())),
+            Some(_) => return Err("argument 'due' must be a YYYY-MM-DD string or null".into()),
+        };
 
         let updated = ops::update_task(
             &self.storage_path,
@@ -288,6 +302,7 @@ impl McpServer {
                 tags,
                 add_tags,
                 remove_tags,
+                due,
             },
         )?;
         serde_json::to_value(updated).map_err(|e| e.to_string())
@@ -424,6 +439,10 @@ fn tool_definitions() -> Value {
                     "search": {
                         "type": "string",
                         "description": "Case-insensitive substring search across title, description, and tags."
+                    },
+                    "overdue": {
+                        "type": "boolean",
+                        "description": "When true, return only overdue non-done tasks."
                     }
                 }
             }
@@ -474,6 +493,10 @@ fn tool_definitions() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional list of tags (normalized to lowercase)."
+                    },
+                    "due": {
+                        "type": "string",
+                        "description": "Optional due date (YYYY-MM-DD, 'today', or 'tomorrow')."
                     },
                     "origin": {
                         "type": "string",
@@ -528,6 +551,10 @@ fn tool_definitions() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Remove specific tags."
+                    },
+                    "due": {
+                        "type": ["string", "null"],
+                        "description": "Set due date (YYYY-MM-DD, 'today', 'tomorrow'), or pass '' / null to clear."
                     }
                 }
             }

@@ -1,5 +1,5 @@
 use crate::app::{App, FormField, ModalRegions, Mode, TagModalRegions, TaskForm, TodoFilter, View};
-use crate::model::{Priority, Status, Task};
+use crate::model::{today_ymd, DueState, Priority, Status, Task};
 use crate::theme::Theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -725,9 +725,16 @@ fn render_todo_card(
     }
 
     if !tags.is_empty() && rect.height >= 3 {
-        let max_w = rect.width.saturating_sub(4) as usize;
+        let reserve_due = task.due.as_ref().map(|d| d.len() + 3).unwrap_or(0);
+        let max_w = (rect.width.saturating_sub(4) as usize).saturating_sub(reserve_due);
         if let Some(line) = tags_border_line(theme, tags, active_tags, max_w) {
             block = block.title_bottom(line);
+        }
+    }
+
+    if let Some(due_line) = due_border_line(theme, task) {
+        if rect.height >= 3 && rect.width >= 18 {
+            block = block.title_bottom(due_line.alignment(Alignment::Right));
         }
     }
 
@@ -1021,9 +1028,16 @@ fn render_kanban_card(
     }
 
     if !tags.is_empty() && rect.height >= 3 {
-        let max_w = rect.width.saturating_sub(4) as usize;
+        let reserve_due = task.due.as_ref().map(|d| d.len() + 3).unwrap_or(0);
+        let max_w = (rect.width.saturating_sub(4) as usize).saturating_sub(reserve_due);
         if let Some(line) = tags_border_line(theme, tags, active_tags, max_w) {
             block = block.title_bottom(line);
+        }
+    }
+
+    if let Some(due_line) = due_border_line(theme, task) {
+        if rect.height >= 3 && rect.width >= 18 {
+            block = block.title_bottom(due_line.alignment(Alignment::Right));
         }
     }
 
@@ -1264,8 +1278,13 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         rows[1],
     );
 
+    let tags_due_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(rows[2]);
+
     let tags_active = form.active_field == FormField::Tags;
-    let tags_w = rows[2].width as usize;
+    let tags_w = tags_due_cols[0].width.saturating_sub(1) as usize;
     let (tags_slice, tags_cursor_off) =
         visible_text_slice(&form.tags.value, form.tags.cursor, tags_w);
     frame.render_widget(
@@ -1287,7 +1306,29 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
                 }),
             )),
         ]),
-        rows[2],
+        tags_due_cols[0],
+    );
+
+    let due_active = form.active_field == FormField::Due;
+    let due_w = tags_due_cols[1].width as usize;
+    let (due_slice, due_cursor_off) = visible_text_slice(&form.due.value, form.due.cursor, due_w);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("Due", field_label_style(&theme, due_active))),
+            Line::from(Span::styled(
+                if due_slice.is_empty() && !due_active {
+                    "YYYY-MM-DD"
+                } else {
+                    due_slice
+                },
+                Style::default().fg(if due_slice.is_empty() {
+                    theme.muted
+                } else {
+                    theme.text
+                }),
+            )),
+        ]),
+        tags_due_cols[1],
     );
 
     let meta_cols = Layout::default()
@@ -1402,9 +1443,15 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
             frame.set_cursor_position(Position::new(cx, cy));
         }
     } else if tags_active {
-        let cx = rows[2].x + (tags_cursor_off as u16);
-        let cy = rows[2].y + 1;
-        if cx < rows[2].right() && cy < rows[2].bottom() {
+        let cx = tags_due_cols[0].x + (tags_cursor_off as u16);
+        let cy = tags_due_cols[0].y + 1;
+        if cx < tags_due_cols[0].right() && cy < tags_due_cols[0].bottom() {
+            frame.set_cursor_position(Position::new(cx, cy));
+        }
+    } else if due_active {
+        let cx = tags_due_cols[1].x + (due_cursor_off as u16);
+        let cy = tags_due_cols[1].y + 1;
+        if cx < tags_due_cols[1].right() && cy < tags_due_cols[1].bottom() {
             frame.set_cursor_position(Position::new(cx, cy));
         }
     }
@@ -1413,7 +1460,8 @@ fn render_task_modal(frame: &mut Frame, app: &mut App, form: &TaskForm) {
         area,
         title: rows[0],
         description: rows[1],
-        tags: rows[2],
+        tags: tags_due_cols[0],
+        due: tags_due_cols[1],
         status: meta_cols[0],
         priority: meta_cols[1],
         save_btn: save_rect,
@@ -1598,7 +1646,7 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if !eff_tags.is_empty() || task.checklist_progress().is_some() {
+    if !eff_tags.is_empty() || task.due.is_some() || task.checklist_progress().is_some() {
         let mut meta_spans: Vec<Span<'static>> = Vec::new();
         for (i, tag) in eff_tags.iter().enumerate() {
             if i > 0 {
@@ -1607,6 +1655,21 @@ fn render_notes_preview_modal(frame: &mut Frame, app: &mut App, task_id: u64, sc
             meta_spans.push(Span::styled(
                 format!("#{tag}"),
                 Style::default().fg(theme.accent),
+            ));
+        }
+        if let Some(due) = &task.due {
+            if !meta_spans.is_empty() {
+                meta_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
+            }
+            let today = today_ymd();
+            let color = match task.due_state(&today) {
+                Some(DueState::Overdue) => theme.error,
+                Some(DueState::Today) => theme.in_progress,
+                _ => theme.subtle,
+            };
+            meta_spans.push(Span::styled(
+                format!("Due {due}"),
+                Style::default().fg(color),
             ));
         }
         if let Some((done, total)) = task.checklist_progress() {
@@ -1986,6 +2049,17 @@ fn tags_border_line<'a>(
     }
     spans.push(Span::raw(" "));
     Some(Line::from(spans))
+}
+
+fn due_border_line(theme: &Theme, task: &Task) -> Option<Line<'static>> {
+    let due = task.due.as_deref()?;
+    let today = today_ymd();
+    let style = match task.due_state(&today) {
+        Some(DueState::Overdue) => Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+        Some(DueState::Today) => Style::default().fg(theme.in_progress),
+        _ => Style::default().fg(theme.muted),
+    };
+    Some(Line::from(Span::styled(format!(" {due} "), style)))
 }
 
 fn priority_tag_style(theme: &Theme, priority: Priority, selected: bool) -> Style {
