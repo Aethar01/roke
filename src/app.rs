@@ -5,12 +5,268 @@ use crate::model::{
     now_millis, parse_due_spec, parse_quick_add, parse_repeat, parse_tags, sort_task_refs,
     today_ymd, DueState, FileLock, FileStamp, Priority, SortOrder, Status, Task, TaskStore,
 };
-use crate::sync::{absorb_syncthing_conflicts, merge_stores, SyncOutcome};
+use crate::sync::{
+    absorb_syncthing_conflicts, merge_stores, sync_state_dir_for, SyncBatchOutcome, SyncJob,
+    SyncOutcome, SyncSlot,
+};
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardScope {
+    Project,
+    All,
+    Global,
+}
+
+impl BoardScope {
+    pub fn cycle(self) -> Self {
+        match self {
+            BoardScope::Project => BoardScope::All,
+            BoardScope::All => BoardScope::Global,
+            BoardScope::Global => BoardScope::Project,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardSource {
+    Project,
+    Global,
+}
+
+/// Holds cleanly separated project and global stores + sync configs when `roke` is opened
+/// inside a repository with `.roke.jsonl` or `.roke.toml`, enabling live `b` switching
+/// between `project`, `all` (merged view), and `global` without cross-contaminating files or sync peers.
+pub struct DualBoard {
+    pub project_name: String,
+    pub scope: BoardScope,
+    pub project_path: PathBuf,
+    pub global_path: PathBuf,
+    pub project_store: TaskStore,
+    pub global_store: TaskStore,
+    pub project_stamp: Option<FileStamp>,
+    pub global_stamp: Option<FileStamp>,
+    pub project_sync_config: SyncConfig,
+    pub global_sync_config: SyncConfig,
+    pub uid_owner: HashMap<String, BoardSource>,
+}
+
+impl DualBoard {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        project_name: String,
+        scope: BoardScope,
+        project_path: PathBuf,
+        global_path: PathBuf,
+        project_store: TaskStore,
+        global_store: TaskStore,
+        project_sync_config: SyncConfig,
+        global_sync_config: SyncConfig,
+    ) -> Self {
+        let project_stamp = file_stamp(&project_path);
+        let global_stamp = file_stamp(&global_path);
+        let mut uid_owner = HashMap::new();
+        for t in &project_store.tasks {
+            uid_owner.insert(t.uid.clone(), BoardSource::Project);
+        }
+        for uid in project_store.tombstones.keys() {
+            uid_owner.insert(uid.clone(), BoardSource::Project);
+        }
+        for t in &global_store.tasks {
+            uid_owner.insert(t.uid.clone(), BoardSource::Global);
+        }
+        for uid in global_store.tombstones.keys() {
+            uid_owner.entry(uid.clone()).or_insert(BoardSource::Global);
+        }
+        Self {
+            project_name,
+            scope,
+            project_path,
+            global_path,
+            project_store,
+            global_store,
+            project_stamp,
+            global_stamp,
+            project_sync_config,
+            global_sync_config,
+            uid_owner,
+        }
+    }
+
+    pub fn scope_label(&self) -> String {
+        match self.scope {
+            BoardScope::Project => self.project_name.clone(),
+            BoardScope::All => format!("{}+global", self.project_name),
+            BoardScope::Global => "global".to_string(),
+        }
+    }
+
+    pub fn compose_view(&mut self) -> TaskStore {
+        for t in &self.project_store.tasks {
+            self.uid_owner.insert(t.uid.clone(), BoardSource::Project);
+        }
+        for t in &self.global_store.tasks {
+            self.uid_owner.insert(t.uid.clone(), BoardSource::Global);
+        }
+        match self.scope {
+            BoardScope::Project => self.project_store.clone(),
+            BoardScope::Global => self.global_store.clone(),
+            BoardScope::All => {
+                let mut tasks = Vec::with_capacity(
+                    self.project_store.tasks.len() + self.global_store.tasks.len(),
+                );
+                let mut used_ids = std::collections::HashSet::new();
+                let mut next_id = self
+                    .project_store
+                    .next_id
+                    .max(self.global_store.next_id)
+                    .max(1);
+
+                for t in &self.project_store.tasks {
+                    let mut task = t.clone();
+                    if task.id == 0 || !used_ids.insert(task.id) {
+                        task.id = next_id;
+                        next_id += 1;
+                        used_ids.insert(task.id);
+                    } else if task.id >= next_id {
+                        next_id = task.id + 1;
+                    }
+                    tasks.push(task);
+                }
+                for t in &self.global_store.tasks {
+                    let mut task = t.clone();
+                    if task.id == 0 || !used_ids.insert(task.id) {
+                        task.id = next_id;
+                        next_id += 1;
+                        used_ids.insert(task.id);
+                    } else if task.id >= next_id {
+                        next_id = task.id + 1;
+                    }
+                    tasks.push(task);
+                }
+
+                let mut tombstones = self.project_store.tombstones.clone();
+                for (uid, &ts) in &self.global_store.tombstones {
+                    tombstones
+                        .entry(uid.clone())
+                        .and_modify(|cur| *cur = (*cur).max(ts))
+                        .or_insert(ts);
+                }
+
+                TaskStore {
+                    next_id,
+                    tasks,
+                    tombstones,
+                }
+            }
+        }
+    }
+
+    /// Split a mutated `All`-scope unified store back into isolated project and global stores,
+    /// preserving each store's original on-disk numeric task IDs.
+    fn split_all_view(&mut self, view: &TaskStore) -> (TaskStore, TaskStore) {
+        let proj_ids: HashMap<&str, u64> = self
+            .project_store
+            .tasks
+            .iter()
+            .map(|t| (t.uid.as_str(), t.id))
+            .collect();
+        let glob_ids: HashMap<&str, u64> = self
+            .global_store
+            .tasks
+            .iter()
+            .map(|t| (t.uid.as_str(), t.id))
+            .collect();
+
+        let mut next_proj = TaskStore {
+            next_id: self.project_store.next_id.max(1),
+            tasks: Vec::new(),
+            tombstones: HashMap::new(),
+        };
+        let mut next_glob = TaskStore {
+            next_id: self.global_store.next_id.max(1),
+            tasks: Vec::new(),
+            tombstones: HashMap::new(),
+        };
+        let mut proj_used = std::collections::HashSet::new();
+        let mut glob_used = std::collections::HashSet::new();
+
+        for t in &view.tasks {
+            let owner = *self
+                .uid_owner
+                .entry(t.uid.clone())
+                .or_insert(BoardSource::Project);
+            let mut task = t.clone();
+            match owner {
+                BoardSource::Project => {
+                    let orig_id = proj_ids.get(t.uid.as_str()).copied().unwrap_or(0);
+                    if orig_id > 0 && proj_used.insert(orig_id) {
+                        task.id = orig_id;
+                    } else {
+                        task.id = next_proj.next_id;
+                        next_proj.next_id += 1;
+                        proj_used.insert(task.id);
+                    }
+                    if task.id >= next_proj.next_id {
+                        next_proj.next_id = task.id + 1;
+                    }
+                    next_proj.tasks.push(task);
+                }
+                BoardSource::Global => {
+                    let orig_id = glob_ids.get(t.uid.as_str()).copied().unwrap_or(0);
+                    if orig_id > 0 && glob_used.insert(orig_id) {
+                        task.id = orig_id;
+                    } else {
+                        task.id = next_glob.next_id;
+                        next_glob.next_id += 1;
+                        glob_used.insert(task.id);
+                    }
+                    if task.id >= next_glob.next_id {
+                        next_glob.next_id = task.id + 1;
+                    }
+                    next_glob.tasks.push(task);
+                }
+            }
+        }
+
+        for (uid, &ts) in &view.tombstones {
+            match self.uid_owner.get(uid).copied() {
+                Some(BoardSource::Global) => {
+                    next_glob.tombstones.insert(uid.clone(), ts);
+                }
+                _ => {
+                    next_proj.tombstones.insert(uid.clone(), ts);
+                }
+            }
+        }
+
+        (next_proj, next_glob)
+    }
+}
+
+fn persist_store_file(
+    store: &mut TaskStore,
+    path: &Path,
+    last_stamp: &mut Option<FileStamp>,
+    device_name: &str,
+) -> Result<(), String> {
+    let _lock = FileLock::acquire(path).map_err(|e| e.to_string())?;
+    let current_stamp = file_stamp(path);
+    if current_stamp.is_some() && current_stamp != *last_stamp {
+        if let Ok(mut disk_store) = TaskStore::load_or_empty(path) {
+            disk_store.ensure_sync_metadata(device_name);
+            *store = merge_stores(store, &disk_store, device_name, device_name);
+        }
+    }
+    store.save(path).map_err(|e| e.to_string())?;
+    *last_stamp = file_stamp(path);
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -403,6 +659,7 @@ pub struct TagModalRegions {
 pub struct LayoutRegions {
     pub tab_todos: Rect,
     pub tab_kanban: Rect,
+    pub board_btn: Rect,
     pub due_btn: Rect,
     pub sort_btn: Rect,
     pub sync_btn: Rect,
@@ -433,6 +690,7 @@ impl LayoutRegions {
     pub fn clear(&mut self) {
         self.tab_todos = Rect::default();
         self.tab_kanban = Rect::default();
+        self.board_btn = Rect::default();
         self.due_btn = Rect::default();
         self.sort_btn = Rect::default();
         self.sync_btn = Rect::default();
@@ -492,6 +750,7 @@ struct LastClick {
 
 pub struct App {
     pub store: TaskStore,
+    pub dual_board: Option<DualBoard>,
     pub storage_path: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub local_config_path: Option<PathBuf>,
@@ -599,6 +858,7 @@ impl App {
             .unwrap_or(SortOrder::Manual);
         Self {
             store,
+            dual_board: None,
             storage_path,
             config_path,
             local_config_path,
@@ -643,12 +903,101 @@ impl App {
         }
     }
 
+    /// Attach a [`DualBoard`] so the TUI can switch live between `project`, `all` (project + global),
+    /// and `global` via `b` or clicking the header board pill.
+    pub fn attach_dual_board(&mut self, mut dual: DualBoard) {
+        self.store = dual.compose_view();
+        self.dual_board = Some(dual);
+        self.clamp_selections();
+    }
+
+    pub fn board_scope_label(&self) -> Option<String> {
+        self.dual_board.as_ref().map(DualBoard::scope_label)
+    }
+
+    pub fn has_any_sync_peers(&self) -> bool {
+        if let Some(db) = &self.dual_board {
+            match db.scope {
+                BoardScope::Project => !db.project_sync_config.peers.is_empty(),
+                BoardScope::Global => !db.global_sync_config.peers.is_empty(),
+                BoardScope::All => {
+                    !db.project_sync_config.peers.is_empty()
+                        || !db.global_sync_config.peers.is_empty()
+                }
+            }
+        } else {
+            !self.sync_config.peers.is_empty()
+        }
+    }
+
+    pub fn cycle_board_scope(&mut self) {
+        let Some(mut db) = self.dual_board.take() else {
+            return;
+        };
+        // Flush any in-memory view state back into backing stores before switching
+        match db.scope {
+            BoardScope::Project => db.project_store = self.store.clone(),
+            BoardScope::Global => db.global_store = self.store.clone(),
+            BoardScope::All => {
+                let (p, g) = db.split_all_view(&self.store);
+                db.project_store = p;
+                db.global_store = g;
+            }
+        }
+        db.scope = db.scope.cycle();
+        let next_store = db.compose_view();
+        let label = db.scope_label();
+        self.dual_board = Some(db);
+        self.store = next_store;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.marked_ids.clear();
+        self.todo_selected = 0;
+        self.todo_scroll = 0;
+        self.kanban_selected = [0, 0, 0];
+        self.kanban_scroll = [0, 0, 0];
+        self.clamp_selections();
+        self.set_message(format!("Board: {label}"));
+    }
+
     pub fn current_kanban_status(&self) -> Status {
         Status::from_index(self.kanban_col)
     }
 
     pub fn effective_tags(&self, task: &Task) -> Vec<String> {
         let mut tags = task.tags.clone();
+        if let Some(db) = &self.dual_board {
+            let owner = db
+                .uid_owner
+                .get(&task.uid)
+                .copied()
+                .unwrap_or(match db.scope {
+                    BoardScope::Global => BoardSource::Global,
+                    BoardScope::Project | BoardScope::All => BoardSource::Project,
+                });
+            if db.scope == BoardScope::All {
+                let board_tag = match owner {
+                    BoardSource::Global => "global".to_string(),
+                    BoardSource::Project => db.project_name.clone(),
+                };
+                if !board_tag.is_empty() && !tags.iter().any(|t| t == &board_tag) {
+                    tags.push(board_tag);
+                }
+            }
+            let sync_cfg = match owner {
+                BoardSource::Global => &db.global_sync_config,
+                BoardSource::Project => &db.project_sync_config,
+            };
+            if let Some(origin) = &task.origin {
+                if sync_cfg.should_inject_tag_for(origin) {
+                    let slug = normalize_device_tag(origin);
+                    if !slug.is_empty() && !tags.iter().any(|t| t == &slug) {
+                        tags.push(slug);
+                    }
+                }
+            }
+            return tags;
+        }
         if let Some(origin) = &task.origin {
             if self.sync_config.should_inject_tag_for(origin) {
                 let slug = normalize_device_tag(origin);
@@ -864,27 +1213,110 @@ impl App {
 
     fn persist_inner(&mut self, allow_auto_sync: bool) {
         self.dirty = true;
-        if let Some(path) = self.storage_path.clone() {
-            let _lock = match FileLock::acquire(&path) {
-                Ok(lock) => lock,
-                Err(err) => {
-                    self.set_message(format!("Save failed: {err}"));
-                    return;
+        if let Some(mut db) = self.dual_board.take() {
+            let proj_device = db.project_sync_config.effective_device_name();
+            let glob_device = db.global_sync_config.effective_device_name();
+            let mut auto_sync = false;
+            match db.scope {
+                BoardScope::Project => {
+                    db.project_store = self.store.clone();
+                    for t in &db.project_store.tasks {
+                        db.uid_owner.insert(t.uid.clone(), BoardSource::Project);
+                    }
+                    if let Err(err) = persist_store_file(
+                        &mut db.project_store,
+                        &db.project_path,
+                        &mut db.project_stamp,
+                        &proj_device,
+                    ) {
+                        self.dual_board = Some(db);
+                        self.set_message(format!("Save failed: {err}"));
+                        return;
+                    }
+                    self.store = db.project_store.clone();
+                    auto_sync = db.project_sync_config.auto_sync_on_save
+                        && !db.project_sync_config.peers.is_empty();
                 }
-            };
-            let current_stamp = file_stamp(&path);
-            if current_stamp.is_some() && current_stamp != self.last_file_stamp {
-                if let Ok(mut disk_store) = TaskStore::load_or_empty(&path) {
-                    let local_name = self.sync_config.effective_device_name();
-                    disk_store.ensure_sync_metadata(&local_name);
-                    self.store = merge_stores(&self.store, &disk_store, &local_name, &local_name);
+                BoardScope::Global => {
+                    db.global_store = self.store.clone();
+                    for t in &db.global_store.tasks {
+                        db.uid_owner.insert(t.uid.clone(), BoardSource::Global);
+                    }
+                    if let Err(err) = persist_store_file(
+                        &mut db.global_store,
+                        &db.global_path,
+                        &mut db.global_stamp,
+                        &glob_device,
+                    ) {
+                        self.dual_board = Some(db);
+                        self.set_message(format!("Save failed: {err}"));
+                        return;
+                    }
+                    self.store = db.global_store.clone();
+                    auto_sync = db.global_sync_config.auto_sync_on_save
+                        && !db.global_sync_config.peers.is_empty();
+                }
+                BoardScope::All => {
+                    let (mut next_proj, mut next_glob) = db.split_all_view(&self.store);
+                    let proj_changed = next_proj != db.project_store;
+                    let glob_changed = next_glob != db.global_store;
+                    if proj_changed {
+                        if let Err(err) = persist_store_file(
+                            &mut next_proj,
+                            &db.project_path,
+                            &mut db.project_stamp,
+                            &proj_device,
+                        ) {
+                            self.dual_board = Some(db);
+                            self.set_message(format!("Save failed: {err}"));
+                            return;
+                        }
+                        db.project_store = next_proj;
+                        if db.project_sync_config.auto_sync_on_save
+                            && !db.project_sync_config.peers.is_empty()
+                        {
+                            auto_sync = true;
+                        }
+                    }
+                    if glob_changed {
+                        if let Err(err) = persist_store_file(
+                            &mut next_glob,
+                            &db.global_path,
+                            &mut db.global_stamp,
+                            &glob_device,
+                        ) {
+                            self.dual_board = Some(db);
+                            self.set_message(format!("Save failed: {err}"));
+                            return;
+                        }
+                        db.global_store = next_glob;
+                        if db.global_sync_config.auto_sync_on_save
+                            && !db.global_sync_config.peers.is_empty()
+                        {
+                            auto_sync = true;
+                        }
+                    }
                 }
             }
-            if let Err(err) = self.store.save(&path) {
+            self.dual_board = Some(db);
+            self.dirty = false;
+            if allow_auto_sync && auto_sync {
+                self.sync_requested = true;
+            }
+            return;
+        }
+
+        if let Some(path) = self.storage_path.clone() {
+            let local_name = self.sync_config.effective_device_name();
+            if let Err(err) = persist_store_file(
+                &mut self.store,
+                &path,
+                &mut self.last_file_stamp,
+                &local_name,
+            ) {
                 self.set_message(format!("Save failed: {err}"));
                 return;
             }
-            self.last_file_stamp = file_stamp(&path);
             self.dirty = false;
         }
         if allow_auto_sync
@@ -895,9 +1327,61 @@ impl App {
         }
     }
 
-    /// Check whether `storage_path` was modified externally (e.g. by CLI, MCP, or another process)
+    /// Check whether storage file(s) were modified externally (e.g. by CLI, MCP, or Syncthing)
     /// and reload/merge changes into the live TUI without losing selection.
     pub fn reload_if_changed(&mut self) -> bool {
+        if let Some(mut db) = self.dual_board.take() {
+            let selected_uid = self
+                .selected_task_id()
+                .and_then(|id| self.store.get(id))
+                .map(|t| t.uid.clone());
+
+            let proj_dev = db.project_sync_config.effective_device_name();
+            let glob_dev = db.global_sync_config.effective_device_name();
+            let mut any_changed = false;
+
+            let p_absorbed = absorb_syncthing_conflicts(&db.project_path, &proj_dev).unwrap_or(0);
+            let p_stamp = file_stamp(&db.project_path);
+            if p_absorbed > 0 || (p_stamp.is_some() && p_stamp != db.project_stamp) {
+                if let Ok(mut disk) = TaskStore::load_or_empty(&db.project_path) {
+                    disk.ensure_sync_metadata(&proj_dev);
+                    if disk != db.project_store {
+                        db.project_store = disk;
+                        any_changed = true;
+                    }
+                    db.project_stamp = p_stamp;
+                }
+            }
+
+            let g_absorbed = absorb_syncthing_conflicts(&db.global_path, &glob_dev).unwrap_or(0);
+            let g_stamp = file_stamp(&db.global_path);
+            if g_absorbed > 0 || (g_stamp.is_some() && g_stamp != db.global_stamp) {
+                if let Ok(mut disk) = TaskStore::load_or_empty(&db.global_path) {
+                    disk.ensure_sync_metadata(&glob_dev);
+                    if disk != db.global_store {
+                        db.global_store = disk;
+                        any_changed = true;
+                    }
+                    db.global_stamp = g_stamp;
+                }
+            }
+
+            if any_changed {
+                self.store = db.compose_view();
+            }
+            self.dual_board = Some(db);
+            if any_changed {
+                self.clamp_selections();
+                if let Some(uid) = selected_uid {
+                    if let Some(id) = self.store.tasks.iter().find(|t| t.uid == uid).map(|t| t.id) {
+                        self.select_task_by_id(id);
+                    }
+                }
+                self.set_message("Reloaded external changes");
+            }
+            return any_changed;
+        }
+
         let Some(path) = self.storage_path.clone() else {
             return false;
         };
@@ -955,6 +1439,7 @@ impl App {
         let local_changed = current_local_stamp != self.last_local_config_stamp;
         self.last_config_stamp = current_stamp;
         self.last_local_config_stamp = current_local_stamp;
+        let global_res = AppConfig::load_or_default(&path);
         let res = if self.local_config_path.is_some() || self.isolate_sync_peers {
             AppConfig::load_with_local_overlay(
                 &path,
@@ -962,14 +1447,20 @@ impl App {
                 self.isolate_sync_peers,
             )
         } else {
-            AppConfig::load_or_default(&path)
+            global_res.clone()
         };
         match res {
             Ok(cfg) => {
                 self.theme = cfg.resolved_theme();
                 self.editor_label = editor_display_name(cfg.editor.as_deref());
                 self.editor_config = cfg.editor;
-                self.sync_config = cfg.sync;
+                self.sync_config = cfg.sync.clone();
+                if let Some(db) = &mut self.dual_board {
+                    db.project_sync_config = cfg.sync;
+                    if let Ok(global_cfg) = global_res {
+                        db.global_sync_config = global_cfg.sync;
+                    }
+                }
                 self.set_message(if local_changed {
                     "Reloaded .roke.toml"
                 } else {
@@ -985,7 +1476,7 @@ impl App {
     }
 
     pub fn request_sync(&mut self) {
-        if self.sync_config.peers.is_empty() {
+        if !self.has_any_sync_peers() {
             self.set_message("No sync peers configured in config.toml");
             return;
         }
@@ -995,6 +1486,101 @@ impl App {
         }
         self.sync_requested = true;
         self.set_message("Syncing…");
+    }
+
+    pub fn build_sync_jobs(&self) -> Vec<SyncJob> {
+        if let Some(db) = &self.dual_board {
+            let mut jobs = Vec::new();
+            let include_project = matches!(db.scope, BoardScope::Project | BoardScope::All);
+            let include_global = matches!(db.scope, BoardScope::Global | BoardScope::All);
+            if include_project && !db.project_sync_config.peers.is_empty() {
+                jobs.push(SyncJob {
+                    slot: SyncSlot::Primary,
+                    store: db.project_store.clone(),
+                    config: db.project_sync_config.clone(),
+                    state_dir: Some(sync_state_dir_for(Some(&db.project_path))),
+                });
+            }
+            if include_global && !db.global_sync_config.peers.is_empty() {
+                jobs.push(SyncJob {
+                    slot: SyncSlot::Global,
+                    store: db.global_store.clone(),
+                    config: db.global_sync_config.clone(),
+                    state_dir: Some(sync_state_dir_for(Some(&db.global_path))),
+                });
+            }
+            return jobs;
+        }
+        if self.sync_config.peers.is_empty() {
+            return Vec::new();
+        }
+        vec![SyncJob {
+            slot: SyncSlot::Primary,
+            store: self.store.clone(),
+            config: self.sync_config.clone(),
+            state_dir: Some(sync_state_dir_for(self.storage_path.as_deref())),
+        }]
+    }
+
+    pub fn apply_sync_batch(&mut self, batch: SyncBatchOutcome) {
+        if let Some(mut db) = self.dual_board.take() {
+            let selected_uid = self
+                .selected_task_id()
+                .and_then(|id| self.store.get(id))
+                .map(|t| t.uid.clone());
+
+            let mut total_synced = 0usize;
+            let mut errors = Vec::new();
+
+            for (slot, outcome) in batch.results {
+                total_synced += outcome.synced_peers;
+                errors.extend(outcome.errors);
+                match slot {
+                    SyncSlot::Primary => {
+                        let dev = db.project_sync_config.effective_device_name();
+                        db.project_store =
+                            merge_stores(&db.project_store, &outcome.merged_store, &dev, &dev);
+                        let _ = persist_store_file(
+                            &mut db.project_store,
+                            &db.project_path,
+                            &mut db.project_stamp,
+                            &dev,
+                        );
+                    }
+                    SyncSlot::Global => {
+                        let dev = db.global_sync_config.effective_device_name();
+                        db.global_store =
+                            merge_stores(&db.global_store, &outcome.merged_store, &dev, &dev);
+                        let _ = persist_store_file(
+                            &mut db.global_store,
+                            &db.global_path,
+                            &mut db.global_stamp,
+                            &dev,
+                        );
+                    }
+                }
+            }
+
+            self.store = db.compose_view();
+            self.dual_board = Some(db);
+            self.clamp_selections();
+            if let Some(uid) = selected_uid {
+                if let Some(id) = self.store.tasks.iter().find(|t| t.uid == uid).map(|t| t.id) {
+                    self.select_task_by_id(id);
+                }
+            }
+            if errors.is_empty() {
+                let noun = if total_synced == 1 { "peer" } else { "peers" };
+                self.set_message(format!("Synced {total_synced} {noun}"));
+            } else {
+                self.set_message(format!("Sync error: {}", errors[0]));
+            }
+            return;
+        }
+
+        if let Some((_, outcome)) = batch.results.into_iter().next() {
+            self.apply_sync_outcome(outcome);
+        }
     }
 
     pub fn apply_sync_outcome(&mut self, outcome: SyncOutcome) {
@@ -1802,6 +2388,9 @@ impl App {
             KeyCode::Char('S') => {
                 self.request_sync();
             }
+            KeyCode::Char('b') if self.dual_board.is_some() => {
+                self.cycle_board_scope();
+            }
             KeyCode::Char('p') => {
                 self.cycle_selected_priority();
             }
@@ -2473,7 +3062,46 @@ impl App {
             .filter_map(|&id| self.store.get(id).cloned())
             .collect();
 
-        if let Some(path) = &self.storage_path {
+        if let Some(db) = &self.dual_board {
+            match db.scope {
+                BoardScope::Project => {
+                    let archive_path = archive_path_for(&db.project_path);
+                    if let Err(err) = append_tasks_to_archive(&archive_path, &done_tasks) {
+                        self.set_message(format!("Archive failed: {err}"));
+                        return;
+                    }
+                }
+                BoardScope::Global => {
+                    let archive_path = archive_path_for(&db.global_path);
+                    if let Err(err) = append_tasks_to_archive(&archive_path, &done_tasks) {
+                        self.set_message(format!("Archive failed: {err}"));
+                        return;
+                    }
+                }
+                BoardScope::All => {
+                    let mut proj_done = Vec::new();
+                    let mut glob_done = Vec::new();
+                    for task in &done_tasks {
+                        match db.uid_owner.get(&task.uid).copied() {
+                            Some(BoardSource::Global) => glob_done.push(task.clone()),
+                            _ => proj_done.push(task.clone()),
+                        }
+                    }
+                    if let Err(err) =
+                        append_tasks_to_archive(&archive_path_for(&db.project_path), &proj_done)
+                    {
+                        self.set_message(format!("Archive failed: {err}"));
+                        return;
+                    }
+                    if let Err(err) =
+                        append_tasks_to_archive(&archive_path_for(&db.global_path), &glob_done)
+                    {
+                        self.set_message(format!("Archive failed: {err}"));
+                        return;
+                    }
+                }
+            }
+        } else if let Some(path) = &self.storage_path {
             let archive_path = archive_path_for(path);
             if let Err(err) = append_tasks_to_archive(&archive_path, &done_tasks) {
                 self.set_message(format!("Archive failed: {err}"));
@@ -2850,6 +3478,10 @@ impl App {
         if rect_contains(self.regions.tab_kanban, x, y) {
             self.view = View::Kanban;
             self.clamp_selections();
+            return;
+        }
+        if rect_contains(self.regions.board_btn, x, y) {
+            self.cycle_board_scope();
             return;
         }
         if rect_contains(self.regions.sync_btn, x, y) {
@@ -4105,5 +4737,115 @@ default_sort = "priority"
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         app.handle_key(key(KeyCode::Char('2')));
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn dual_board_merged_view_isolates_storage_tags_and_sync_jobs() {
+        use crate::config::{PeerConfig, PeerKind};
+
+        let dir = std::env::temp_dir().join(format!("roke_dual_board_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let proj_path = dir.join(".roke.jsonl");
+        let glob_path = dir.join("global-todos.jsonl");
+
+        let mut proj_store = TaskStore::new_empty();
+        proj_store.add_with_origin(
+            "Ship API".into(),
+            String::new(),
+            Status::Todo,
+            Priority::High,
+            vec!["backend".into()],
+            "laptop",
+        );
+        proj_store.save(&proj_path).unwrap();
+
+        let mut glob_store = TaskStore::new_empty();
+        let gid = glob_store.add_with_origin(
+            "Buy groceries".into(),
+            String::new(),
+            Status::Todo,
+            Priority::Low,
+            vec!["home".into()],
+            "laptop",
+        );
+        let glob_uid = glob_store.get(gid).unwrap().uid.clone();
+        glob_store.save(&glob_path).unwrap();
+
+        let proj_sync = SyncConfig {
+            peers: vec![PeerConfig::minimal("team", PeerKind::Caldav)],
+            ..SyncConfig::default()
+        };
+        let glob_sync = SyncConfig {
+            peers: vec![PeerConfig::minimal("phone", PeerKind::Caldav)],
+            ..SyncConfig::default()
+        };
+
+        let mut app = App::with_config(
+            proj_store.clone(),
+            Some(proj_path.clone()),
+            AppConfig::default(),
+        );
+        app.attach_dual_board(DualBoard::new(
+            "myapp".into(),
+            BoardScope::Project,
+            proj_path.clone(),
+            glob_path.clone(),
+            proj_store,
+            glob_store,
+            proj_sync,
+            glob_sync,
+        ));
+
+        // Starts in Project scope (1 task)
+        assert_eq!(app.board_scope_label().as_deref(), Some("myapp"));
+        assert_eq!(app.store.tasks.len(), 1);
+        assert_eq!(app.build_sync_jobs().len(), 1);
+
+        // Press 'b' -> All scope (merged view shows both boards with dynamic board tags)
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.board_scope_label().as_deref(), Some("myapp+global"));
+        assert_eq!(app.store.tasks.len(), 2);
+        assert_eq!(app.build_sync_jobs().len(), 2);
+
+        let glob_task = app
+            .store
+            .tasks
+            .iter()
+            .find(|t| t.uid == glob_uid)
+            .unwrap()
+            .clone();
+        assert!(app
+            .effective_tags(&glob_task)
+            .contains(&"global".to_string()));
+        assert!(!glob_task.tags.contains(&"global".to_string()));
+
+        // Toggle the global task done while in merged All view
+        app.toggle_task_done(glob_task.id);
+
+        // Verify strict file isolation: global file updated, project file untouched!
+        let proj_on_disk = TaskStore::load_or_empty(&proj_path).unwrap();
+        let glob_on_disk = TaskStore::load_or_empty(&glob_path).unwrap();
+        assert_eq!(proj_on_disk.tasks.len(), 1);
+        assert_eq!(proj_on_disk.tasks[0].title, "Ship API");
+        assert_eq!(glob_on_disk.tasks.len(), 1);
+        assert_eq!(glob_on_disk.tasks[0].status, Status::Done);
+
+        // Render merged header with board scope pill cleanly
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(app.regions.board_btn.width > 0);
+
+        // Press 'b' -> Global scope -> 'b' -> back to Project scope
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.board_scope_label().as_deref(), Some("global"));
+        assert_eq!(app.store.tasks.len(), 1);
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.board_scope_label().as_deref(), Some("myapp"));
+        assert_eq!(app.store.tasks.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

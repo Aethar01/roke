@@ -1,10 +1,12 @@
-use crate::config::{default_config_path, default_state_dir, find_local_config, AppConfig};
+use crate::config::{
+    default_config_path, default_state_dir, find_local_config, normalize_device_tag, AppConfig,
+};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
     default_storage_path, find_local_board, parse_due_spec, parse_due_time, parse_quick_add,
-    parse_repeat, parse_tags, today_ymd, DueState, Priority, SortOrder, Status, Task, TaskStore,
-    LOCAL_BOARD_FILENAME,
+    parse_repeat, parse_tags, sort_tasks, today_ymd, DueState, Priority, SortOrder, Status, Task,
+    TaskStore, LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
 use crate::sync::{oauth, project_cache_board_path};
@@ -89,8 +91,12 @@ pub struct Cli {
     pub file: Option<PathBuf>,
 
     /// Force the global board and config even inside a directory containing .roke.jsonl or .roke.toml
-    #[arg(long = "global", global = true)]
+    #[arg(long = "global", global = true, conflicts_with = "all_boards")]
     pub global_board: bool,
+
+    /// Show and sync both the project board and the global board simultaneously
+    #[arg(long = "all", global = true, conflicts_with = "global_board")]
+    pub all_boards: bool,
 
     /// Path to TOML config file (overrides both global config.toml and local .roke.toml)
     #[arg(short = 'c', long = "config", value_name = "PATH", global = true)]
@@ -121,8 +127,10 @@ pub struct Cli {
 #[derive(Debug, Clone)]
 pub struct ResolvedProjectContext {
     pub storage_path: PathBuf,
+    pub global_storage_path: PathBuf,
     pub global_config_path: PathBuf,
     pub local_config_path: Option<PathBuf>,
+    pub project_name: Option<String>,
     pub isolate_sync_peers: bool,
 }
 
@@ -131,11 +139,17 @@ impl Cli {
     /// `.roke.toml` precedence into account (overridden by `--global`, `--file`, or `--config`).
     pub fn resolve_context(&self) -> ResolvedProjectContext {
         let global_config_path = self.config_path();
+        let global_storage_path = default_storage_path();
         if self.global_board {
             return ResolvedProjectContext {
-                storage_path: self.file.clone().unwrap_or_else(default_storage_path),
+                storage_path: self
+                    .file
+                    .clone()
+                    .unwrap_or_else(|| global_storage_path.clone()),
+                global_storage_path,
                 global_config_path,
                 local_config_path: None,
+                project_name: None,
                 isolate_sync_peers: false,
             };
         }
@@ -164,27 +178,41 @@ impl Cli {
             (b, c) => (b, c),
         };
 
+        let project_dir = active_board
+            .as_deref()
+            .or(active_local_cfg.as_deref())
+            .and_then(Path::parent);
+        let project_name = project_dir.and_then(|dir| {
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .map(normalize_device_tag)
+                .filter(|s| !s.is_empty())
+        });
+
         let storage_path = if let Some(file) = &self.file {
             file.clone()
         } else if let Some(board) = &active_board {
             board.clone()
         } else if let Some(cfg_file) = &active_local_cfg {
-            let project_dir = cfg_file.parent().unwrap_or(Path::new("."));
-            project_cache_board_path(project_dir)
+            let dir = cfg_file.parent().unwrap_or(Path::new("."));
+            project_cache_board_path(dir)
         } else {
-            default_storage_path()
+            global_storage_path.clone()
         };
 
         let isolate_sync_peers = active_board.is_some() || active_local_cfg.is_some();
 
         ResolvedProjectContext {
             storage_path,
+            global_storage_path,
             global_config_path,
             local_config_path: active_local_cfg,
+            project_name,
             isolate_sync_peers,
         }
     }
 
+    #[cfg(test)]
     pub fn storage_path(&self) -> PathBuf {
         self.resolve_context().storage_path
     }
@@ -584,7 +612,14 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
 }
 
 pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<(), String> {
-    let path = cli.storage_path();
+    let ctx = cli.resolve_context();
+    let path = ctx.storage_path.clone();
+    let dual_all = cli.all_boards && ctx.isolate_sync_peers && cli.file.is_none();
+    let global_cfg = if dual_all {
+        AppConfig::load_or_default(&ctx.global_config_path).unwrap_or_default()
+    } else {
+        cfg.clone()
+    };
     let json = cli.json;
     let painter = Painter::new(cfg.resolved_theme(), cli.color.should_color_stdout());
 
@@ -599,7 +634,38 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 overdue_only: args.overdue,
                 sort: args.sort,
             };
-            let tasks = ops::list_tasks(&path, cfg, &filter)?;
+            let (tasks, board_labels): (Vec<Task>, Vec<Option<String>>) = if dual_all {
+                let proj_label = ctx
+                    .project_name
+                    .clone()
+                    .unwrap_or_else(|| "project".to_string());
+                let proj_tasks = ops::list_tasks(&path, cfg, &filter)?;
+                let glob_tasks = ops::list_tasks(&ctx.global_storage_path, &global_cfg, &filter)?;
+                let combined: Vec<(Task, String)> = proj_tasks
+                    .into_iter()
+                    .map(|t| (t, proj_label.clone()))
+                    .chain(glob_tasks.into_iter().map(|t| (t, "global".to_string())))
+                    .collect();
+                let mut only_tasks: Vec<Task> = combined.iter().map(|(t, _)| t.clone()).collect();
+                sort_tasks(&mut only_tasks, filter.sort);
+                if filter.sort != SortOrder::Manual {
+                    let labels_by_uid: std::collections::HashMap<String, String> =
+                        combined.into_iter().map(|(t, l)| (t.uid, l)).collect();
+                    let labels = only_tasks
+                        .iter()
+                        .map(|t| labels_by_uid.get(&t.uid).cloned())
+                        .collect();
+                    (only_tasks, labels)
+                } else {
+                    let labels = combined.iter().map(|(_, l)| Some(l.clone())).collect();
+                    let tasks = combined.into_iter().map(|(t, _)| t).collect();
+                    (tasks, labels)
+                }
+            } else {
+                let tasks = ops::list_tasks(&path, cfg, &filter)?;
+                let labels = vec![None; tasks.len()];
+                (tasks, labels)
+            };
             if json {
                 print_json(&tasks)?;
             } else if tasks.is_empty() {
@@ -610,8 +676,13 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     .map(|t| t.id.to_string().len() + 1)
                     .max()
                     .unwrap_or(2);
-                for task in &tasks {
-                    let eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                for (task, board_tag) in tasks.iter().zip(board_labels.iter()) {
+                    let mut eff_tags = ops::effective_tags_for(task, &cfg.sync);
+                    if let Some(bt) = board_tag {
+                        if !eff_tags.iter().any(|t| t == bt) {
+                            eff_tags.push(bt.clone());
+                        }
+                    }
                     println!("{}", painter.format_task_line(task, &eff_tags, id_width));
                     if args.verbose {
                         let indent = " ".repeat(id_width + 5);
@@ -1020,7 +1091,41 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
             }
         }
         SubCommand::Sync => {
-            let report: SyncReport = ops::sync_tasks(&path, cfg)?;
+            let report: SyncReport = if dual_all {
+                let mut synced_peers = 0usize;
+                let mut total_tasks = 0usize;
+                let mut errors = Vec::new();
+                if !cfg.sync.peers.is_empty() {
+                    match ops::sync_tasks(&path, cfg) {
+                        Ok(r) => {
+                            synced_peers += r.synced_peers;
+                            total_tasks += r.total_tasks;
+                            errors.extend(r.errors);
+                        }
+                        Err(e) => errors.push(format!("project: {e}")),
+                    }
+                }
+                if !global_cfg.sync.peers.is_empty() {
+                    match ops::sync_tasks(&ctx.global_storage_path, &global_cfg) {
+                        Ok(r) => {
+                            synced_peers += r.synced_peers;
+                            total_tasks += r.total_tasks;
+                            errors.extend(r.errors);
+                        }
+                        Err(e) => errors.push(format!("global: {e}")),
+                    }
+                }
+                if cfg.sync.peers.is_empty() && global_cfg.sync.peers.is_empty() {
+                    return Err("no sync peers configured in .roke.toml or config.toml".into());
+                }
+                SyncReport {
+                    synced_peers,
+                    total_tasks,
+                    errors,
+                }
+            } else {
+                ops::sync_tasks(&path, cfg)?
+            };
             if json {
                 print_json(&report)?;
             } else {

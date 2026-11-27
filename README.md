@@ -48,6 +48,7 @@ install -m 755 target/release/roke ~/.local/bin/roke
 
 ```bash
 roke                                     # open interactive TUI (auto-discovers .roke.jsonl / .roke.toml, else global board)
+roke --all                               # open TUI (or run list/sync) with both project and global boards merged
 roke init                                # create a project-local .roke.jsonl in the current directory
 roke --global                            # force the global board and config even inside a repo with .roke.jsonl or .roke.toml
 roke --file ./project-todos.jsonl        # use a specific JSONL task file
@@ -58,7 +59,7 @@ roke completions zsh                     # generate shell completions (bash, zsh
 
 ### CLI & agent usage
 
-All subcommands accept `--file`, `--global`, `--config`, `--json`, and `--color <auto|always|never>` (honoring your `[theme]` colours from `config.toml` and `NO_COLOR`), and accept either a numeric task ID or stable `uid`. Any edits appear live in an open `roke` TUI.
+All subcommands accept `--file`, `--global`, `--all`, `--config`, `--json`, and `--color <auto|always|never>` (honoring your `[theme]` colours from `config.toml` and `NO_COLOR`), and accept either a numeric task ID or stable `uid`. Any edits appear live in an open `roke` TUI.
 
 ```bash
 roke list --status todo --tag work --sort priority --verbose
@@ -126,6 +127,7 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 | `D` / `@` | Edit due date / toggle due-today & overdue focus |
 | `m` / `M` | Mark task / mark all visible or clear marks (batch `Space`/`H`/`L`/`p`/`d`/`y`) |
 | `S` | Sync with configured peers |
+| `b` | Switch board scope (`project` / `project+global` / `global`, when inside a project) |
 | `d` / `x` | Delete selected (or marked) task(s) |
 | `A` / `V` | Archive all Done tasks / Browse & restore archive |
 | `y` / `Y` | Yank title (or notes in preview) / Yank full task as Markdown |
@@ -152,6 +154,7 @@ editor = "nvim"            # optional; overrides $VISUAL / $EDITOR for Markdown 
 default_view = "todos"     # "todos" or "kanban"
 default_filter = "all"     # "all", "todo", "in-progress", or "done"
 default_sort = "manual"    # "manual", "priority", "due", or "updated"
+merge_global = false       # true starts inside a project repo with project+global boards merged
 
 [theme]
 preset = "catppuccin"      # optional: "default", "catppuccin", "tokyo-night", "gruvbox", "nord", "minimal"
@@ -228,6 +231,7 @@ password_env = "ROKE_TEAM_PASSWORD"
 ```
 
 - **Precedence**: `.roke.jsonl` and `.roke.toml` take precedence over global automatically (use `--global` to jump back to your personal board). If only `.roke.toml` exists, `roke` keeps its local board cache under `$XDG_STATE_HOME/roke/boards/<hash>/todos.jsonl`.
+- **Merged view (`b` / `--all` / `merge_global = true`)**: View and manage project and global tasks side by side in the same Todo List or Kanban Board (cards get dynamic `#<project>` / `#global` tags for visual clarity and filtering). Writes, archives, and syncs remain strictly isolated to each board's own file and peers.
 - **Safe layering**: Personal `[theme]`, `editor`, and `device_name` are inherited from `~/.config/roke/config.toml`, while `sync.peers` are isolated to `.roke.toml` (so personal trackers never leak into a repo). For security when cloning untrusted repos, `.roke.toml` cannot override `editor` or run shell commands (`password_cmd`, `client_secret_cmd`, `token_cmd`).
 
 ### Sync backend notes
@@ -256,3 +260,7 @@ Minimal lines such as `{"title":"Buy milk"}` can also be appended directly from 
 ## The name
 
 **roke** is named after Roke, the Isle of the Wise in Ursula K. Le Guin's *Earthsea*, as it appears on her [map of the archipelago](https://www.ursulakleguin.com/maps-and-drawings) (copyright The Ursula K. Le Guin Foundation, made available under [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/)).
+
+## License
+
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.

@@ -434,9 +434,28 @@ pub fn sync_all_peers(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSlot {
+    Primary,
+    Global,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncJob {
+    pub slot: SyncSlot,
+    pub store: TaskStore,
+    pub config: SyncConfig,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncBatchOutcome {
+    pub results: Vec<(SyncSlot, SyncOutcome)>,
+}
+
 pub struct SyncManager {
-    tx: Sender<SyncOutcome>,
-    rx: Receiver<SyncOutcome>,
+    tx: Sender<SyncBatchOutcome>,
+    rx: Receiver<SyncBatchOutcome>,
     pub in_flight: bool,
 }
 
@@ -450,25 +469,38 @@ impl SyncManager {
         }
     }
 
-    pub fn trigger(
-        &mut self,
-        store: TaskStore,
-        config: SyncConfig,
-        state_dir: Option<PathBuf>,
-    ) -> bool {
-        if self.in_flight || config.peers.is_empty() {
+    pub fn trigger_batch(&mut self, jobs: Vec<SyncJob>) -> bool {
+        let active: Vec<SyncJob> = jobs
+            .into_iter()
+            .filter(|j| !j.config.peers.is_empty())
+            .collect();
+        if self.in_flight || active.is_empty() {
             return false;
         }
         self.in_flight = true;
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let outcome = sync_all_peers(store, config, state_dir);
-            let _ = tx.send(outcome);
+            let results: Vec<(SyncSlot, SyncOutcome)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = active
+                    .into_iter()
+                    .map(|job| {
+                        scope.spawn(move || {
+                            let outcome = sync_all_peers(job.store, job.config, job.state_dir);
+                            (job.slot, outcome)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("board sync thread panicked"))
+                    .collect()
+            });
+            let _ = tx.send(SyncBatchOutcome { results });
         });
         true
     }
 
-    pub fn poll(&mut self) -> Option<SyncOutcome> {
+    pub fn poll(&mut self) -> Option<SyncBatchOutcome> {
         match self.rx.try_recv() {
             Ok(outcome) => {
                 self.in_flight = false;

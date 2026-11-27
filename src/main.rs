@@ -9,7 +9,7 @@ mod sync;
 mod theme;
 mod ui;
 
-use app::App;
+use app::{App, BoardScope, DualBoard};
 use clap::Parser;
 use cli::{format_error, Cli};
 use config::AppConfig;
@@ -178,15 +178,56 @@ fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::with_config_and_paths(
-        store,
-        Some(storage_path),
-        Some(ctx.global_config_path),
-        ctx.local_config_path,
+        store.clone(),
+        Some(storage_path.clone()),
+        Some(ctx.global_config_path.clone()),
+        ctx.local_config_path.clone(),
         ctx.isolate_sync_peers,
-        cfg,
+        cfg.clone(),
     );
+
+    if ctx.isolate_sync_peers && cli.file.is_none() {
+        let global_cfg = AppConfig::load_or_default(&ctx.global_config_path).unwrap_or_default();
+        let global_dev = global_cfg.sync.effective_device_name();
+        let _ = sync::absorb_syncthing_conflicts(&ctx.global_storage_path, &global_dev);
+        let mut global_store = TaskStore::load_or_empty(&ctx.global_storage_path)
+            .unwrap_or_else(|_| TaskStore::new_empty());
+        global_store.ensure_sync_metadata(&global_dev);
+
+        let initial_scope = if cli.all_boards || cfg.merge_global {
+            BoardScope::All
+        } else {
+            BoardScope::Project
+        };
+        let proj_name = ctx
+            .project_name
+            .clone()
+            .unwrap_or_else(|| "project".to_string());
+        let dual = DualBoard::new(
+            proj_name,
+            initial_scope,
+            storage_path,
+            ctx.global_storage_path,
+            store,
+            global_store,
+            cfg.sync.clone(),
+            global_cfg.sync,
+        );
+        app.attach_dual_board(dual);
+    }
+
     let mut sync_mgr = SyncManager::new();
-    if app.sync_config.auto_sync_on_start && !app.sync_config.peers.is_empty() {
+    let should_auto_sync = if let Some(db) = &app.dual_board {
+        (matches!(db.scope, BoardScope::Project | BoardScope::All)
+            && db.project_sync_config.auto_sync_on_start
+            && !db.project_sync_config.peers.is_empty())
+            || (matches!(db.scope, BoardScope::Global | BoardScope::All)
+                && db.global_sync_config.auto_sync_on_start
+                && !db.global_sync_config.peers.is_empty())
+    } else {
+        app.sync_config.auto_sync_on_start && !app.sync_config.peers.is_empty()
+    };
+    if should_auto_sync {
         app.request_sync();
     }
 
@@ -258,16 +299,16 @@ fn run_loop(
 
         if app.sync_requested && !sync_mgr.in_flight {
             app.sync_requested = false;
-            let state_dir = sync::sync_state_dir_for(app.storage_path.as_deref());
-            if sync_mgr.trigger(app.store.clone(), app.sync_config.clone(), Some(state_dir)) {
+            let jobs = app.build_sync_jobs();
+            if sync_mgr.trigger_batch(jobs) {
                 app.syncing = true;
                 needs_draw = true;
             }
         }
 
-        if let Some(outcome) = sync_mgr.poll() {
+        if let Some(batch) = sync_mgr.poll() {
             app.syncing = false;
-            app.apply_sync_outcome(outcome);
+            app.apply_sync_batch(batch);
             needs_draw = true;
         }
 

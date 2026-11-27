@@ -142,6 +142,40 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
         x = x.saturating_add(tab2_w + 2);
     }
 
+    if let Some(board_label) = app.board_scope_label() {
+        let sep_w: u16 = 3; // "│  "
+        let pill = format!("◫ {board_label}");
+        let pill_w = pill.width() as u16;
+        if x + sep_w + pill_w < area.right() {
+            frame.render_widget(
+                Paragraph::new(Span::styled("│", Style::default().fg(theme.muted))),
+                Rect::new(x, y, 1, 1),
+            );
+            x = x.saturating_add(sep_w);
+            let rect = Rect::new(x, y, pill_w, 1);
+            app.regions.board_btn = rect;
+            let is_merged = board_label.contains('+');
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    pill,
+                    Style::default()
+                        .fg(if is_merged {
+                            theme.accent
+                        } else {
+                            theme.subtle
+                        })
+                        .add_modifier(if is_merged {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )),
+                rect,
+            );
+            x = x.saturating_add(pill_w + 2);
+        }
+    }
+
     let help_w = help_label.len() as u16;
     let add_w = add_label.len() as u16;
     let open_count = app
@@ -175,7 +209,7 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 
-    if !app.sync_config.peers.is_empty() {
+    if app.has_any_sync_peers() {
         let sync_label = if app.syncing {
             "↻ syncing"
         } else {
@@ -2280,6 +2314,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(&theme, "D / @", "Edit due date / toggle due-today focus"),
         help_row(&theme, "m / M", "Mark task / mark all or clear marks"),
         help_row(&theme, "S", "Sync with configured peers"),
+        help_row(&theme, "b", "Switch board scope (project / all / global)"),
         help_row(&theme, "d / x", "Delete task"),
         help_row(&theme, "A", "Archive all Done tasks"),
         help_row(&theme, "V", "Browse & restore archived tasks"),

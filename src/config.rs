@@ -4,6 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Optional editor command for editing Markdown task notes (overrides $VISUAL / $EDITOR).
@@ -18,6 +22,9 @@ pub struct AppConfig {
     /// Optional startup sort order ("manual", "priority", "due", "updated").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_sort: Option<String>,
+    /// When true, opening roke inside a project repo starts in merged view (project + global boards).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub merge_global: bool,
     #[serde(default)]
     pub theme: ThemeConfig,
     #[serde(default)]
@@ -389,6 +396,8 @@ struct LocalConfigOverlay {
     #[serde(default)]
     default_sort: Option<String>,
     #[serde(default)]
+    merge_global: Option<bool>,
+    #[serde(default)]
     theme: ThemeConfig,
     #[serde(default)]
     sync: Option<LocalSyncOverlay>,
@@ -464,6 +473,9 @@ impl AppConfig {
                 if let Some(v) = overlay.default_sort {
                     cfg.default_sort = Some(v);
                 }
+                if let Some(v) = overlay.merge_global {
+                    cfg.merge_global = v;
+                }
                 cfg.theme.overlay(&overlay.theme);
 
                 // Project-local config always isolates sync peers from the user's personal peers.
@@ -506,6 +518,7 @@ impl AppConfig {
             default_view: Some("todos".into()),
             default_filter: Some("all".into()),
             default_sort: Some("manual".into()),
+            merge_global: false,
             theme: ThemeConfig::default_template(),
             sync: SyncConfig {
                 device_name: Some(detect_hostname()),
