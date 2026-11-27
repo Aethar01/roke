@@ -254,20 +254,10 @@ mod tests {
         let cfg = SyncConfig {
             device_name: Some("laptop".into()),
             peers: vec![PeerConfig {
-                name: "cloud".into(),
-                kind: PeerKind::Webdav,
-                host: String::new(),
-                remote_path: None,
-                port: None,
-                identity_file: None,
                 url: Some(url),
-                list: None,
-                path: None,
                 username: Some("elliott".into()),
                 password: Some("secret".into()),
-                password_env: None,
-                password_cmd: None,
-                inject_device_tag: None,
+                ..PeerConfig::minimal("cloud", PeerKind::Webdav)
             }],
             ..SyncConfig::default()
         };

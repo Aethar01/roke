@@ -45,13 +45,17 @@ pub struct SyncConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum PeerKind {
     #[default]
     Ssh,
     Caldav,
     Webdav,
     File,
+    #[serde(alias = "google_tasks", alias = "googletasks")]
+    GoogleTasks,
+    #[serde(alias = "ms_todo", alias = "mstodo", alias = "microsoft-todo")]
+    MsTodo,
 }
 
 impl PeerKind {
@@ -61,7 +65,13 @@ impl PeerKind {
             PeerKind::Caldav => "caldav",
             PeerKind::Webdav => "webdav",
             PeerKind::File => "file",
+            PeerKind::GoogleTasks => "google-tasks",
+            PeerKind::MsTodo => "ms-todo",
         }
+    }
+
+    pub fn uses_oauth(self) -> bool {
+        matches!(self, PeerKind::GoogleTasks | PeerKind::MsTodo)
     }
 }
 
@@ -121,58 +131,138 @@ pub struct PeerConfig {
     /// Shell command whose stdout provides the password (e.g. `pass show caldav`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_cmd: Option<String>,
+    /// OAuth 2.0 client ID for kind = "ms-todo" (Azure App) or kind = "google-tasks" (Google Cloud Desktop App).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// Optional OAuth 2.0 client secret (Google Cloud Desktop OAuth client; prefer `client_secret_env` or `client_secret_cmd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// Environment variable name holding the OAuth 2.0 client secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_env: Option<String>,
+    /// Shell command whose stdout provides the OAuth 2.0 client secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_cmd: Option<String>,
+    /// Microsoft Azure AD tenant for kind = "ms-todo" (defaults to "common").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// Optional shell command whose stdout provides an OAuth Bearer access token directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cmd: Option<String>,
     /// Optional per-peer override for `sync.inject_device_tag`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_device_tag: Option<bool>,
 }
 
+fn run_secret_cmd(label: &str, cmd_str: &str) -> Result<String, String> {
+    #[cfg(windows)]
+    let output = std::process::Command::new("cmd")
+        .args(["/C", cmd_str])
+        .output();
+    #[cfg(not(windows))]
+    let output = std::process::Command::new("sh")
+        .args(["-c", cmd_str])
+        .output();
+    let output = output.map_err(|e| format!("failed to run {label}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("{label} exited with {}", output.status)
+        } else {
+            format!("{label} failed: {stderr}")
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string())
+}
+
+fn resolve_secret_triple(
+    direct: Option<&str>,
+    env_var: Option<&str>,
+    cmd: Option<&str>,
+    cmd_label: &str,
+) -> Result<Option<String>, String> {
+    if let Some(val) = direct.filter(|s| !s.is_empty()) {
+        return Ok(Some(val.to_string()));
+    }
+    if let Some(env_name) = env_var.map(str::trim).filter(|s| !s.is_empty()) {
+        return match std::env::var(env_name) {
+            Ok(val) if !val.is_empty() => Ok(Some(val)),
+            Ok(_) => Err(format!("environment variable '{env_name}' is empty")),
+            Err(_) => Err(format!("environment variable '{env_name}' is not set")),
+        };
+    }
+    if let Some(cmd_str) = cmd.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some(run_secret_cmd(cmd_label, cmd_str)?));
+    }
+    Ok(None)
+}
+
 impl PeerConfig {
     /// Resolve HTTP Basic Auth password from `password`, `password_env`, or `password_cmd`.
     pub fn resolve_password(&self) -> Result<Option<String>, String> {
-        if let Some(pw) = self.password.as_deref().filter(|s| !s.is_empty()) {
-            return Ok(Some(pw.to_string()));
-        }
-        if let Some(env_name) = self
-            .password_env
+        resolve_secret_triple(
+            self.password.as_deref(),
+            self.password_env.as_deref(),
+            self.password_cmd.as_deref(),
+            "password_cmd",
+        )
+    }
+
+    /// Resolve OAuth client secret from `client_secret`, `client_secret_env`, or `client_secret_cmd`.
+    pub fn resolve_client_secret(&self) -> Result<Option<String>, String> {
+        resolve_secret_triple(
+            self.client_secret.as_deref(),
+            self.client_secret_env.as_deref(),
+            self.client_secret_cmd.as_deref(),
+            "client_secret_cmd",
+        )
+    }
+
+    /// Resolve an externally supplied OAuth access token via `token_cmd`, if configured.
+    pub fn resolve_token_cmd(&self) -> Result<Option<String>, String> {
+        let Some(cmd) = self
+            .token_cmd
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            return match std::env::var(env_name) {
-                Ok(val) if !val.is_empty() => Ok(Some(val)),
-                Ok(_) => Err(format!("environment variable '{env_name}' is empty")),
-                Err(_) => Err(format!("environment variable '{env_name}' is not set")),
-            };
+        else {
+            return Ok(None);
+        };
+        let tok = run_secret_cmd("token_cmd", cmd)?;
+        if tok.trim().is_empty() {
+            return Err("token_cmd returned empty output".into());
         }
-        if let Some(cmd_str) = self
-            .password_cmd
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            #[cfg(windows)]
-            let output = std::process::Command::new("cmd")
-                .args(["/C", cmd_str])
-                .output();
-            #[cfg(not(windows))]
-            let output = std::process::Command::new("sh")
-                .args(["-c", cmd_str])
-                .output();
-            let output = output.map_err(|e| format!("failed to run password_cmd: {e}"))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(if stderr.is_empty() {
-                    format!("password_cmd exited with {}", output.status)
-                } else {
-                    format!("password_cmd failed: {stderr}")
-                });
-            }
-            let val = String::from_utf8_lossy(&output.stdout)
-                .trim_end_matches(['\r', '\n'])
-                .to_string();
-            return Ok(Some(val));
+        Ok(Some(tok.trim().to_string()))
+    }
+}
+
+impl PeerConfig {
+    /// Construct a minimal peer config with only `name` and `kind` populated (useful in templates/tests).
+    pub fn minimal(name: impl Into<String>, kind: PeerKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            host: String::new(),
+            remote_path: None,
+            port: None,
+            identity_file: None,
+            url: None,
+            list: None,
+            path: None,
+            username: None,
+            password: None,
+            password_env: None,
+            password_cmd: None,
+            client_id: None,
+            client_secret: None,
+            client_secret_env: None,
+            client_secret_cmd: None,
+            tenant: None,
+            token_cmd: None,
+            inject_device_tag: None,
         }
-        Ok(None)
     }
 }
 
@@ -298,52 +388,19 @@ impl AppConfig {
                 auto_sync_on_save: false,
                 peers: vec![
                     PeerConfig {
-                        name: "server".into(),
-                        kind: PeerKind::Ssh,
                         host: "user@example.com".into(),
-                        remote_path: None,
-                        port: None,
-                        identity_file: None,
-                        url: None,
-                        list: None,
-                        path: None,
-                        username: None,
-                        password: None,
-                        password_env: None,
-                        password_cmd: None,
-                        inject_device_tag: None,
+                        ..PeerConfig::minimal("server", PeerKind::Ssh)
                     },
                     PeerConfig {
-                        name: "phone".into(),
-                        kind: PeerKind::Caldav,
-                        host: String::new(),
-                        remote_path: None,
-                        port: None,
-                        identity_file: None,
                         url: Some("https://caldav.tasks.org/".into()),
                         list: Some("Default list".into()),
-                        path: None,
                         username: Some("user".into()),
-                        password: None,
                         password_env: Some("ROKE_CALDAV_PASSWORD".into()),
-                        password_cmd: None,
-                        inject_device_tag: None,
+                        ..PeerConfig::minimal("phone", PeerKind::Caldav)
                     },
                     PeerConfig {
-                        name: "syncthing".into(),
-                        kind: PeerKind::File,
-                        host: String::new(),
-                        remote_path: None,
-                        port: None,
-                        identity_file: None,
-                        url: None,
-                        list: None,
                         path: Some("~/Sync/roke/todos.jsonl".into()),
-                        username: None,
-                        password: None,
-                        password_env: None,
-                        password_cmd: None,
-                        inject_device_tag: None,
+                        ..PeerConfig::minimal("syncthing", PeerKind::File)
                     },
                 ],
             },
@@ -367,6 +424,25 @@ pub fn default_config_path() -> PathBuf {
         }
     }
     PathBuf::from("config.toml")
+}
+
+/// XDG state directory for machine-local sync cursors and OAuth tokens
+/// (`$XDG_STATE_HOME/roke` or `~/.local/state/roke`).
+pub fn default_state_dir() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        if !xdg.trim().is_empty() {
+            return PathBuf::from(xdg).join("roke");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("roke");
+        }
+    }
+    PathBuf::from(".roke-state")
 }
 
 #[cfg(test)]
@@ -439,11 +515,24 @@ password = "inline-pass"
 name = "syncthing"
 kind = "file"
 path = "~/Sync/roke/todos.jsonl"
+
+[[peers]]
+name = "microsoft"
+kind = "ms-todo"
+client_id = "azure-app-id"
+list = "Tasks"
+
+[[peers]]
+name = "google"
+kind = "google-tasks"
+client_id = "google-client-id"
+client_secret_cmd = "printf google-secret"
+list = "My Tasks"
 "#,
         )
         .unwrap();
 
-        assert_eq!(cfg.peers.len(), 4);
+        assert_eq!(cfg.peers.len(), 6);
         assert_eq!(cfg.peers[0].kind, PeerKind::Ssh);
         assert_eq!(cfg.peers[1].kind, PeerKind::Caldav);
         assert_eq!(cfg.peers[1].list.as_deref(), Some("Default list"));
@@ -460,6 +549,13 @@ path = "~/Sync/roke/todos.jsonl"
         assert_eq!(
             cfg.peers[3].path.as_deref(),
             Some("~/Sync/roke/todos.jsonl")
+        );
+        assert_eq!(cfg.peers[4].kind, PeerKind::MsTodo);
+        assert_eq!(cfg.peers[4].client_id.as_deref(), Some("azure-app-id"));
+        assert_eq!(cfg.peers[5].kind, PeerKind::GoogleTasks);
+        assert_eq!(
+            cfg.peers[5].resolve_client_secret().unwrap().as_deref(),
+            Some("google-secret")
         );
     }
 }

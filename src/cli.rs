@@ -1,4 +1,4 @@
-use crate::config::{default_config_path, AppConfig};
+use crate::config::{default_config_path, default_state_dir, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
@@ -7,6 +7,7 @@ use crate::model::{
     LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
+use crate::sync::oauth;
 use crate::theme::{to_crossterm_color, Theme};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -203,8 +204,14 @@ pub enum SubCommand {
         oneline: bool,
     },
 
-    /// Sync tasks with peers configured in config.toml (SSH, CalDAV, WebDAV, file)
+    /// Sync tasks with peers configured in config.toml (SSH, CalDAV, WebDAV, file, ms-todo, google-tasks)
     Sync,
+
+    /// Authenticate an OAuth sync peer (ms-todo or google-tasks), or list OAuth peer status
+    Auth {
+        /// Peer name from config.toml (omit to list OAuth peers and login status)
+        peer: Option<String>,
+    },
 
     /// Prune old sync tombstones from the JSONL file
     Gc {
@@ -971,6 +978,100 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
             }
             if !report.errors.is_empty() && report.synced_peers == 0 {
                 return Err(report.errors.join("; "));
+            }
+        }
+        SubCommand::Auth { peer } => {
+            let state_dir = default_state_dir();
+            if let Some(peer_name) = peer {
+                let target = cfg
+                    .sync
+                    .peers
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(peer_name))
+                    .ok_or_else(|| {
+                        let avail: Vec<&str> = cfg
+                            .sync
+                            .peers
+                            .iter()
+                            .filter(|p| p.kind.uses_oauth())
+                            .map(|p| p.name.as_str())
+                            .collect();
+                        if avail.is_empty() {
+                            format!("peer '{peer_name}' not found (no OAuth peers configured in config.toml)")
+                        } else {
+                            format!(
+                                "peer '{peer_name}' not found (OAuth peers: {})",
+                                avail.join(", ")
+                            )
+                        }
+                    })?;
+                let saved_path = oauth::authenticate_peer(target, &state_dir)?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "peer": target.name,
+                        "kind": target.kind.label(),
+                        "token_path": saved_path.display().to_string(),
+                    }))?;
+                } else {
+                    println!(
+                        "{} Authenticated {} ({}) {}",
+                        painter.badge("✓", painter.theme.done),
+                        painter.style(&target.name, painter.theme.text, true, false, false),
+                        target.kind.label(),
+                        painter.muted(&format!("→ {}", saved_path.display()))
+                    );
+                }
+            } else {
+                let oauth_peers: Vec<_> = cfg
+                    .sync
+                    .peers
+                    .iter()
+                    .filter(|p| p.kind.uses_oauth())
+                    .collect();
+                if json {
+                    let entries: Vec<_> = oauth_peers
+                        .iter()
+                        .map(|p| {
+                            let authenticated =
+                                p.token_cmd.is_some() || oauth::has_saved_tokens(&state_dir, p);
+                            serde_json::json!({
+                                "peer": p.name,
+                                "kind": p.kind.label(),
+                                "authenticated": authenticated,
+                            })
+                        })
+                        .collect();
+                    print_json(&entries)?;
+                } else if oauth_peers.is_empty() {
+                    println!(
+                        "{}",
+                        painter.muted(
+                            "No OAuth peers (ms-todo / google-tasks) configured in config.toml."
+                        )
+                    );
+                } else {
+                    for p in oauth_peers {
+                        let ok = p.token_cmd.is_some() || oauth::has_saved_tokens(&state_dir, p);
+                        let badge = if ok {
+                            painter.badge("✓", painter.theme.done)
+                        } else {
+                            painter.badge("○", painter.theme.muted)
+                        };
+                        let status = if p.token_cmd.is_some() {
+                            "token_cmd"
+                        } else if ok {
+                            "authenticated"
+                        } else {
+                            "not authenticated (run `roke auth <peer>`)"
+                        };
+                        println!(
+                            "{badge} {} ({})  {}",
+                            painter.style(&p.name, painter.theme.text, true, false, false),
+                            p.kind.label(),
+                            painter.muted(status)
+                        );
+                    }
+                }
             }
         }
         SubCommand::Gc { days } => {

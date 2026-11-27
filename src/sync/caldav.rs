@@ -555,9 +555,7 @@ pub(crate) fn pull(peer: &PeerConfig, state_dir: Option<&Path>) -> Result<CalDav
     if same_collection {
         for (uid, seen) in prev_state.seen {
             if !remote_items.contains_key(&uid) {
-                store
-                    .tombstones
-                    .insert(uid, seen.synced_at_ms.saturating_add(1));
+                store.tombstones.insert(uid, seen.synced_at_ms);
             }
         }
     }
@@ -588,6 +586,7 @@ pub(crate) fn push(
 
     // 1. PUT newly created or updated tasks
     for task in &merged.tasks {
+        let seen_ts = sync_ts.max(task.updated_at);
         if let Some(remote) = snapshot.remote_items.get(&task.uid) {
             if tasks_caldav_equal(task, &remote.task) {
                 next_seen.insert(
@@ -595,7 +594,7 @@ pub(crate) fn push(
                     SeenVtodo {
                         href: remote.href.clone(),
                         etag: remote.etag.clone(),
-                        synced_at_ms: sync_ts,
+                        synced_at_ms: seen_ts,
                     },
                 );
                 continue;
@@ -623,7 +622,7 @@ pub(crate) fn push(
                         SeenVtodo {
                             href: remote.href.clone(),
                             etag: new_etag,
-                            synced_at_ms: sync_ts,
+                            synced_at_ms: seen_ts,
                         },
                     );
                 }
@@ -657,7 +656,7 @@ pub(crate) fn push(
                         SeenVtodo {
                             href: item_url,
                             etag: new_etag,
-                            synced_at_ms: sync_ts,
+                            synced_at_ms: seen_ts,
                         },
                     );
                 }
@@ -1035,20 +1034,10 @@ mod tests {
         let cfg = SyncConfig {
             device_name: Some("laptop".into()),
             peers: vec![PeerConfig {
-                name: "tasks-org".into(),
-                kind: PeerKind::Caldav,
-                host: String::new(),
-                remote_path: None,
-                port: None,
-                identity_file: None,
                 url: Some(url),
-                list: None,
-                path: None,
                 username: Some("elliott".into()),
                 password: Some("pass".into()),
-                password_env: None,
-                password_cmd: None,
-                inject_device_tag: None,
+                ..PeerConfig::minimal("tasks-org", PeerKind::Caldav)
             }],
             ..SyncConfig::default()
         };

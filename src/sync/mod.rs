@@ -1,11 +1,14 @@
 pub mod caldav;
 pub mod file;
+pub mod google_tasks;
 pub mod http;
 pub mod ical;
+pub mod ms_todo;
+pub mod oauth;
 pub mod ssh;
 pub mod webdav;
 
-use crate::config::{normalize_device_tag, PeerConfig, PeerKind, SyncConfig};
+use crate::config::{default_state_dir, normalize_device_tag, PeerConfig, PeerKind, SyncConfig};
 use crate::model::{default_storage_path, FileLock, Task, TaskStore};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -31,6 +34,8 @@ pub(crate) struct WholeFileSnapshot {
 pub(crate) enum RemoteSnapshot {
     WholeFile(WholeFileSnapshot),
     CalDav(caldav::CalDavSnapshot),
+    MsTodo(ms_todo::MsTodoSnapshot),
+    GoogleTasks(google_tasks::GoogleTasksSnapshot),
 }
 
 impl RemoteSnapshot {
@@ -38,6 +43,8 @@ impl RemoteSnapshot {
         match self {
             RemoteSnapshot::WholeFile(wf) => wf.store.as_ref(),
             RemoteSnapshot::CalDav(cd) => Some(&cd.store),
+            RemoteSnapshot::MsTodo(ms) => Some(&ms.store),
+            RemoteSnapshot::GoogleTasks(gt) => Some(&gt.store),
         }
     }
 }
@@ -48,19 +55,27 @@ pub(crate) enum PushError {
     Other(String),
 }
 
-/// Derive a peer sync-state directory next to `storage_path` (e.g. `~/.local/share/roke/.roke-sync-state`).
+/// Derive the XDG state directory for sync cursors (`$XDG_STATE_HOME/roke` or `~/.local/state/roke`).
+/// The default global board stores cursors directly under the XDG state dir; project-local or
+/// custom boards get an isolated subdirectory under `boards/<hash>/` so Git repos and Syncthing
+/// folders are never polluted with machine-local sync state or OAuth tokens.
 pub fn sync_state_dir_for(storage_path: Option<&Path>) -> PathBuf {
-    let base_dir = storage_path
-        .and_then(Path::parent)
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| {
-            default_storage_path()
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
-    base_dir.join(".roke-sync-state")
+    let base = default_state_dir();
+    let Some(path) = storage_path else {
+        return base;
+    };
+    let default_path = default_storage_path();
+    if path == default_path {
+        return base;
+    }
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let default_resolved = fs::canonicalize(&default_path).unwrap_or(default_path);
+    if resolved == default_resolved {
+        return base;
+    }
+    let hash = oauth::sha256(resolved.to_string_lossy().as_bytes());
+    let short_hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+    base.join("boards").join(short_hex)
 }
 
 /// Detect and automatically absorb Syncthing conflict files next to `storage_path`
@@ -260,6 +275,10 @@ fn pull_peer(peer: &PeerConfig, state_dir: Option<&Path>) -> Result<RemoteSnapsh
         PeerKind::File => file::pull(peer).map(RemoteSnapshot::WholeFile),
         PeerKind::Webdav => webdav::pull(peer).map(RemoteSnapshot::WholeFile),
         PeerKind::Caldav => caldav::pull(peer, state_dir).map(RemoteSnapshot::CalDav),
+        PeerKind::MsTodo => ms_todo::pull(peer, state_dir).map(RemoteSnapshot::MsTodo),
+        PeerKind::GoogleTasks => {
+            google_tasks::pull(peer, state_dir).map(RemoteSnapshot::GoogleTasks)
+        }
     }
 }
 
@@ -267,6 +286,7 @@ fn push_peer(
     peer: &PeerConfig,
     merged: &TaskStore,
     snapshot: &RemoteSnapshot,
+    state_dir: Option<&Path>,
 ) -> Result<(), PushError> {
     match (peer.kind, snapshot) {
         (PeerKind::Ssh, RemoteSnapshot::WholeFile(wf)) => ssh::push(peer, merged, Some(&wf.token)),
@@ -277,6 +297,12 @@ fn push_peer(
             webdav::push(peer, merged, Some(&wf.token))
         }
         (PeerKind::Caldav, RemoteSnapshot::CalDav(cd)) => caldav::push(peer, merged, cd),
+        (PeerKind::MsTodo, RemoteSnapshot::MsTodo(ms)) => {
+            ms_todo::push(peer, merged, ms, state_dir)
+        }
+        (PeerKind::GoogleTasks, RemoteSnapshot::GoogleTasks(gt)) => {
+            google_tasks::push(peer, merged, gt, state_dir)
+        }
         _ => Err(PushError::Other(format!(
             "internal snapshot mismatch for peer kind {}",
             peer.kind.label()
@@ -327,7 +353,8 @@ pub fn sync_all_peers(
     }
 
     // Pass 2: Push merged store back in parallel with CAS, skipping whole-file peers already up to date.
-    // CalDAV always runs push (it skips unchanged items internally and updates its seen-UID state file).
+    // Per-item backends (CalDAV, Microsoft To Do, Google Tasks) always run push (skipping unchanged
+    // items internally and updating their seen-ID state file).
     let mut peers_to_push: Vec<(&PeerConfig, RemoteSnapshot)> = Vec::new();
     for (peer, snapshot) in reachable_peers {
         let skip_push = match &snapshot {
@@ -335,7 +362,9 @@ pub fn sync_all_peers(
                 Some(ref remote) => stores_semantically_equal(&working, remote),
                 None => working.tasks.is_empty() && working.tombstones.is_empty(),
             },
-            RemoteSnapshot::CalDav(_) => false,
+            RemoteSnapshot::CalDav(_)
+            | RemoteSnapshot::MsTodo(_)
+            | RemoteSnapshot::GoogleTasks(_) => false,
         };
         if skip_push {
             synced_peers += 1;
@@ -349,7 +378,7 @@ pub fn sync_all_peers(
         let handles: Vec<_> = peers_to_push
             .into_iter()
             .map(|(peer, snapshot)| {
-                scope.spawn(move || (peer, push_peer(peer, working_ref, &snapshot)))
+                scope.spawn(move || (peer, push_peer(peer, working_ref, &snapshot, state_dir_ref)))
             })
             .collect();
         handles
@@ -368,7 +397,7 @@ pub fn sync_all_peers(
                         if let Some(remote_store) = latest.remote_store() {
                             working = merge_stores(&working, remote_store, &local_name, &peer.name);
                         }
-                        match push_peer(peer, &working, &latest) {
+                        match push_peer(peer, &working, &latest, state_dir_ref) {
                             Ok(()) => synced_peers += 1,
                             Err(PushError::Conflict) => {
                                 errors.push(format!("{}: remote changed concurrently", peer.name));
@@ -581,5 +610,20 @@ mod tests {
         assert_eq!(merged.tasks.len(), 3);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_state_dir_uses_xdg_state_and_isolates_project_boards() {
+        let global_state = sync_state_dir_for(None);
+        assert_eq!(global_state, default_state_dir());
+
+        let default_board_state = sync_state_dir_for(Some(&default_storage_path()));
+        assert_eq!(default_board_state, default_state_dir());
+
+        let project_a = sync_state_dir_for(Some(Path::new("/tmp/project-a/.roke.jsonl")));
+        let project_b = sync_state_dir_for(Some(Path::new("/tmp/project-b/.roke.jsonl")));
+        assert!(project_a.starts_with(default_state_dir().join("boards")));
+        assert!(project_b.starts_with(default_state_dir().join("boards")));
+        assert_ne!(project_a, project_b);
     }
 }

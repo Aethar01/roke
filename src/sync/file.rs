@@ -90,20 +90,8 @@ mod tests {
 
     fn test_peer(name: &str, path: PathBuf) -> PeerConfig {
         PeerConfig {
-            name: name.into(),
-            kind: PeerKind::File,
-            host: String::new(),
-            remote_path: None,
-            port: None,
-            identity_file: None,
-            url: None,
-            list: None,
             path: Some(path.to_string_lossy().to_string()),
-            username: None,
-            password: None,
-            password_env: None,
-            password_cmd: None,
-            inject_device_tag: None,
+            ..PeerConfig::minimal(name, PeerKind::File)
         }
     }
 

@@ -4,7 +4,7 @@
 
 **A quiet todo list and Kanban board for the terminal.**
 
-Built in Rust with [Ratatui](https://ratatui.rs/) — Vim keybindings, mouse drag-and-drop, multi-tag filtering, JSONL storage, TOML theming, and multi-backend sync (SSH, CalDAV / Tasks.org, WebDAV, and Syncthing/local files).
+Built in Rust with [Ratatui](https://ratatui.rs/) — Vim keybindings, mouse drag-and-drop, multi-tag filtering, JSONL storage, TOML theming, and multi-backend sync (SSH, CalDAV / Tasks.org, Microsoft To Do, Google Tasks, WebDAV, and Syncthing/local files).
 
 </div>
 
@@ -25,7 +25,7 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 - **Interactive Markdown notes & checklists** — Task notes support full Markdown, show `[done/total]` checklist progress on cards, preview cleanly in-app with `v` (where you can toggle `- [ ]` / `- [x]` items directly with `Tab`/`Space` or click), and open in `nvim` / `$VISUAL` / `$EDITOR` via `n` in the TUI, `Ctrl-E` in the edit modal, or `roke notes <id>`.
 - **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`notes`/`move`/`done`/`rm`/`tags`/`stats`/`archive`/`unarchive`/`gc`/`sync`/`init`/`completions` (supporting multi-ID batch `move`/`done`/`rm`, `--json`, and theme-aware colours), or connect any MCP client directly with `roke mcp` (supports `--read-only`).
 - **TOML config, built-in theme presets & live reload** — Choose a built-in `[theme]` preset (`default`, `catppuccin`, `tokyo-night`, `gruvbox`, `nord`, `minimal`) or override any colour using ANSI-16 names, 256-color indices, or `#rrggbb` hex values, plus startup defaults (`default_view`, `default_filter`, `default_sort`). Edits to `config.toml` hot-reload in any open TUI.
-- **Conflict-free multi-backend parallel sync** — Two-way parallel background sync across **SSH** (`BatchMode=yes`, honoring `~/.ssh/config`), **CalDAV** (any RFC 4791 server such as Radicale, Baikal, Nextcloud, Fastmail, or iCloud for Android **Tasks.org** / iOS Reminders, losslessly preserving alarms and client-only VTODO fields), **WebDAV** (`ETag`/`If-Match` CAS), and **local/Syncthing folders** (including automatic merging of `*.sync-conflict-*.jsonl` files). Uses last-write-wins timestamps, syncable card order, and tombstones (prunable via `roke gc`), with optional `inject_device_tag`.
+- **Conflict-free multi-backend parallel sync** — Two-way parallel background sync across **SSH** (`BatchMode=yes`, honoring `~/.ssh/config`), **CalDAV** (Tasks.org Cloud, Radicale, Baikal, Nextcloud, Fastmail, iCloud), **Microsoft To Do** (Microsoft Graph + OAuth2 Device Code), **Google Tasks** (Tasks API v1 + OAuth2 PKCE, preserving local-only metadata), **WebDAV** (`ETag`/`If-Match` CAS), and **local/Syncthing folders** (auto-merging `*.sync-conflict-*.jsonl`). Sync state and OAuth tokens live cleanly under `$XDG_STATE_HOME/roke` (`~/.local/state/roke`).
 
 ## Installation
 
@@ -80,6 +80,7 @@ roke archive                             # move Done tasks to archive.jsonl
 roke archive --list                      # browse archived tasks
 roke unarchive 1                         # restore archived task(s) back to the active board
 roke gc --days 90                        # prune sync tombstones older than 90 days
+roke auth microsoft                      # sign in to Microsoft To Do (device code) or Google Tasks (PKCE)
 roke sync --json
 
 # Batch add from JSON array or JSONL on stdin
@@ -190,17 +191,34 @@ password_env = "ROKE_WEBDAV_PASSWORD"
 name = "syncthing"
 kind = "file"              # local or Syncthing/Dropbox/iCloud synced file
 path = "~/Sync/roke/todos.jsonl"
+
+[[sync.peers]]
+name = "microsoft"
+kind = "ms-todo"           # Microsoft To Do via Graph API (run `roke auth microsoft` once)
+client_id = "<azure-app-client-id>"
+# tenant = "common"        # optional (default: "common" for personal + work accounts)
+# list = "Tasks"           # optional; defaults to your default To Do list
+
+[[sync.peers]]
+name = "google"
+kind = "google-tasks"      # Google Tasks API v1 (run `roke auth google` once)
+client_id = "<google-desktop-oauth-client-id>"
+client_secret_env = "ROKE_GOOGLE_CLIENT_SECRET" # or client_secret_cmd = "..."
+# list = "My Tasks"        # optional; defaults to @default
 ```
 
 Run `roke --print-config` to see every available theme key and default value.
 
 ### Sync backend notes
 
+- **State & tokens (`$XDG_STATE_HOME/roke`)**: Machine-local sync cursors, cached discovery URLs, and OAuth refresh tokens (`0600`) live in `$XDG_STATE_HOME/roke` (`~/.local/state/roke`), keeping Git repos and Syncthing folders clean. Project-local `.roke.jsonl` boards automatically get isolated state subdirs under `boards/<hash>/`.
 - **SSH (`kind = "ssh"`, default)**: Uses non-interactive `ssh -o BatchMode=yes` with `cksum` compare-and-swap, so key-based authentication (`ssh-agent` or `~/.ssh/config`) should already work for `ssh <host>`.
-- **CalDAV (`kind = "caldav"`)**: Syncs against any RFC 4791 CalDAV server (**Tasks.org Cloud**, Radicale, Baikal, Nextcloud, Fastmail, iCloud) for native mobile apps like **Tasks.org** on Android or Reminders on iOS. Supports RFC 6764 auto-discovery (`/.well-known/caldav` → `current-user-principal` → `calendar-home-set` → `list` or first `VTODO` collection) and caches the resolved list URL. `roke` patches existing VTODOs in place so phone-only fields (`VALARM` reminders, geofences, subtasks, complex `RRULE`s) are preserved verbatim, and tracks last-seen UIDs locally (`.roke-sync-state/`) so deletions on your phone propagate cleanly instead of resurrecting. Archiving a Done task in `roke` deletes it from the CalDAV list; unarchiving pushes it back.
+- **CalDAV (`kind = "caldav"`)**: Syncs against any RFC 4791 CalDAV server (**Tasks.org Cloud**, Radicale, Baikal, Nextcloud, Fastmail, iCloud) for native mobile apps like **Tasks.org** on Android or Reminders on iOS. Supports RFC 6764 auto-discovery (`/.well-known/caldav` → `current-user-principal` → `calendar-home-set` → `list` or first `VTODO` collection) and caches the resolved list URL. `roke` patches existing VTODOs in place so phone-only fields (`VALARM` reminders, geofences, subtasks, complex `RRULE`s) are preserved verbatim, and tracks last-seen UIDs so deletions on your phone propagate cleanly. Archiving a Done task in `roke` deletes it from CalDAV; unarchiving pushes it back.
+- **Microsoft To Do (`kind = "ms-todo"`)**: Syncs title, notes, all 3 statuses (`notStarted`/`inProgress`/`completed`), priority, tags (`categories`), due dates, reminder times, and recurrence via Microsoft Graph. Authenticate once with `roke auth <peer>` (Device Code flow — works over SSH too).
+- **Google Tasks (`kind = "google-tasks"`)**: Syncs title, notes, completion state, and due dates via Google Tasks API v1. Authenticate once with `roke auth <peer>` (localhost PKCE flow). Because Google's API lacks priority, tags, `in-progress`, due times, and recurrence, `roke` preserves those local-only fields in `$XDG_STATE_HOME/roke` across remote edits.
 - **WebDAV (`kind = "webdav"`)**: Syncs a single remote `todos.jsonl` file with `ETag` / `If-Match` compare-and-swap.
 - **File / Syncthing (`kind = "file"`)**: Merges with a local synced `todos.jsonl` file using `FileLock` + `cksum` CAS. If Syncthing creates `*.sync-conflict-*.jsonl` files next to your board (either your main board or a `file` peer), `roke` automatically merges and cleans them up.
-- **Credentials**: CalDAV and WebDAV peers accept `password_env`, `password_cmd` (e.g. `pass`, `op`, `security`), or `password`.
+- **Credentials**: CalDAV/WebDAV peers accept `password_env`, `password_cmd` (e.g. `pass`, `op`, `security`), or `password`. OAuth peers use `roke auth <peer>` (or an external `token_cmd`).
 - By default (`inject_device_tag = false`), tasks from all peers merge seamlessly without extra tags. Enabling `inject_device_tag = true` (globally or per peer) dynamically injects `#<peer>` into the local UI and filters without modifying remote `tags`.
 
 ## Storage format
