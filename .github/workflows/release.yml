@@ -49,7 +49,7 @@ jobs:
           name="roke-${VERSION}-${{ matrix.target }}"
           mkdir -p "$name"
           cp "target/${{ matrix.target }}/release/roke" "$name/roke"
-          cp README.md "$name/README.md"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$name/"
           tar -czf "${name}.tar.gz" "$name"
 
       - name: Upload artifact
