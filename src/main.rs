@@ -150,6 +150,7 @@ fn main() -> io::Result<()> {
     }
 
     let storage_path = cli.storage_path();
+    let _ = sync::absorb_syncthing_conflicts(&storage_path, &cfg.sync.effective_device_name());
     let mut store = match TaskStore::load_or_init(&storage_path) {
         Ok(store) => store,
         Err(err) => {
@@ -248,7 +249,8 @@ fn run_loop(
 
         if app.sync_requested && !sync_mgr.in_flight {
             app.sync_requested = false;
-            if sync_mgr.trigger(app.store.clone(), app.sync_config.clone()) {
+            let state_dir = sync::sync_state_dir_for(app.storage_path.as_deref());
+            if sync_mgr.trigger(app.store.clone(), app.sync_config.clone(), Some(state_dir)) {
                 app.syncing = true;
                 needs_draw = true;
             }

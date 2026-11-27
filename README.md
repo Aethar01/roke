@@ -4,7 +4,7 @@
 
 **A quiet todo list and Kanban board for the terminal.**
 
-Built in Rust with [Ratatui](https://ratatui.rs/) — Vim keybindings, mouse drag-and-drop, multi-tag filtering, JSONL storage, TOML theming, and peer-to-peer SSH sync.
+Built in Rust with [Ratatui](https://ratatui.rs/) — Vim keybindings, mouse drag-and-drop, multi-tag filtering, JSONL storage, TOML theming, and multi-backend sync (SSH, CalDAV / Tasks.org, WebDAV, and Syncthing/local files).
 
 </div>
 
@@ -20,12 +20,12 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 
 - **Two views, one store** — Switch seamlessly between a **Todo List** (`All`, `To Do`, `In Progress`, `Done`) and a three-column **Kanban Board** (`Tab`, `gt`, `1`/`2`, or click the header tabs).
 - **Vim-first, mouse-friendly** — Navigate with `h`/`j`/`k`/`l`, `gg`/`G`, quick-add with `Q`, move cards across columns with `H`/`L` or `<`/`>`, reorder with `J`/`K`, sort with `O`, yank with `y`/`Y`, undo/redo with `u`/`Ctrl-R`, archive/restore with `A`/`V`, and search live with `/`. Click tabs, filters, checkboxes (`○`/`◐`/`✓`), double-click cards to edit, scroll with the wheel, and drag-and-drop cards to reorder or move across Kanban columns.
-- **Zero-clutter multi-tag filtering, natural due dates & recurrence** — Tag tasks (`work, personal`), set due dates (`YYYY-MM-DD`, `today`, `tomorrow`, `+3d`, `+2w`, `fri`, `eow`, `eom`) with local-time overdue highlighting and recurrence (`daily`, `weekdays`, `weekly`, `monthly`, `every 3d`), filter by multiple tags via clicks or the scrollable `t` picker, and toggle between `and` and `or`. Tags, due dates, and repeat rules tuck quietly into card bottom borders.
+- **Zero-clutter multi-tag filtering, natural due dates/times & recurrence** — Tag tasks (`work, personal`), set due dates and optional local times (`YYYY-MM-DD`, `today`, `tomorrow@14:30`, `+3d`, `+2w`, `fri 9:30am`, `eow`, `eom`) with local-time overdue highlighting and recurrence (`daily`, `weekdays`, `weekly`, `monthly`, `every 3d`), filter by multiple tags via clicks or the scrollable `t` picker, and toggle between `and` and `or`. Tags, due dates, and repeat rules tuck quietly into card bottom borders.
 - **Plain JSONL storage, project-local boards & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), or auto-discovered from a project-local `.roke.jsonl` (`roke init`), one compact JSON object per line with atomic locked saves. The TUI watches both `todos.jsonl` and `config.toml` and reloads live.
 - **Interactive Markdown notes & checklists** — Task notes support full Markdown, show `[done/total]` checklist progress on cards, preview cleanly in-app with `v` (where you can toggle `- [ ]` / `- [x]` items directly with `Tab`/`Space` or click), and open in `nvim` / `$VISUAL` / `$EDITOR` via `n` in the TUI, `Ctrl-E` in the edit modal, or `roke notes <id>`.
 - **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`notes`/`move`/`done`/`rm`/`tags`/`stats`/`archive`/`unarchive`/`gc`/`sync`/`init`/`completions` (supporting multi-ID batch `move`/`done`/`rm`, `--json`, and theme-aware colours), or connect any MCP client directly with `roke mcp` (supports `--read-only`).
 - **TOML config, built-in theme presets & live reload** — Choose a built-in `[theme]` preset (`default`, `catppuccin`, `tokyo-night`, `gruvbox`, `nord`, `minimal`) or override any colour using ANSI-16 names, 256-color indices, or `#rrggbb` hex values, plus startup defaults (`default_view`, `default_filter`, `default_sort`). Edits to `config.toml` hot-reload in any open TUI.
-- **Conflict-free parallel SSH sync** — Two-way parallel background sync over system `ssh` (`BatchMode=yes`, honoring `~/.ssh/config`) using last-write-wins timestamps, syncable card order, and tombstones (prunable via `roke gc`). Works across `bash`, `zsh`, `sh`, and `fish` login shells, with an optional `inject_device_tag` setting to dynamically tag tasks with the machine they came from.
+- **Conflict-free multi-backend parallel sync** — Two-way parallel background sync across **SSH** (`BatchMode=yes`, honoring `~/.ssh/config`), **CalDAV** (any RFC 4791 server such as Radicale, Baikal, Nextcloud, Fastmail, or iCloud for Android **Tasks.org** / iOS Reminders, losslessly preserving alarms and client-only VTODO fields), **WebDAV** (`ETag`/`If-Match` CAS), and **local/Syncthing folders** (including automatic merging of `*.sync-conflict-*.jsonl` files). Uses last-write-wins timestamps, syncable card order, and tombstones (prunable via `roke gc`), with optional `inject_device_tag`.
 
 ## Installation
 
@@ -124,7 +124,7 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 | `t` / `T` | Multi-tag filter picker / edit tags on selected task |
 | `D` / `@` | Edit due date / toggle due-today & overdue focus |
 | `m` / `M` | Mark task / mark all visible or clear marks (batch `Space`/`H`/`L`/`p`/`d`/`y`) |
-| `S` | Sync now via SSH |
+| `S` | Sync with configured peers |
 | `d` / `x` | Delete selected (or marked) task(s) |
 | `A` / `V` | Archive all Done tasks / Browse & restore archive |
 | `y` / `Y` | Yank title (or notes in preview) / Yank full task as Markdown |
@@ -164,19 +164,44 @@ auto_sync_on_save = false  # sync in the background after every edit
 
 [[sync.peers]]
 name = "server"
+kind = "ssh"               # default; can be omitted
 host = "server"            # user@host or an alias from ~/.ssh/config
 # remote_path = "~/.local/share/roke/todos.jsonl"
 # port = 22
 # identity_file = "~/.ssh/id_ed25519"
 # inject_device_tag = true # optional per-peer override
+
+[[sync.peers]]
+name = "phone"
+kind = "caldav"            # works with Tasks.org Cloud, Radicale, Baikal, Nextcloud, Fastmail, etc.
+url = "https://caldav.tasks.org/"  # server root, home-set, or direct list URL (auto-discovered)
+list = "Default list"              # optional; defaults to first VTODO list
+username = "user"
+password_env = "ROKE_CALDAV_PASSWORD" # or password_cmd = "pass show caldav"
+
+[[sync.peers]]
+name = "cloud"
+kind = "webdav"            # single todos.jsonl file over HTTP WebDAV with ETag CAS
+url = "https://dav.example.com/roke/todos.jsonl"
+username = "user"
+password_env = "ROKE_WEBDAV_PASSWORD"
+
+[[sync.peers]]
+name = "syncthing"
+kind = "file"              # local or Syncthing/Dropbox/iCloud synced file
+path = "~/Sync/roke/todos.jsonl"
 ```
 
 Run `roke --print-config` to see every available theme key and default value.
 
-### SSH sync notes
+### Sync backend notes
 
-- Sync uses non-interactive `ssh -o BatchMode=yes`, so key-based authentication (`ssh-agent` or an unencrypted key in `~/.ssh/config`) should already work for `ssh <host>`.
-- By default (`inject_device_tag = false`), tasks from all machines merge seamlessly without extra tags. Enabling `inject_device_tag = true` (globally or per peer) dynamically injects `#<peer>` into the local UI and filters without modifying the remote file's stored `tags`.
+- **SSH (`kind = "ssh"`, default)**: Uses non-interactive `ssh -o BatchMode=yes` with `cksum` compare-and-swap, so key-based authentication (`ssh-agent` or `~/.ssh/config`) should already work for `ssh <host>`.
+- **CalDAV (`kind = "caldav"`)**: Syncs against any RFC 4791 CalDAV server (**Tasks.org Cloud**, Radicale, Baikal, Nextcloud, Fastmail, iCloud) for native mobile apps like **Tasks.org** on Android or Reminders on iOS. Supports RFC 6764 auto-discovery (`/.well-known/caldav` → `current-user-principal` → `calendar-home-set` → `list` or first `VTODO` collection) and caches the resolved list URL. `roke` patches existing VTODOs in place so phone-only fields (`VALARM` reminders, geofences, subtasks, complex `RRULE`s) are preserved verbatim, and tracks last-seen UIDs locally (`.roke-sync-state/`) so deletions on your phone propagate cleanly instead of resurrecting. Archiving a Done task in `roke` deletes it from the CalDAV list; unarchiving pushes it back.
+- **WebDAV (`kind = "webdav"`)**: Syncs a single remote `todos.jsonl` file with `ETag` / `If-Match` compare-and-swap.
+- **File / Syncthing (`kind = "file"`)**: Merges with a local synced `todos.jsonl` file using `FileLock` + `cksum` CAS. If Syncthing creates `*.sync-conflict-*.jsonl` files next to your board (either your main board or a `file` peer), `roke` automatically merges and cleans them up.
+- **Credentials**: CalDAV and WebDAV peers accept `password_env`, `password_cmd` (e.g. `pass`, `op`, `security`), or `password`.
+- By default (`inject_device_tag = false`), tasks from all peers merge seamlessly without extra tags. Enabling `inject_device_tag = true` (globally or per peer) dynamically injects `#<peer>` into the local UI and filters without modifying remote `tags`.
 
 ## Storage format
 

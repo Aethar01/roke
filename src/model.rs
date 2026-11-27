@@ -226,6 +226,112 @@ fn parse_weekday_name(s: &str) -> Option<i64> {
     }
 }
 
+/// Validate and normalize a local time of day (`HH:MM`, `H:MM`, `9am`, `2:30pm`) to 24-hour `HH:MM`.
+pub fn parse_due_time(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err("due time cannot be empty".into());
+    }
+    let (meridiem, core) = if let Some(s) = trimmed.strip_suffix("am") {
+        (Some("am"), s.trim())
+    } else if let Some(s) = trimmed.strip_suffix("pm") {
+        (Some("pm"), s.trim())
+    } else {
+        (None, trimmed.as_str())
+    };
+
+    let (hour_raw, minute) = if let Some((h_str, m_str)) = core.split_once(':') {
+        let h: u32 = h_str.parse().map_err(|_| {
+            format!("invalid due time '{raw}' (expected HH:MM, e.g. 14:30 or 2:30pm)")
+        })?;
+        if m_str.len() != 2 {
+            return Err(format!(
+                "invalid due time '{raw}' (expected HH:MM, e.g. 14:30 or 2:30pm)"
+            ));
+        }
+        let m: u32 = m_str.parse().map_err(|_| {
+            format!("invalid due time '{raw}' (expected HH:MM, e.g. 14:30 or 2:30pm)")
+        })?;
+        (h, m)
+    } else if meridiem.is_some() {
+        let h: u32 = core.parse().map_err(|_| {
+            format!("invalid due time '{raw}' (expected HH:MM, e.g. 14:30 or 2:30pm)")
+        })?;
+        (h, 0)
+    } else {
+        return Err(format!(
+            "invalid due time '{raw}' (expected HH:MM, e.g. 14:30 or 2:30pm)"
+        ));
+    };
+
+    if minute > 59 {
+        return Err(format!("invalid due time '{raw}' (minute must be 00..59)"));
+    }
+
+    let hour = match meridiem {
+        Some("am") => {
+            if !(1..=12).contains(&hour_raw) {
+                return Err(format!("invalid due time '{raw}' (12-hour clock is 1..12)"));
+            }
+            if hour_raw == 12 {
+                0
+            } else {
+                hour_raw
+            }
+        }
+        Some("pm") => {
+            if !(1..=12).contains(&hour_raw) {
+                return Err(format!("invalid due time '{raw}' (12-hour clock is 1..12)"));
+            }
+            if hour_raw == 12 {
+                12
+            } else {
+                hour_raw + 12
+            }
+        }
+        _ => {
+            if hour_raw > 23 {
+                return Err(format!("invalid due time '{raw}' (hour must be 00..23)"));
+            }
+            hour_raw
+        }
+    };
+
+    Ok(format!("{hour:02}:{minute:02}"))
+}
+
+/// Validate and normalize a due date with an optional time (`YYYY-MM-DD`, `YYYY-MM-DD HH:MM`,
+/// `YYYY-MM-DDTHH:MM`, `tomorrow@14:30`, `fri 9:30am`, etc.).
+pub fn parse_due_spec(raw: &str) -> Result<(String, Option<String>), String> {
+    parse_due_spec_from(raw, local_today_ymd_tuple())
+}
+
+pub(crate) fn parse_due_spec_from(
+    raw: &str,
+    base: (i64, u32, u32),
+) -> Result<(String, Option<String>), String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("due date cannot be empty".into());
+    }
+    if let Some((date_part, time_part)) = trimmed.split_once('@') {
+        let date = parse_due_date_from(date_part, base)?;
+        let time = parse_due_time(time_part)?;
+        return Ok((date, Some(time)));
+    }
+    if let Some((date_part, time_part)) = trimmed.split_once(' ') {
+        let date = parse_due_date_from(date_part, base)?;
+        let time = parse_due_time(time_part)?;
+        return Ok((date, Some(time)));
+    }
+    if trimmed.len() > 10 && matches!(trimmed.as_bytes()[10], b'T' | b't') {
+        let date = parse_due_date_from(&trimmed[..10], base)?;
+        let time = parse_due_time(&trimmed[11..])?;
+        return Ok((date, Some(time)));
+    }
+    Ok((parse_due_date_from(trimmed, base)?, None))
+}
+
 /// Validate and normalize a due date (`YYYY-MM-DD`, `today`, `tomorrow`, `+3d`, `+2w`, `+1m`, `mon`..`sun`, `eow`, `eom`).
 pub fn parse_due_date(raw: &str) -> Result<String, String> {
     parse_due_date_from(raw, local_today_ymd_tuple())
@@ -587,6 +693,20 @@ fn priority_rank(p: Priority) -> u8 {
     }
 }
 
+fn cmp_due(a: &Task, b: &Task) -> std::cmp::Ordering {
+    match (&a.due, &b.due) {
+        (Some(da), Some(db)) => da.cmp(db).then_with(|| match (&a.due_time, &b.due_time) {
+            (Some(ta), Some(tb)) => ta.cmp(tb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 pub fn sort_task_refs(tasks: &mut [&Task], sort: SortOrder) {
     match sort {
         SortOrder::Manual => {}
@@ -594,22 +714,13 @@ pub fn sort_task_refs(tasks: &mut [&Task], sort: SortOrder) {
             tasks.sort_by(|a, b| {
                 priority_rank(a.priority)
                     .cmp(&priority_rank(b.priority))
-                    .then_with(|| match (&a.due, &b.due) {
-                        (Some(da), Some(db)) => da.cmp(db),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => std::cmp::Ordering::Equal,
-                    })
+                    .then_with(|| cmp_due(a, b))
             });
         }
         SortOrder::Due => {
-            tasks.sort_by(|a, b| match (&a.due, &b.due) {
-                (Some(da), Some(db)) => da
-                    .cmp(db)
-                    .then_with(|| priority_rank(a.priority).cmp(&priority_rank(b.priority))),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => priority_rank(a.priority).cmp(&priority_rank(b.priority)),
+            tasks.sort_by(|a, b| {
+                cmp_due(a, b)
+                    .then_with(|| priority_rank(a.priority).cmp(&priority_rank(b.priority)))
             });
         }
         SortOrder::Updated => {
@@ -625,22 +736,13 @@ pub fn sort_tasks(tasks: &mut [Task], sort: SortOrder) {
             tasks.sort_by(|a, b| {
                 priority_rank(a.priority)
                     .cmp(&priority_rank(b.priority))
-                    .then_with(|| match (&a.due, &b.due) {
-                        (Some(da), Some(db)) => da.cmp(db),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => std::cmp::Ordering::Equal,
-                    })
+                    .then_with(|| cmp_due(a, b))
             });
         }
         SortOrder::Due => {
-            tasks.sort_by(|a, b| match (&a.due, &b.due) {
-                (Some(da), Some(db)) => da
-                    .cmp(db)
-                    .then_with(|| priority_rank(a.priority).cmp(&priority_rank(b.priority))),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => priority_rank(a.priority).cmp(&priority_rank(b.priority)),
+            tasks.sort_by(|a, b| {
+                cmp_due(a, b)
+                    .then_with(|| priority_rank(a.priority).cmp(&priority_rank(b.priority)))
             });
         }
         SortOrder::Updated => {
@@ -667,9 +769,13 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
     #[serde(default)]
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -698,6 +804,27 @@ impl Task {
         };
     }
 
+    /// Update status and keep `completed_at` in sync (`Some(now)` on Done, `None` otherwise).
+    pub fn set_status(&mut self, status: Status) {
+        self.status = status;
+        if status == Status::Done {
+            if self.completed_at.is_none() {
+                self.completed_at = Some(now_millis());
+            }
+        } else {
+            self.completed_at = None;
+        }
+    }
+
+    /// Formatted due label combining `due` and optional `due_time` (e.g. `2026-12-01 14:30`).
+    pub fn due_display(&self) -> Option<String> {
+        let due = self.due.as_deref()?;
+        match self.due_time.as_deref() {
+            Some(t) if !t.is_empty() => Some(format!("{due} {t}")),
+            _ => Some(due.to_string()),
+        }
+    }
+
     pub fn due_state(&self, today: &str) -> Option<DueState> {
         let due = self.due.as_deref()?;
         if self.status == Status::Done {
@@ -717,6 +844,7 @@ impl Task {
         let next_due = next_due_for_repeat(self.due.as_deref(), &rep, local_today_ymd_tuple());
         self.due = Some(next_due.clone());
         self.status = Status::Todo;
+        self.completed_at = None;
         self.touch();
         Some(next_due)
     }
@@ -801,15 +929,17 @@ pub struct QuickAddParsed {
     pub priority: Option<Priority>,
     pub tags: Vec<String>,
     pub due: Option<String>,
+    pub due_time: Option<String>,
     pub repeat: Option<String>,
 }
 
-/// Parse quick-add shorthand: `Ship release #ops #release !high @tomorrow ~weekly`.
+/// Parse quick-add shorthand: `Ship release #ops #release !high @tomorrow@14:30 ~weekly`.
 pub fn parse_quick_add(raw: &str) -> Result<QuickAddParsed, String> {
     let mut title_parts: Vec<&str> = Vec::new();
     let mut priority: Option<Priority> = None;
     let mut tags: Vec<String> = Vec::new();
     let mut due: Option<String> = None;
+    let mut due_time: Option<String> = None;
     let mut repeat: Option<String> = None;
 
     for token in raw.split_whitespace() {
@@ -829,7 +959,9 @@ pub fn parse_quick_add(raw: &str) -> Result<QuickAddParsed, String> {
             }
         } else if let Some(due_raw) = token.strip_prefix('@') {
             if !due_raw.is_empty() {
-                due = Some(parse_due_date(due_raw)?);
+                let (d, t) = parse_due_spec(due_raw)?;
+                due = Some(d);
+                due_time = t;
                 continue;
             }
         } else if let Some(rep_raw) = token.strip_prefix('~') {
@@ -850,6 +982,7 @@ pub fn parse_quick_add(raw: &str) -> Result<QuickAddParsed, String> {
         priority,
         tags,
         due,
+        due_time,
         repeat,
     })
 }
@@ -1029,8 +1162,10 @@ impl TaskStore {
             priority,
             tags,
             due: None,
+            due_time: None,
             repeat: None,
             created_at: Some(now),
+            completed_at: (status == Status::Done).then_some(now),
             updated_at: now,
             origin: origin_opt,
             order: next_order,
@@ -1558,6 +1693,40 @@ mod tests {
             store.get(id).unwrap().due_state("2025-12-31"),
             Some(DueState::Upcoming)
         );
+
+        // Due time parsing & combined specs
+        assert_eq!(parse_due_time("9:30").unwrap(), "09:30");
+        assert_eq!(parse_due_time("14:30").unwrap(), "14:30");
+        assert_eq!(parse_due_time("2:15pm").unwrap(), "14:15");
+        assert_eq!(parse_due_time("12am").unwrap(), "00:00");
+        assert_eq!(parse_due_time("12pm").unwrap(), "12:00");
+        assert!(parse_due_time("25:00").is_err());
+
+        assert_eq!(
+            parse_due_spec_from("tomorrow@14:30", base).unwrap(),
+            ("2026-11-27".into(), Some("14:30".into()))
+        );
+        assert_eq!(
+            parse_due_spec_from("2026-12-01 9:05am", base).unwrap(),
+            ("2026-12-01".into(), Some("09:05".into()))
+        );
+        assert_eq!(
+            parse_due_spec_from("2026-12-01T18:00", base).unwrap(),
+            ("2026-12-01".into(), Some("18:00".into()))
+        );
+
+        let qa = parse_quick_add("Dentist #health @2026-12-01@14:30 !high").unwrap();
+        assert_eq!(qa.title, "Dentist");
+        assert_eq!(qa.due.as_deref(), Some("2026-12-01"));
+        assert_eq!(qa.due_time.as_deref(), Some("14:30"));
+
+        // Status transitions keep completed_at consistent
+        let task = store.get_mut(id).unwrap();
+        assert!(task.completed_at.is_none());
+        task.set_status(Status::Done);
+        assert!(task.completed_at.is_some());
+        task.set_status(Status::InProgress);
+        assert!(task.completed_at.is_none());
     }
 
     #[test]

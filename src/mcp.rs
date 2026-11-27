@@ -291,6 +291,7 @@ impl McpServer {
         };
         let tags = optional_tags(args, "tags")?;
         let due = optional_str(args, "due")?.map(str::to_string);
+        let due_time = optional_str(args, "due_time")?.map(str::to_string);
         let repeat = optional_str(args, "repeat")?.map(str::to_string);
         let origin = optional_str(args, "origin")?.map(str::to_string);
         Ok(AddTaskInput {
@@ -300,6 +301,7 @@ impl McpServer {
             priority,
             tags,
             due,
+            due_time,
             repeat,
             origin,
         })
@@ -377,6 +379,15 @@ impl McpServer {
             Some(Value::String(s)) => Some(Some(s.clone())),
             Some(_) => return Err("argument 'due' must be a date string or null".into()),
         };
+        let due_time = match args.get("due_time") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(s)) if s.trim().is_empty() => Some(None),
+            Some(Value::String(s)) => Some(Some(s.clone())),
+            Some(_) => {
+                return Err("argument 'due_time' must be a time string (HH:MM) or null".into())
+            }
+        };
         let repeat = match args.get("repeat") {
             None => None,
             Some(Value::Null) => Some(None),
@@ -398,6 +409,7 @@ impl McpServer {
                 add_tags,
                 remove_tags,
                 due,
+                due_time,
                 repeat,
             },
         )?;
@@ -667,7 +679,11 @@ fn tool_definitions(read_only: bool) -> Value {
                 },
                 "due": {
                     "type": "string",
-                    "description": "Optional due date (YYYY-MM-DD, 'today', 'tomorrow', '+3d', '+2w', 'fri', 'eow', 'eom')."
+                    "description": "Optional due date (YYYY-MM-DD, 'today', 'tomorrow', '+3d', '+2w', 'fri', 'eow', 'eom', or with time like 'tomorrow 14:30')."
+                },
+                "due_time": {
+                    "type": "string",
+                    "description": "Optional local due time ('HH:MM', '9am', '2:30pm')."
                 },
                 "repeat": {
                     "type": "string",
@@ -767,7 +783,11 @@ fn tool_definitions(read_only: bool) -> Value {
                     },
                     "due": {
                         "type": ["string", "null"],
-                        "description": "Set due date (YYYY-MM-DD, 'today', 'tomorrow', '+3d', 'fri', etc.), or pass '' / null to clear."
+                        "description": "Set due date (YYYY-MM-DD, 'today', 'tomorrow', '+3d', 'fri', or with time like 'tomorrow 14:30'), or pass '' / null to clear."
+                    },
+                    "due_time": {
+                        "type": ["string", "null"],
+                        "description": "Set local due time ('HH:MM', '9am', '2:30pm'), or pass '' / null to clear."
                     },
                     "repeat": {
                         "type": ["string", "null"],

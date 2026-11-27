@@ -2,10 +2,10 @@ use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::editor::editor_display_name;
 use crate::model::{
     append_tasks_to_archive, archive_path_for, file_stamp, format_tags, matches_search_query,
-    now_millis, parse_due_date, parse_quick_add, parse_repeat, parse_tags, sort_task_refs,
+    now_millis, parse_due_spec, parse_quick_add, parse_repeat, parse_tags, sort_task_refs,
     today_ymd, DueState, FileLock, FileStamp, Priority, SortOrder, Status, Task, TaskStore,
 };
-use crate::sync::{merge_stores, SyncOutcome};
+use crate::sync::{absorb_syncthing_conflicts, merge_stores, SyncOutcome};
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -302,7 +302,7 @@ impl TaskForm {
             title: TextInput::new(task.title.clone()),
             description: TextInput::new(task.description.clone()),
             tags: TextInput::new(format_tags(&task.tags)),
-            due: TextInput::new(task.due.clone().unwrap_or_default()),
+            due: TextInput::new(task.due_display().unwrap_or_default()),
             repeat: TextInput::new(task.repeat.clone().unwrap_or_default()),
             status: task.status,
             priority: task.priority,
@@ -883,14 +883,15 @@ impl App {
         let Some(path) = self.storage_path.clone() else {
             return false;
         };
+        let local_name = self.sync_config.effective_device_name();
+        let absorbed = absorb_syncthing_conflicts(&path, &local_name).unwrap_or(0);
         let current_stamp = file_stamp(&path);
-        if current_stamp.is_none() || current_stamp == self.last_file_stamp {
+        if absorbed == 0 && (current_stamp.is_none() || current_stamp == self.last_file_stamp) {
             return false;
         }
         let Ok(mut disk_store) = TaskStore::load_or_empty(&path) else {
             return false;
         };
-        let local_name = self.sync_config.effective_device_name();
         disk_store.ensure_sync_metadata(&local_name);
 
         let selected_uid = self
@@ -949,7 +950,7 @@ impl App {
 
     pub fn request_sync(&mut self) {
         if self.sync_config.peers.is_empty() {
-            self.set_message("No SSH peers configured in config.toml");
+            self.set_message("No sync peers configured in config.toml");
             return;
         }
         if self.syncing {
@@ -957,7 +958,7 @@ impl App {
             return;
         }
         self.sync_requested = true;
-        self.set_message("Syncing via SSH…");
+        self.set_message("Syncing…");
     }
 
     pub fn apply_sync_outcome(&mut self, outcome: SyncOutcome) {
@@ -1348,6 +1349,7 @@ impl App {
                     );
                     if let Some(task) = self.store.get_mut(id) {
                         task.due = parsed.due;
+                        task.due_time = parsed.due_time;
                         task.repeat = parsed.repeat;
                     }
                     self.persist();
@@ -1583,10 +1585,11 @@ impl App {
         };
         let tags = parse_tags(&form.tags.value);
         let due_raw = form.due.value.trim();
-        let due = if due_raw.is_empty() {
-            None
+        let (due, due_time) = if due_raw.is_empty() {
+            (None, None)
         } else {
-            Some(parse_due_date(due_raw)?)
+            let (d, t) = parse_due_spec(due_raw)?;
+            (Some(d), t)
         };
         let repeat_raw = form.repeat.value.trim();
         let repeat = if repeat_raw.is_empty() {
@@ -1600,10 +1603,11 @@ impl App {
             if let Some(task) = self.store.get_mut(id) {
                 task.title = title;
                 task.description = description;
-                task.status = form.status;
+                task.set_status(form.status);
                 task.priority = form.priority;
                 task.tags = tags;
                 task.due = due;
+                task.due_time = due_time;
                 task.repeat = repeat;
                 task.touch();
             }
@@ -1621,6 +1625,7 @@ impl App {
             );
             if let Some(task) = self.store.get_mut(id) {
                 task.due = due;
+                task.due_time = due_time;
                 task.repeat = repeat;
             }
             self.set_message("Task added");
@@ -2027,7 +2032,7 @@ impl App {
             if next_status == Status::Done && task.repeat.is_some() {
                 rolled_due = task.complete_if_recurring();
             } else {
-                task.status = next_status;
+                task.set_status(next_status);
                 task.touch();
             }
         }
@@ -2080,7 +2085,7 @@ impl App {
                 if target == Status::Done && task.repeat.is_some() {
                     task.complete_if_recurring();
                 } else {
-                    task.status = target;
+                    task.set_status(target);
                     task.touch();
                 }
             }
@@ -2109,7 +2114,7 @@ impl App {
                     if next == Status::Done && task.repeat.is_some() {
                         task.complete_if_recurring();
                     } else {
-                        task.status = next;
+                        task.set_status(next);
                         task.touch();
                     }
                 }
@@ -2159,7 +2164,7 @@ impl App {
                             if next_status == Status::Done && task.repeat.is_some() {
                                 task.complete_if_recurring();
                             } else {
-                                task.status = next_status;
+                                task.set_status(next_status);
                                 task.touch();
                             }
                             moved += 1;
@@ -2197,7 +2202,7 @@ impl App {
             if target == Status::Done && task.repeat.is_some() {
                 rolled_due = task.complete_if_recurring();
             } else {
-                task.status = target;
+                task.set_status(target);
                 task.touch();
             }
         }
@@ -2368,7 +2373,11 @@ impl App {
             }
         }
         if let Some(due) = &task.due {
-            out.push_str(&format!(" @{due}"));
+            if let Some(t) = &task.due_time {
+                out.push_str(&format!(" @{due}@{t}"));
+            } else {
+                out.push_str(&format!(" @{due}"));
+            }
         }
         if !task.description.trim().is_empty() {
             out.push('\n');
@@ -2993,7 +3002,7 @@ impl App {
                         if target == Status::Done && task.repeat.is_some() {
                             rolled_due = task.complete_if_recurring();
                         } else {
-                            task.status = target;
+                            task.set_status(target);
                             task.touch();
                         }
                     }

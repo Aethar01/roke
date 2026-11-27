@@ -889,7 +889,7 @@ fn render_todo_card(
     }
 
     if !tags.is_empty() && rect.height >= 3 {
-        let reserve_due = task.due.as_ref().map(|d| d.len() + 3).unwrap_or(0);
+        let reserve_due = task.due_display().map(|d| d.len() + 3).unwrap_or(0);
         let max_w = (rect.width.saturating_sub(4) as usize).saturating_sub(reserve_due);
         if let Some(line) = tags_border_line(theme, tags, active_tags, max_w) {
             block = block.title_bottom(line);
@@ -1221,7 +1221,7 @@ fn render_kanban_card(
     }
 
     if !tags.is_empty() && rect.height >= 3 {
-        let reserve_due = task.due.as_ref().map(|d| d.len() + 3).unwrap_or(0);
+        let reserve_due = task.due_display().map(|d| d.len() + 3).unwrap_or(0);
         let max_w = (rect.width.saturating_sub(4) as usize).saturating_sub(reserve_due);
         if let Some(line) = tags_border_line(theme, tags, active_tags, max_w) {
             block = block.title_bottom(line);
@@ -1928,7 +1928,7 @@ fn render_notes_preview_modal(
                 Style::default().fg(theme.accent),
             ));
         }
-        if let Some(due) = &task.due {
+        if let Some(due) = task.due_display() {
             if !meta_spans.is_empty() {
                 meta_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
             }
@@ -2279,7 +2279,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(&theme, "t / T", "Filter tags / edit tags"),
         help_row(&theme, "D / @", "Edit due date / toggle due-today focus"),
         help_row(&theme, "m / M", "Mark task / mark all or clear marks"),
-        help_row(&theme, "S", "Sync via SSH"),
+        help_row(&theme, "S", "Sync with configured peers"),
         help_row(&theme, "d / x", "Delete task"),
         help_row(&theme, "A", "Archive all Done tasks"),
         help_row(&theme, "V", "Browse & restore archived tasks"),
@@ -2577,7 +2577,8 @@ fn due_border_line(theme: &Theme, task: &Task) -> Option<Line<'static>> {
         Some(DueState::Today) => Style::default().fg(theme.in_progress),
         _ => Style::default().fg(theme.muted),
     };
-    let text = match (&task.due, &task.repeat) {
+    let due_disp = task.due_display();
+    let text = match (due_disp.as_deref(), task.repeat.as_deref()) {
         (Some(due), Some(rep)) => format!(" {due} ↻ {rep} "),
         (Some(due), None) => format!(" {due} "),
         (None, Some(rep)) => format!(" ↻ {rep} "),

@@ -1,10 +1,10 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::model::{
-    append_tasks_to_archive, archive_path_for, matches_search_query, now_millis, parse_due_date,
-    parse_repeat, parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority, SortOrder,
-    Status, Task, TaskStore,
+    append_tasks_to_archive, archive_path_for, matches_search_query, now_millis, parse_due_spec,
+    parse_due_time, parse_repeat, parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority,
+    SortOrder, Status, Task, TaskStore,
 };
-use crate::sync::{merge_stores, sync_all_peers};
+use crate::sync::{absorb_syncthing_conflicts, merge_stores, sync_all_peers, sync_state_dir_for};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -42,6 +42,7 @@ pub struct AddTaskInput {
     pub priority: Priority,
     pub tags: Vec<String>,
     pub due: Option<String>,
+    pub due_time: Option<String>,
     pub repeat: Option<String>,
     pub origin: Option<String>,
 }
@@ -55,6 +56,7 @@ impl Default for AddTaskInput {
             priority: Priority::Medium,
             tags: Vec::new(),
             due: None,
+            due_time: None,
             repeat: None,
             origin: None,
         }
@@ -71,6 +73,7 @@ pub struct UpdateTaskInput {
     pub add_tags: Vec<String>,
     pub remove_tags: Vec<String>,
     pub due: Option<Option<String>>,
+    pub due_time: Option<Option<String>>,
     pub repeat: Option<Option<String>>,
 }
 
@@ -84,6 +87,7 @@ impl UpdateTaskInput {
             && self.add_tags.is_empty()
             && self.remove_tags.is_empty()
             && self.due.is_none()
+            && self.due_time.is_none()
             && self.repeat.is_none()
     }
 }
@@ -302,15 +306,26 @@ pub fn add_tasks_batch(
                 .to_string()
         };
         let tags = normalize_tags(&input.tags);
-        let due = match input
+        let (due, mut due_time) = match input
             .due
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(raw) => Some(parse_due_date(raw)?),
-            None => None,
+            Some(raw) => {
+                let (d, t) = parse_due_spec(raw)?;
+                (Some(d), t)
+            }
+            None => (None, None),
         };
+        if let Some(raw_time) = input
+            .due_time
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            due_time = Some(parse_due_time(raw_time)?);
+        }
         let repeat = match input
             .repeat
             .as_deref()
@@ -336,6 +351,7 @@ pub fn add_tasks_batch(
         );
         if let Some(task) = store.get_mut(id) {
             task.due = due;
+            task.due_time = due_time;
             task.repeat = repeat;
         }
         created_ids.push(id);
@@ -400,10 +416,29 @@ pub fn update_task(
         task.tags.retain(|t| !to_remove.contains(t));
     }
     if let Some(due_update) = input.due {
-        task.due = match due_update {
+        match due_update {
+            None => {
+                task.due = None;
+                task.due_time = None;
+            }
+            Some(raw) if raw.trim().is_empty() => {
+                task.due = None;
+                task.due_time = None;
+            }
+            Some(raw) => {
+                let (d, t) = parse_due_spec(&raw)?;
+                task.due = Some(d);
+                if t.is_some() {
+                    task.due_time = t;
+                }
+            }
+        }
+    }
+    if let Some(due_time_update) = input.due_time {
+        task.due_time = match due_time_update {
             None => None,
             Some(raw) if raw.trim().is_empty() => None,
-            Some(raw) => Some(parse_due_date(&raw)?),
+            Some(raw) => Some(parse_due_time(&raw)?),
         };
     }
     if let Some(repeat_update) = input.repeat {
@@ -417,7 +452,7 @@ pub fn update_task(
         if status == Status::Done && !was_done && task.repeat.is_some() {
             task.complete_if_recurring();
         } else {
-            task.status = status;
+            task.set_status(status);
         }
     }
 
@@ -456,13 +491,15 @@ pub fn list_tags(path: &Path, cfg: &AppConfig) -> Result<Vec<TagCount>, String> 
 
 pub fn sync_tasks(path: &Path, cfg: &AppConfig) -> Result<SyncReport, String> {
     if cfg.sync.peers.is_empty() {
-        return Err("no SSH peers configured in config.toml".into());
+        return Err("no sync peers configured in config.toml".into());
     }
-    let store = load_store(path, cfg)?;
     let local_name = cfg.sync.effective_device_name();
-    let outcome = sync_all_peers(store, cfg.sync.clone());
+    let _ = absorb_syncthing_conflicts(path, &local_name);
+    let store = load_store(path, cfg)?;
+    let state_dir = sync_state_dir_for(Some(path));
+    let outcome = sync_all_peers(store, cfg.sync.clone(), Some(state_dir));
 
-    // Re-read disk under lock in case another process edited the file while SSH ran
+    // Re-read disk under lock in case another process edited the file while sync ran
     let _lock = acquire_lock(path)?;
     let latest_disk = load_store(path, cfg)?;
     let merged = merge_stores(
@@ -603,7 +640,7 @@ pub fn board_stats(path: &Path, cfg: &AppConfig) -> Result<BoardStats, String> {
             Status::InProgress => in_progress += 1,
             Status::Done => {
                 done += 1;
-                if task.updated_at >= seven_days_ago {
+                if task.completed_at.unwrap_or(task.updated_at) >= seven_days_ago {
                     completed_last_7_days += 1;
                 }
             }
@@ -627,7 +664,7 @@ pub fn board_stats(path: &Path, cfg: &AppConfig) -> Result<BoardStats, String> {
     }
 
     for task in &archive_store.tasks {
-        if task.updated_at >= seven_days_ago {
+        if task.completed_at.unwrap_or(task.updated_at) >= seven_days_ago {
             completed_last_7_days += 1;
         }
     }
@@ -686,6 +723,7 @@ mod tests {
                 priority: Priority::High,
                 tags: vec!["#agent".into(), "rust".into()],
                 due: Some("2026-12-01".into()),
+                due_time: None,
                 repeat: None,
                 origin: None,
             },
@@ -705,6 +743,7 @@ mod tests {
                 priority: Priority::Low,
                 tags: vec!["personal".into()],
                 due: None,
+                due_time: None,
                 repeat: None,
                 origin: None,
             },

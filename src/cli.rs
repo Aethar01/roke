@@ -2,8 +2,8 @@ use crate::config::{default_config_path, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
-    default_storage_path, find_local_board, parse_due_date, parse_quick_add, parse_repeat,
-    parse_tags, today_ymd, DueState, Priority, SortOrder, Status, Task, TaskStore,
+    default_storage_path, find_local_board, parse_due_spec, parse_due_time, parse_quick_add,
+    parse_repeat, parse_tags, today_ymd, DueState, Priority, SortOrder, Status, Task, TaskStore,
     LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
@@ -95,7 +95,7 @@ pub struct Cli {
     #[arg(long = "global", global = true, conflicts_with = "local")]
     pub global_board: bool,
 
-    /// Path to TOML config file (theme + SSH sync)
+    /// Path to TOML config file (theme + sync)
     #[arg(short = 'c', long = "config", value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
 
@@ -203,7 +203,7 @@ pub enum SubCommand {
         oneline: bool,
     },
 
-    /// Sync tasks over SSH with peers configured in config.toml
+    /// Sync tasks with peers configured in config.toml (SSH, CalDAV, WebDAV, file)
     Sync,
 
     /// Prune old sync tombstones from the JSONL file
@@ -288,6 +288,14 @@ pub struct ListArgs {
     pub verbose: bool,
 }
 
+fn validate_due_arg(raw: &str) -> Result<String, String> {
+    let (d, t) = parse_due_spec(raw)?;
+    Ok(match t {
+        Some(hm) => format!("{d} {hm}"),
+        None => d,
+    })
+}
+
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Task title (omit when using --stdin)
@@ -315,9 +323,13 @@ pub struct AddArgs {
     #[arg(short = 't', long = "tag", visible_alias = "tags")]
     pub tags: Vec<String>,
 
-    /// Optional due date (YYYY-MM-DD, today, tomorrow, +3d, +2w, fri, eow, eom)
-    #[arg(long = "due", value_parser = parse_due_date)]
+    /// Optional due date (YYYY-MM-DD, today, tomorrow, +3d, fri, or with time e.g. 'tomorrow 14:30')
+    #[arg(long = "due", value_parser = validate_due_arg)]
     pub due: Option<String>,
+
+    /// Optional local due time (HH:MM, 9am, 2:30pm)
+    #[arg(long = "due-time", value_parser = parse_due_time)]
+    pub due_time: Option<String>,
 
     /// Optional recurrence rule (daily, weekdays, weekly, monthly, every 3d/2w/2m)
     #[arg(long = "repeat", value_parser = parse_repeat)]
@@ -327,7 +339,7 @@ pub struct AddArgs {
     #[arg(long = "origin")]
     pub origin: Option<String>,
 
-    /// Parse quick-add shorthand in title (#tag !high @tomorrow ~weekly)
+    /// Parse quick-add shorthand in title (#tag !high @tomorrow@14:30 ~weekly)
     #[arg(short = 'Q', long = "quick")]
     pub quick: bool,
 
@@ -369,13 +381,21 @@ pub struct EditArgs {
     #[arg(long = "rm-tag", visible_alias = "remove-tag")]
     pub remove_tags: Vec<String>,
 
-    /// Set due date (YYYY-MM-DD, today, tomorrow, +3d, +2w, fri, eow, eom)
-    #[arg(long = "due", value_parser = parse_due_date)]
+    /// Set due date (YYYY-MM-DD, today, tomorrow, +3d, fri, or with time e.g. 'tomorrow 14:30')
+    #[arg(long = "due", value_parser = validate_due_arg)]
     pub due: Option<String>,
 
-    /// Clear the task's due date
+    /// Clear the task's due date (and due time)
     #[arg(long = "clear-due")]
     pub clear_due: bool,
+
+    /// Set local due time (HH:MM, 9am, 2:30pm)
+    #[arg(long = "due-time", value_parser = parse_due_time)]
+    pub due_time: Option<String>,
+
+    /// Clear only the task's due time (keeps due date)
+    #[arg(long = "clear-due-time")]
+    pub clear_due_time: bool,
 
     /// Set recurrence rule (daily, weekdays, weekly, monthly, every 3d/2w/2m)
     #[arg(long = "repeat", value_parser = parse_repeat)]
@@ -426,6 +446,8 @@ struct StdinTaskSpec {
     #[serde(default)]
     due: Option<String>,
     #[serde(default)]
+    due_time: Option<String>,
+    #[serde(default)]
     repeat: Option<String>,
     #[serde(default)]
     origin: Option<String>,
@@ -473,6 +495,7 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
             spec.description
         };
         let due = spec.due.or_else(|| defaults.due.clone());
+        let due_time = spec.due_time.or_else(|| defaults.due_time.clone());
         let repeat = spec.repeat.or_else(|| defaults.repeat.clone());
         let origin = spec.origin.or_else(|| defaults.origin.clone());
         out.push(AddTaskInput {
@@ -482,6 +505,7 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
             priority,
             tags,
             due,
+            due_time,
             repeat,
             origin,
         });
@@ -548,6 +572,7 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 priority: args.priority,
                 tags: args.tags.iter().flat_map(|t| parse_tags(t)).collect(),
                 due: args.due.clone(),
+                due_time: args.due_time.clone(),
                 repeat: args.repeat.clone(),
                 origin: args.origin.clone(),
             };
@@ -589,6 +614,9 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     if input.due.is_none() {
                         input.due = parsed.due;
                     }
+                    if input.due_time.is_none() {
+                        input.due_time = parsed.due_time;
+                    }
                     if input.repeat.is_none() {
                         input.repeat = parsed.repeat;
                     }
@@ -623,6 +651,8 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     && args.remove_tags.is_empty()
                     && args.due.is_none()
                     && !args.clear_due
+                    && args.due_time.is_none()
+                    && !args.clear_due_time
                     && args.repeat.is_none()
                     && !args.clear_repeat
                 {
@@ -638,6 +668,11 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 Some(None)
             } else {
                 args.due.clone().map(Some)
+            };
+            let due_time_update = if args.clear_due_time {
+                Some(None)
+            } else {
+                args.due_time.clone().map(Some)
             };
             let repeat_update = if args.clear_repeat {
                 Some(None)
@@ -657,10 +692,11 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     .flat_map(|t| parse_tags(t))
                     .collect(),
                 due: due_update,
+                due_time: due_time_update,
                 repeat: repeat_update,
             };
             if input.is_empty() {
-                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --due, --clear-due, --repeat, --clear-repeat, --editor.".into());
+                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --due, --clear-due, --due-time, --clear-due-time, --repeat, --clear-repeat, --editor.".into());
             }
             let task = ops::update_task(&path, cfg, &args.selector, input)?;
             if json {
@@ -1233,7 +1269,7 @@ impl Painter {
             format!("  {joined}")
         };
 
-        let due_str = if let Some(due) = &task.due {
+        let due_str = if let Some(due) = task.due_display() {
             let today = today_ymd();
             let color = match task.due_state(&today) {
                 Some(DueState::Overdue) => self.theme.error,
@@ -1291,7 +1327,7 @@ impl Painter {
                 prio_color
             )
         ));
-        if let Some(due) = &task.due {
+        if let Some(due) = task.due_display() {
             let today = today_ymd();
             let color = match task.due_state(&today) {
                 Some(DueState::Overdue) => self.theme.error,
@@ -1301,7 +1337,7 @@ impl Painter {
             out.push_str(&format!(
                 "  {} {}\n",
                 self.muted("due:     "),
-                self.colored(due, color)
+                self.colored(&due, color)
             ));
         }
         if let Some(rep) = &task.repeat {
@@ -1396,8 +1432,10 @@ mod tests {
             priority: Priority::High,
             tags: vec!["work".into()],
             due: None,
+            due_time: None,
             repeat: None,
             created_at: Some(1),
+            completed_at: None,
             updated_at: 1,
             origin: Some("local".into()),
             order: None,
