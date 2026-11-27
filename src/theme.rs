@@ -68,6 +68,61 @@ pub struct ThemeConfig {
 }
 
 impl ThemeConfig {
+    /// Overlay any explicitly specified fields from `other` onto `self`.
+    pub fn overlay(&mut self, other: &ThemeConfig) {
+        if let Some(v) = &other.preset {
+            self.preset = Some(v.clone());
+        }
+        if let Some(v) = &other.accent {
+            self.accent = Some(v.clone());
+        }
+        if let Some(v) = &other.text {
+            self.text = Some(v.clone());
+        }
+        if let Some(v) = &other.subtle {
+            self.subtle = Some(v.clone());
+        }
+        if let Some(v) = &other.muted {
+            self.muted = Some(v.clone());
+        }
+        if let Some(v) = &other.todo {
+            self.todo = Some(v.clone());
+        }
+        if let Some(v) = &other.in_progress {
+            self.in_progress = Some(v.clone());
+        }
+        if let Some(v) = &other.done {
+            self.done = Some(v.clone());
+        }
+        if let Some(v) = &other.priority_high {
+            self.priority_high = Some(v.clone());
+        }
+        if let Some(v) = &other.priority_medium {
+            self.priority_medium = Some(v.clone());
+        }
+        if let Some(v) = &other.priority_low {
+            self.priority_low = Some(v.clone());
+        }
+        if let Some(v) = &other.add {
+            self.add = Some(v.clone());
+        }
+        if let Some(v) = &other.drag {
+            self.drag = Some(v.clone());
+        }
+        if let Some(v) = &other.drop {
+            self.drop = Some(v.clone());
+        }
+        if let Some(v) = &other.error {
+            self.error = Some(v.clone());
+        }
+        if let Some(v) = &other.tag {
+            self.tag = Some(v.clone());
+        }
+        if let Some(v) = &other.tag_active {
+            self.tag_active = Some(v.clone());
+        }
+    }
+
     pub fn default_template() -> Self {
         Self {
             preset: Some("default".into()),

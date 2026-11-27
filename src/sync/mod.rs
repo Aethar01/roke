@@ -55,6 +55,19 @@ pub(crate) enum PushError {
     Other(String),
 }
 
+/// Compute a deterministic board cache path under `$XDG_STATE_HOME/roke/boards/<hash>/todos.jsonl`
+/// for repos that define a project-local `.roke.toml` (e.g. a shared team remote tracker) without
+/// committing a `.roke.jsonl` file.
+pub fn project_cache_board_path(project_dir: &Path) -> PathBuf {
+    let resolved = fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let hash = oauth::sha256(resolved.to_string_lossy().as_bytes());
+    let short_hex: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+    default_state_dir()
+        .join("boards")
+        .join(short_hex)
+        .join("todos.jsonl")
+}
+
 /// Derive the XDG state directory for sync cursors (`$XDG_STATE_HOME/roke` or `~/.local/state/roke`).
 /// The default global board stores cursors directly under the XDG state dir; project-local or
 /// custom boards get an isolated subdirectory under `boards/<hash>/` so Git repos and Syncthing

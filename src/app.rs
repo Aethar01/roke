@@ -494,6 +494,8 @@ pub struct App {
     pub store: TaskStore,
     pub storage_path: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
+    pub local_config_path: Option<PathBuf>,
+    isolate_sync_peers: bool,
     pub theme: Theme,
     pub editor_config: Option<String>,
     pub editor_label: String,
@@ -529,6 +531,7 @@ pub struct App {
     last_click: Option<LastClick>,
     last_file_stamp: Option<FileStamp>,
     last_config_stamp: Option<FileStamp>,
+    last_local_config_stamp: Option<FileStamp>,
     dirty: bool,
 }
 
@@ -551,10 +554,22 @@ impl App {
         config_path: Option<PathBuf>,
         config: AppConfig,
     ) -> Self {
+        Self::with_config_and_paths(store, storage_path, config_path, None, false, config)
+    }
+
+    pub fn with_config_and_paths(
+        store: TaskStore,
+        storage_path: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        local_config_path: Option<PathBuf>,
+        isolate_sync_peers: bool,
+        config: AppConfig,
+    ) -> Self {
         let theme = config.resolved_theme();
         let editor_label = editor_display_name(config.editor.as_deref());
         let last_file_stamp = storage_path.as_deref().and_then(file_stamp);
         let last_config_stamp = config_path.as_deref().and_then(file_stamp);
+        let last_local_config_stamp = local_config_path.as_deref().and_then(file_stamp);
         let initial_view = match config
             .default_view
             .as_deref()
@@ -586,6 +601,8 @@ impl App {
             store,
             storage_path,
             config_path,
+            local_config_path,
+            isolate_sync_peers,
             theme,
             editor_config: config.editor,
             editor_label,
@@ -621,6 +638,7 @@ impl App {
             last_click: None,
             last_file_stamp,
             last_config_stamp,
+            last_local_config_stamp,
             dirty: false,
         }
     }
@@ -922,23 +940,41 @@ impl App {
         changed
     }
 
-    /// Watch `config.toml` and hot-reload theme, editor, and sync settings on change.
+    /// Watch `config.toml` (and project-local `.roke.toml` if present) and hot-reload settings on change.
     pub fn reload_config_if_changed(&mut self) -> bool {
         let Some(path) = self.config_path.clone() else {
             return false;
         };
         let current_stamp = file_stamp(&path);
-        if current_stamp == self.last_config_stamp {
+        let current_local_stamp = self.local_config_path.as_deref().and_then(file_stamp);
+        if current_stamp == self.last_config_stamp
+            && current_local_stamp == self.last_local_config_stamp
+        {
             return false;
         }
+        let local_changed = current_local_stamp != self.last_local_config_stamp;
         self.last_config_stamp = current_stamp;
-        match AppConfig::load_or_default(&path) {
+        self.last_local_config_stamp = current_local_stamp;
+        let res = if self.local_config_path.is_some() || self.isolate_sync_peers {
+            AppConfig::load_with_local_overlay(
+                &path,
+                self.local_config_path.as_deref(),
+                self.isolate_sync_peers,
+            )
+        } else {
+            AppConfig::load_or_default(&path)
+        };
+        match res {
             Ok(cfg) => {
                 self.theme = cfg.resolved_theme();
                 self.editor_label = editor_display_name(cfg.editor.as_deref());
                 self.editor_config = cfg.editor;
                 self.sync_config = cfg.sync;
-                self.set_message("Reloaded config.toml");
+                self.set_message(if local_changed {
+                    "Reloaded .roke.toml"
+                } else {
+                    "Reloaded config.toml"
+                });
                 true
             }
             Err(err) => {

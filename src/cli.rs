@@ -1,4 +1,4 @@
-use crate::config::{default_config_path, default_state_dir, AppConfig};
+use crate::config::{default_config_path, default_state_dir, find_local_config, AppConfig};
 use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
@@ -7,7 +7,7 @@ use crate::model::{
     LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
-use crate::sync::oauth;
+use crate::sync::{oauth, project_cache_board_path};
 use crate::theme::{to_crossterm_color, Theme};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -16,7 +16,7 @@ use crossterm::style::{Attribute, ContentStyle, StyledContent};
 use ratatui::style::Color;
 use serde::Deserialize;
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn clap_styles() -> Styles {
     Styles::styled()
@@ -88,15 +88,11 @@ pub struct Cli {
     #[arg(short = 'f', long = "file", value_name = "PATH", global = true)]
     pub file: Option<PathBuf>,
 
-    /// Use a project-local .roke.jsonl board in the current or nearest parent directory
-    #[arg(long = "local", global = true, conflicts_with = "global_board")]
-    pub local: bool,
-
-    /// Force the global board even when inside a directory containing .roke.jsonl
-    #[arg(long = "global", global = true, conflicts_with = "local")]
+    /// Force the global board and config even inside a directory containing .roke.jsonl or .roke.toml
+    #[arg(long = "global", global = true)]
     pub global_board: bool,
 
-    /// Path to TOML config file (theme + sync)
+    /// Path to TOML config file (overrides both global config.toml and local .roke.toml)
     #[arg(short = 'c', long = "config", value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
 
@@ -122,26 +118,93 @@ pub struct Cli {
     pub command: Option<SubCommand>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedProjectContext {
+    pub storage_path: PathBuf,
+    pub global_config_path: PathBuf,
+    pub local_config_path: Option<PathBuf>,
+    pub isolate_sync_peers: bool,
+}
+
 impl Cli {
-    pub fn storage_path(&self) -> PathBuf {
-        if let Some(file) = &self.file {
-            return file.clone();
+    /// Resolve board storage path and global/local config paths taking `.roke.jsonl` and
+    /// `.roke.toml` precedence into account (overridden by `--global`, `--file`, or `--config`).
+    pub fn resolve_context(&self) -> ResolvedProjectContext {
+        let global_config_path = self.config_path();
+        if self.global_board {
+            return ResolvedProjectContext {
+                storage_path: self.file.clone().unwrap_or_else(default_storage_path),
+                global_config_path,
+                local_config_path: None,
+                isolate_sync_peers: false,
+            };
         }
-        if !self.global_board {
-            if let Ok(cwd) = std::env::current_dir() {
-                if let Some(found) = find_local_board(&cwd) {
-                    return found;
-                }
-                if self.local {
-                    return cwd.join(LOCAL_BOARD_FILENAME);
+
+        let cwd = std::env::current_dir().ok();
+        let local_board = cwd.as_deref().and_then(find_local_board);
+        let local_config = if self.config.is_some() {
+            None
+        } else {
+            cwd.as_deref().and_then(find_local_config)
+        };
+
+        // Pick the nearest project marker when both exist in different ancestor directories.
+        let (active_board, active_local_cfg) = match (local_board, local_config) {
+            (Some(b), Some(c)) => {
+                let b_depth = b.parent().map(|p| p.components().count()).unwrap_or(0);
+                let c_depth = c.parent().map(|p| p.components().count()).unwrap_or(0);
+                if b_depth == c_depth {
+                    (Some(b), Some(c))
+                } else if b_depth > c_depth {
+                    (Some(b), None)
+                } else {
+                    (None, Some(c))
                 }
             }
+            (b, c) => (b, c),
+        };
+
+        let storage_path = if let Some(file) = &self.file {
+            file.clone()
+        } else if let Some(board) = &active_board {
+            board.clone()
+        } else if let Some(cfg_file) = &active_local_cfg {
+            let project_dir = cfg_file.parent().unwrap_or(Path::new("."));
+            project_cache_board_path(project_dir)
+        } else {
+            default_storage_path()
+        };
+
+        let isolate_sync_peers = active_board.is_some() || active_local_cfg.is_some();
+
+        ResolvedProjectContext {
+            storage_path,
+            global_config_path,
+            local_config_path: active_local_cfg,
+            isolate_sync_peers,
         }
-        default_storage_path()
+    }
+
+    pub fn storage_path(&self) -> PathBuf {
+        self.resolve_context().storage_path
     }
 
     pub fn config_path(&self) -> PathBuf {
         self.config.clone().unwrap_or_else(default_config_path)
+    }
+
+    pub fn load_effective_config(&self) -> Result<(AppConfig, ResolvedProjectContext), String> {
+        let ctx = self.resolve_context();
+        let cfg = if self.config.is_some() {
+            AppConfig::load_or_default(&ctx.global_config_path)?
+        } else {
+            AppConfig::load_with_local_overlay(
+                &ctx.global_config_path,
+                ctx.local_config_path.as_deref(),
+                ctx.isolate_sync_peers,
+            )?
+        };
+        Ok((cfg, ctx))
     }
 }
 

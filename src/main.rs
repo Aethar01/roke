@@ -129,15 +129,11 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let config_path = cli.config_path();
-    let cfg = match AppConfig::load_or_default(&config_path) {
-        Ok(cfg) => cfg,
+    let (cfg, ctx) = match cli.load_effective_config() {
+        Ok(res) => res,
         Err(err) => {
-            eprintln!(
-                "Warning: could not load config {}: {err}. Using defaults.",
-                config_path.display()
-            );
-            AppConfig::default()
+            eprintln!("Warning: could not load config: {err}. Using defaults.");
+            (AppConfig::default(), cli.resolve_context())
         }
     };
 
@@ -149,9 +145,15 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let storage_path = cli.storage_path();
+    let storage_path = ctx.storage_path;
     let _ = sync::absorb_syncthing_conflicts(&storage_path, &cfg.sync.effective_device_name());
-    let mut store = match TaskStore::load_or_init(&storage_path) {
+    let load_res = if !cfg.sync.peers.is_empty() || ctx.local_config_path.is_some() {
+        // Avoid seeding tutorial starter tasks into a synced or remote-only project board
+        TaskStore::load_or_empty(&storage_path)
+    } else {
+        TaskStore::load_or_init(&storage_path)
+    };
+    let mut store = match load_res {
         Ok(store) => store,
         Err(err) => {
             eprintln!(
@@ -175,7 +177,14 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::with_config_and_path(store, Some(storage_path), Some(config_path), cfg);
+    let mut app = App::with_config_and_paths(
+        store,
+        Some(storage_path),
+        Some(ctx.global_config_path),
+        ctx.local_config_path,
+        ctx.isolate_sync_peers,
+        cfg,
+    );
     let mut sync_mgr = SyncManager::new();
     if app.sync_config.auto_sync_on_start && !app.sync_config.peers.is_empty() {
         app.request_sync();

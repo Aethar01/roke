@@ -353,6 +353,71 @@ fn detect_hostname_uncached() -> String {
     "local".to_string()
 }
 
+pub const LOCAL_CONFIG_FILENAME: &str = ".roke.toml";
+
+/// Walk upward from `start_dir` looking for a project-local `.roke.toml` config.
+pub fn find_local_config(start_dir: &Path) -> Option<PathBuf> {
+    for dir in start_dir.ancestors() {
+        let candidate = dir.join(LOCAL_CONFIG_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LocalSyncOverlay {
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default)]
+    inject_device_tag: Option<bool>,
+    #[serde(default)]
+    auto_sync_on_start: Option<bool>,
+    #[serde(default)]
+    auto_sync_on_save: Option<bool>,
+    #[serde(default)]
+    peers: Option<Vec<PeerConfig>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LocalConfigOverlay {
+    #[serde(default)]
+    default_view: Option<String>,
+    #[serde(default)]
+    default_filter: Option<String>,
+    #[serde(default)]
+    default_sort: Option<String>,
+    #[serde(default)]
+    theme: ThemeConfig,
+    #[serde(default)]
+    sync: Option<LocalSyncOverlay>,
+}
+
+fn validate_local_peers_safe(peers: &[PeerConfig]) -> Result<(), String> {
+    for peer in peers {
+        if peer
+            .password_cmd
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || peer
+                .client_secret_cmd
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || peer
+                .token_cmd
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Err(format!(
+                "peer '{}' uses shell command fields (password_cmd, client_secret_cmd, token_cmd) which are not allowed in project-local .roke.toml; use password_env, client_secret_env, or `roke auth` instead",
+                peer.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl AppConfig {
     pub fn load_or_default(path: &Path) -> Result<Self, String> {
         if !path.exists() {
@@ -368,6 +433,67 @@ impl AppConfig {
         } else {
             toml::from_str(&raw).map_err(|e| e.to_string())
         }
+    }
+
+    /// Load the global config and optionally layer a project-local `.roke.toml` on top.
+    ///
+    /// - Theme, `editor`, and `sync.device_name` inherit from the user's global config.
+    /// - Project-local boards (`.roke.toml` or `.roke.jsonl`) never inherit global personal
+    ///   `sync.peers`, preventing personal trackers from syncing into a project repo.
+    /// - For safety when cloning untrusted Git repos, `.roke.toml` cannot override `editor`
+    ///   or run shell commands (`password_cmd`, `client_secret_cmd`, `token_cmd`).
+    pub fn load_with_local_overlay(
+        global_path: &Path,
+        local_config_path: Option<&Path>,
+        isolate_sync_peers: bool,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::load_or_default(global_path)?;
+
+        if let Some(local_path) = local_config_path {
+            if local_path.exists() {
+                let raw = fs::read_to_string(local_path).map_err(|e| e.to_string())?;
+                let overlay: LocalConfigOverlay =
+                    toml::from_str(&raw).map_err(|e| format!("{}: {e}", local_path.display()))?;
+
+                if let Some(v) = overlay.default_view {
+                    cfg.default_view = Some(v);
+                }
+                if let Some(v) = overlay.default_filter {
+                    cfg.default_filter = Some(v);
+                }
+                if let Some(v) = overlay.default_sort {
+                    cfg.default_sort = Some(v);
+                }
+                cfg.theme.overlay(&overlay.theme);
+
+                // Project-local config always isolates sync peers from the user's personal peers.
+                cfg.sync.peers.clear();
+                if let Some(sync_ov) = overlay.sync {
+                    if let Some(peers) = sync_ov.peers {
+                        validate_local_peers_safe(&peers)?;
+                        cfg.sync.peers = peers;
+                    }
+                    if let Some(dn) = sync_ov.device_name {
+                        cfg.sync.device_name = Some(dn);
+                    }
+                    if let Some(v) = sync_ov.inject_device_tag {
+                        cfg.sync.inject_device_tag = v;
+                    }
+                    if let Some(v) = sync_ov.auto_sync_on_start {
+                        cfg.sync.auto_sync_on_start = v;
+                    }
+                    if let Some(v) = sync_ov.auto_sync_on_save {
+                        cfg.sync.auto_sync_on_save = v;
+                    }
+                }
+                return Ok(cfg);
+            }
+        }
+
+        if isolate_sync_peers {
+            cfg.sync.peers.clear();
+        }
+        Ok(cfg)
     }
 
     pub fn resolved_theme(&self) -> Theme {
@@ -557,5 +683,98 @@ list = "My Tasks"
             cfg.peers[5].resolve_client_secret().unwrap().as_deref(),
             Some("google-secret")
         );
+    }
+
+    #[test]
+    fn local_roke_toml_overlays_global_isolates_peers_and_blocks_shell_cmds() {
+        let dir = std::env::temp_dir().join(format!("roke_local_cfg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let global_path = dir.join("global.toml");
+        fs::write(
+            &global_path,
+            r#"
+editor = "nvim"
+default_view = "todos"
+
+[theme]
+preset = "catppuccin"
+accent = "blue"
+
+[sync]
+device_name = "macbook"
+
+[[sync.peers]]
+name = "personal-phone"
+kind = "caldav"
+url = "https://caldav.tasks.org/"
+"#,
+        )
+        .unwrap();
+
+        // Case 1: .roke.jsonl without .roke.toml keeps theme/editor but clears personal peers
+        let board_only = AppConfig::load_with_local_overlay(&global_path, None, true).unwrap();
+        assert_eq!(board_only.editor.as_deref(), Some("nvim"));
+        assert_eq!(board_only.theme.preset.as_deref(), Some("catppuccin"));
+        assert!(board_only.sync.peers.is_empty());
+
+        // Case 2: .roke.toml layers project view/theme + replaces sync peers while preserving personal editor/device
+        let local_path = dir.join(".roke.toml");
+        fs::write(
+            &local_path,
+            r#"
+editor = "malicious-ignored"
+default_view = "kanban"
+
+[theme]
+accent = "green"
+
+[sync]
+auto_sync_on_save = true
+
+[[sync.peers]]
+name = "team-board"
+kind = "caldav"
+url = "https://dav.company.com/team/sprint/"
+password_env = "ROKE_TEAM_PASS"
+"#,
+        )
+        .unwrap();
+
+        let merged =
+            AppConfig::load_with_local_overlay(&global_path, Some(&local_path), true).unwrap();
+        assert_eq!(merged.editor.as_deref(), Some("nvim"));
+        assert_eq!(merged.default_view.as_deref(), Some("kanban"));
+        assert_eq!(merged.theme.preset.as_deref(), Some("catppuccin"));
+        assert_eq!(merged.theme.accent.as_deref(), Some("green"));
+        assert_eq!(merged.sync.device_name.as_deref(), Some("macbook"));
+        assert!(merged.sync.auto_sync_on_save);
+        assert_eq!(merged.sync.peers.len(), 1);
+        assert_eq!(merged.sync.peers[0].name, "team-board");
+
+        // Case 3: .roke.toml attempting shell execution via password_cmd is rejected
+        let unsafe_path = dir.join("unsafe.toml");
+        fs::write(
+            &unsafe_path,
+            r#"
+[[sync.peers]]
+name = "evil"
+kind = "caldav"
+url = "https://dav.example.com/"
+password_cmd = "echo pwned"
+"#,
+        )
+        .unwrap();
+        let err =
+            AppConfig::load_with_local_overlay(&global_path, Some(&unsafe_path), true).unwrap_err();
+        assert!(err.contains("not allowed in project-local .roke.toml"));
+
+        // Case 4: find_local_config walks upward
+        let nested = dir.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_local_config(&nested), Some(local_path));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -21,7 +21,7 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 - **Two views, one store** — Switch seamlessly between a **Todo List** (`All`, `To Do`, `In Progress`, `Done`) and a three-column **Kanban Board** (`Tab`, `gt`, `1`/`2`, or click the header tabs).
 - **Vim-first, mouse-friendly** — Navigate with `h`/`j`/`k`/`l`, `gg`/`G`, quick-add with `Q`, move cards across columns with `H`/`L` or `<`/`>`, reorder with `J`/`K`, sort with `O`, yank with `y`/`Y`, undo/redo with `u`/`Ctrl-R`, archive/restore with `A`/`V`, and search live with `/`. Click tabs, filters, checkboxes (`○`/`◐`/`✓`), double-click cards to edit, scroll with the wheel, and drag-and-drop cards to reorder or move across Kanban columns.
 - **Zero-clutter multi-tag filtering, natural due dates/times & recurrence** — Tag tasks (`work, personal`), set due dates and optional local times (`YYYY-MM-DD`, `today`, `tomorrow@14:30`, `+3d`, `+2w`, `fri 9:30am`, `eow`, `eom`) with local-time overdue highlighting and recurrence (`daily`, `weekdays`, `weekly`, `monthly`, `every 3d`), filter by multiple tags via clicks or the scrollable `t` picker, and toggle between `and` and `or`. Tags, due dates, and repeat rules tuck quietly into card bottom borders.
-- **Plain JSONL storage, project-local boards & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), or auto-discovered from a project-local `.roke.jsonl` (`roke init`), one compact JSON object per line with atomic locked saves. The TUI watches both `todos.jsonl` and `config.toml` and reloads live.
+- **Plain JSONL storage, project-local boards/configs & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), or automatically scoped to a project when `.roke.jsonl` or `.roke.toml` exists in the current or nearest parent directory (override anytime with `--global`). A Git repo can commit just `.roke.toml` pointing at a shared team remote tracker (caching locally in `$XDG_STATE_HOME/roke/boards/`), with zero `.roke.jsonl` merge conflicts. The TUI watches `todos.jsonl`, `config.toml`, and `.roke.toml` and reloads live.
 - **Interactive Markdown notes & checklists** — Task notes support full Markdown, show `[done/total]` checklist progress on cards, preview cleanly in-app with `v` (where you can toggle `- [ ]` / `- [x]` items directly with `Tab`/`Space` or click), and open in `nvim` / `$VISUAL` / `$EDITOR` via `n` in the TUI, `Ctrl-E` in the edit modal, or `roke notes <id>`.
 - **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`notes`/`move`/`done`/`rm`/`tags`/`stats`/`archive`/`unarchive`/`gc`/`sync`/`init`/`completions` (supporting multi-ID batch `move`/`done`/`rm`, `--json`, and theme-aware colours), or connect any MCP client directly with `roke mcp` (supports `--read-only`).
 - **TOML config, built-in theme presets & live reload** — Choose a built-in `[theme]` preset (`default`, `catppuccin`, `tokyo-night`, `gruvbox`, `nord`, `minimal`) or override any colour using ANSI-16 names, 256-color indices, or `#rrggbb` hex values, plus startup defaults (`default_view`, `default_filter`, `default_sort`). Edits to `config.toml` hot-reload in any open TUI.
@@ -47,9 +47,9 @@ install -m 755 target/release/roke ~/.local/bin/roke
 ## Usage
 
 ```bash
-roke                                     # open interactive TUI (auto-discovers .roke.jsonl or uses global board)
+roke                                     # open interactive TUI (auto-discovers .roke.jsonl / .roke.toml, else global board)
 roke init                                # create a project-local .roke.jsonl in the current directory
-roke --global                            # force the global board even inside a repo with .roke.jsonl
+roke --global                            # force the global board and config even inside a repo with .roke.jsonl or .roke.toml
 roke --file ./project-todos.jsonl        # use a specific JSONL task file
 roke --config ./config.toml              # use a specific TOML config file
 roke --print-config                      # print a full starter config.toml to stdout
@@ -58,7 +58,7 @@ roke completions zsh                     # generate shell completions (bash, zsh
 
 ### CLI & agent usage
 
-All subcommands accept `--file`, `--local`, `--global`, `--config`, `--json`, and `--color <auto|always|never>` (honoring your `[theme]` colours from `config.toml` and `NO_COLOR`), and accept either a numeric task ID or stable `uid`. Any edits appear live in an open `roke` TUI.
+All subcommands accept `--file`, `--global`, `--config`, `--json`, and `--color <auto|always|never>` (honoring your `[theme]` colours from `config.toml` and `NO_COLOR`), and accept either a numeric task ID or stable `uid`. Any edits appear live in an open `roke` TUI.
 
 ```bash
 roke list --status todo --tag work --sort priority --verbose
@@ -208,6 +208,27 @@ client_secret_env = "ROKE_GOOGLE_CLIENT_SECRET" # or client_secret_cmd = "..."
 ```
 
 Run `roke --print-config` to see every available theme key and default value.
+
+### Project-local `.roke.toml` (shared team trackers)
+
+Drop a `.roke.toml` in a Git repository to override project defaults and point teammates at a shared remote tracker (CalDAV, Microsoft To Do, WebDAV, etc.) — even without committing `.roke.jsonl`:
+
+```toml
+default_view = "kanban"
+
+[sync]
+auto_sync_on_start = true
+auto_sync_on_save = true
+
+[[sync.peers]]
+name = "team"
+kind = "caldav"
+url = "https://dav.company.com/team/sprint/"
+password_env = "ROKE_TEAM_PASSWORD"
+```
+
+- **Precedence**: `.roke.jsonl` and `.roke.toml` take precedence over global automatically (use `--global` to jump back to your personal board). If only `.roke.toml` exists, `roke` keeps its local board cache under `$XDG_STATE_HOME/roke/boards/<hash>/todos.jsonl`.
+- **Safe layering**: Personal `[theme]`, `editor`, and `device_name` are inherited from `~/.config/roke/config.toml`, while `sync.peers` are isolated to `.roke.toml` (so personal trackers never leak into a repo). For security when cloning untrusted repos, `.roke.toml` cannot override `editor` or run shell commands (`password_cmd`, `client_secret_cmd`, `token_cmd`).
 
 ### Sync backend notes
 
