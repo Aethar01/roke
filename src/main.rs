@@ -277,10 +277,9 @@ fn run_loop(
         }
 
         if let Some(target) = app.pending_editor.take() {
-            if let Some((initial, title)) = app.editor_initial_content(target) {
+            if let Some(doc) = app.editor_initial_document(target) {
                 suspend_terminal(terminal)?;
-                let edit_res =
-                    editor::edit_markdown_in_editor(&initial, &title, app.editor_config.as_deref());
+                let edit_res = editor::edit_task_in_editor(&doc, app.editor_config.as_deref());
                 resume_terminal(terminal)?;
                 app.apply_editor_result(target, edit_res);
                 needs_draw = true;

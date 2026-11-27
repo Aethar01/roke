@@ -345,6 +345,11 @@ fn ms_json_to_task(
     } else {
         None
     };
+    let start = item
+        .get("startDateTime")
+        .and_then(|d| d.get("dateTime"))
+        .and_then(Value::as_str)
+        .and_then(extract_ymd);
     let repeat = item.get("recurrence").and_then(ms_recurrence_to_roke);
     let created_at = item
         .get("createdDateTime")
@@ -391,7 +396,14 @@ fn ms_json_to_task(
             tags,
             due,
             due_time,
+            start,
+            start_time: None,
             repeat,
+            reminders: Vec::new(),
+            parent_uid: None,
+            location: None,
+            url: None,
+            percent_complete: None,
             created_at,
             completed_at,
             updated_at,
@@ -432,6 +444,14 @@ fn task_to_ms_payload(task: &Task) -> Value {
         obj.insert("dueDateTime".into(), Value::Null);
         obj.insert("isReminderOn".into(), json!(false));
     }
+    if let Some(ref start) = task.start {
+        obj.insert(
+            "startDateTime".into(),
+            json!({ "dateTime": format!("{start}T00:00:00"), "timeZone": "UTC" }),
+        );
+    } else {
+        obj.insert("startDateTime".into(), Value::Null);
+    }
     if task.status == Status::Done {
         let done_ts = task.completed_at.unwrap_or(task.updated_at);
         obj.insert(
@@ -457,6 +477,7 @@ fn tasks_ms_equal(a: &Task, b: &Task) -> bool {
         && a.tags == b.tags
         && a.due == b.due
         && a.due_time == b.due_time
+        && a.start == b.start
         && a.repeat == b.repeat
 }
 

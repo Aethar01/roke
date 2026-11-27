@@ -292,7 +292,17 @@ impl McpServer {
         let tags = optional_tags(args, "tags")?;
         let due = optional_str(args, "due")?.map(str::to_string);
         let due_time = optional_str(args, "due_time")?.map(str::to_string);
+        let start = optional_str(args, "start")?.map(str::to_string);
+        let start_time = optional_str(args, "start_time")?.map(str::to_string);
         let repeat = optional_str(args, "repeat")?.map(str::to_string);
+        let reminders = optional_string_list(args, "reminders")?;
+        let parent_uid = optional_str(args, "parent_uid")?
+            .or(optional_str(args, "parent")?)
+            .map(str::to_string);
+        let location = optional_str(args, "location")?.map(str::to_string);
+        let url = optional_str(args, "url")?.map(str::to_string);
+        let percent_complete =
+            optional_u8_pct(args, "percent_complete")?.or(optional_u8_pct(args, "progress")?);
         let origin = optional_str(args, "origin")?.map(str::to_string);
         Ok(AddTaskInput {
             title,
@@ -302,7 +312,14 @@ impl McpServer {
             tags,
             due,
             due_time,
+            start,
+            start_time,
             repeat,
+            reminders,
+            parent_uid,
+            location,
+            url,
+            percent_complete,
             origin,
         })
     }
@@ -372,28 +389,29 @@ impl McpServer {
         };
         let add_tags = optional_tags(args, "add_tags")?;
         let remove_tags = optional_tags(args, "remove_tags")?;
-        let due = match args.get("due") {
+        let due = parse_nullable_string_arg(args, "due", "a date string or null")?;
+        let due_time =
+            parse_nullable_string_arg(args, "due_time", "a time string (HH:MM) or null")?;
+        let start = parse_nullable_string_arg(args, "start", "a date string or null")?;
+        let start_time =
+            parse_nullable_string_arg(args, "start_time", "a time string (HH:MM) or null")?;
+        let repeat = parse_nullable_string_arg(args, "repeat", "a recurrence string or null")?;
+        let reminders = match args.get("reminders") {
             None => None,
-            Some(Value::Null) => Some(None),
-            Some(Value::String(s)) if s.trim().is_empty() => Some(None),
-            Some(Value::String(s)) => Some(Some(s.clone())),
-            Some(_) => return Err("argument 'due' must be a date string or null".into()),
+            Some(Value::Null) => Some(Vec::new()),
+            Some(_) => Some(optional_string_list(args, "reminders")?),
         };
-        let due_time = match args.get("due_time") {
-            None => None,
-            Some(Value::Null) => Some(None),
-            Some(Value::String(s)) if s.trim().is_empty() => Some(None),
-            Some(Value::String(s)) => Some(Some(s.clone())),
-            Some(_) => {
-                return Err("argument 'due_time' must be a time string (HH:MM) or null".into())
-            }
+        let parent_uid = if args.get("parent_uid").is_some() {
+            parse_nullable_string_arg(args, "parent_uid", "a parent UID/ID string or null")?
+        } else {
+            parse_nullable_string_arg(args, "parent", "a parent UID/ID string or null")?
         };
-        let repeat = match args.get("repeat") {
-            None => None,
-            Some(Value::Null) => Some(None),
-            Some(Value::String(s)) if s.trim().is_empty() => Some(None),
-            Some(Value::String(s)) => Some(Some(s.clone())),
-            Some(_) => return Err("argument 'repeat' must be a recurrence string or null".into()),
+        let location = parse_nullable_string_arg(args, "location", "a location string or null")?;
+        let url = parse_nullable_string_arg(args, "url", "a URL string or null")?;
+        let percent_complete = if args.get("percent_complete").is_some() {
+            parse_nullable_u8_pct(args, "percent_complete")?
+        } else {
+            parse_nullable_u8_pct(args, "progress")?
         };
 
         let updated = ops::update_task(
@@ -410,7 +428,14 @@ impl McpServer {
                 remove_tags,
                 due,
                 due_time,
+                start,
+                start_time,
                 repeat,
+                reminders,
+                parent_uid,
+                location,
+                url,
+                percent_complete,
             },
         )?;
         serde_json::to_value(updated).map_err(|e| e.to_string())
@@ -462,6 +487,79 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, Strin
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.as_str())),
         Some(_) => Err(format!("argument '{key}' must be a string")),
+    }
+}
+
+fn parse_nullable_string_arg(
+    args: &Value,
+    key: &str,
+    expected: &str,
+) -> Result<Option<Option<String>>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s.clone()))),
+        Some(_) => Err(format!("argument '{key}' must be {expected}")),
+    }
+}
+
+fn optional_string_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(s
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for item in items {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| format!("argument '{key}' items must be strings"))?;
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(format!(
+            "argument '{key}' must be an array of strings or a comma-separated string"
+        )),
+    }
+}
+
+fn optional_u8_pct(args: &Value, key: &str) -> Result<Option<u8>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| format!("argument '{key}' must be an integer 0..=100"))?;
+            if n > 100 {
+                return Err(format!("argument '{key}' must be 0..=100"));
+            }
+            Ok(Some(n as u8))
+        }
+    }
+}
+
+fn parse_nullable_u8_pct(args: &Value, key: &str) -> Result<Option<Option<u8>>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| format!("argument '{key}' must be an integer 0..=100 or null"))?;
+            if n > 100 {
+                return Err(format!("argument '{key}' must be 0..=100"));
+            }
+            Ok(Some(Some(n as u8)))
+        }
     }
 }
 
@@ -685,9 +783,40 @@ fn tool_definitions(read_only: bool) -> Value {
                     "type": "string",
                     "description": "Optional local due time ('HH:MM', '9am', '2:30pm')."
                 },
+                "start": {
+                    "type": "string",
+                    "description": "Optional start / hide-until date (YYYY-MM-DD, 'today', 'tomorrow', '+3d', or with time)."
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "Optional local start time ('HH:MM', '9am', '2:30pm')."
+                },
                 "repeat": {
                     "type": "string",
                     "description": "Optional recurrence rule ('daily', 'weekdays', 'weekly', 'monthly', 'every 3d/2w/2m')."
+                },
+                "reminders": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional reminders ('at-due', 'at-start', '-15m', '-1h', '-1d', 'start-15m', 'YYYY-MM-DD HH:MM')."
+                },
+                "parent_uid": {
+                    "type": "string",
+                    "description": "Optional parent task UID or numeric ID (marks this task as a subtask)."
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Optional location / place name."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Optional associated URL."
+                },
+                "percent_complete": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Optional completion progress (0..=100)."
                 },
                 "origin": {
                     "type": "string",
@@ -789,9 +918,40 @@ fn tool_definitions(read_only: bool) -> Value {
                         "type": ["string", "null"],
                         "description": "Set local due time ('HH:MM', '9am', '2:30pm'), or pass '' / null to clear."
                     },
+                    "start": {
+                        "type": ["string", "null"],
+                        "description": "Set start / hide-until date (YYYY-MM-DD, 'today', '+3d', etc.), or pass '' / null to clear."
+                    },
+                    "start_time": {
+                        "type": ["string", "null"],
+                        "description": "Set local start time ('HH:MM', '9am'), or pass '' / null to clear."
+                    },
                     "repeat": {
                         "type": ["string", "null"],
                         "description": "Set recurrence rule ('daily', 'weekdays', 'weekly', 'monthly', 'every 3d'), or pass '' / null to clear."
+                    },
+                    "reminders": {
+                        "type": ["array", "null"],
+                        "items": { "type": "string" },
+                        "description": "Replace reminders ('at-due', '-15m', '-1h', '-1d', 'start-15m', 'YYYY-MM-DD HH:MM'), or pass [] / null to clear."
+                    },
+                    "parent_uid": {
+                        "type": ["string", "null"],
+                        "description": "Set parent task UID or ID (subtask), or pass '' / null to clear."
+                    },
+                    "location": {
+                        "type": ["string", "null"],
+                        "description": "Set location string, or pass '' / null to clear."
+                    },
+                    "url": {
+                        "type": ["string", "null"],
+                        "description": "Set associated URL, or pass '' / null to clear."
+                    },
+                    "percent_complete": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Set completion percentage (0..=100), or pass null to clear."
                     }
                 }
             }

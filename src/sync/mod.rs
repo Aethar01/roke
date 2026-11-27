@@ -272,7 +272,14 @@ fn stores_semantically_equal(a: &TaskStore, b: &TaskStore) -> bool {
                 && at.tags == bt.tags
                 && at.due == bt.due
                 && at.due_time == bt.due_time
+                && at.start == bt.start
+                && at.start_time == bt.start_time
                 && at.repeat == bt.repeat
+                && at.reminders == bt.reminders
+                && at.parent_uid == bt.parent_uid
+                && at.location == bt.location
+                && at.url == bt.url
+                && at.percent_complete == bt.percent_complete
                 && at.created_at == bt.created_at
                 && at.completed_at == bt.completed_at
                 && at.updated_at == bt.updated_at

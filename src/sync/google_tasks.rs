@@ -48,7 +48,21 @@ struct LocalExtras {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     due_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     repeat: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reminders: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    percent_complete: Option<u8>,
     #[serde(default)]
     in_progress: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,7 +83,14 @@ impl LocalExtras {
             priority: task.priority,
             tags: task.tags.clone(),
             due_time: task.due_time.clone(),
+            start: task.start.clone(),
+            start_time: task.start_time.clone(),
             repeat: task.repeat.clone(),
+            reminders: task.reminders.clone(),
+            parent_uid: task.parent_uid.clone(),
+            location: task.location.clone(),
+            url: task.url.clone(),
+            percent_complete: task.percent_complete,
             in_progress: task.status == Status::InProgress,
             order: task.order,
             origin: task.origin.clone(),
@@ -311,7 +332,14 @@ fn google_json_to_task(
             tags: extras.map(|e| e.tags.clone()).unwrap_or_default(),
             due,
             due_time,
+            start: extras.and_then(|e| e.start.clone()),
+            start_time: extras.and_then(|e| e.start_time.clone()),
             repeat: extras.and_then(|e| e.repeat.clone()),
+            reminders: extras.map(|e| e.reminders.clone()).unwrap_or_default(),
+            parent_uid: extras.and_then(|e| e.parent_uid.clone()),
+            location: extras.and_then(|e| e.location.clone()),
+            url: extras.and_then(|e| e.url.clone()),
+            percent_complete: extras.and_then(|e| e.percent_complete),
             created_at: extras.and_then(|e| e.created_at),
             completed_at,
             updated_at,

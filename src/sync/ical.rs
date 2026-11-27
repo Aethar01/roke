@@ -1,7 +1,7 @@
 use crate::config::normalize_device_tag;
 use crate::model::{
-    civil_from_days, days_from_civil, now_millis, parse_due_date, parse_due_time, parse_tags,
-    Priority, Status, Task,
+    civil_from_days, days_from_civil, now_millis, parse_due_date, parse_due_time, parse_reminder,
+    parse_tags, Priority, Status, Task,
 };
 
 /// Unfold RFC 5545 folded lines (`CRLF`/`LF` followed by a single space or horizontal tab).
@@ -258,10 +258,10 @@ fn local_ymd_hm_to_utc_secs(y: i64, m: u32, d: u32, h: u32, min: u32) -> i64 {
     days_from_civil(y, m, d) * 86_400 + (h as i64) * 3600 + (min as i64) * 60
 }
 
-fn format_due_line(due: &str, due_time: Option<&str>) -> Option<String> {
-    let normalized = parse_due_date(due).ok()?;
+fn format_date_or_datetime_line(prop_name: &str, date: &str, time: Option<&str>) -> Option<String> {
+    let normalized = parse_due_date(date).ok()?;
     let compact = normalized.replace('-', "");
-    if let Some(time_raw) = due_time {
+    if let Some(time_raw) = time {
         if let Ok(hm) = parse_due_time(time_raw) {
             let y: i64 = normalized[0..4].parse().ok()?;
             let m: u32 = normalized[5..7].parse().ok()?;
@@ -270,10 +270,152 @@ fn format_due_line(due: &str, due_time: Option<&str>) -> Option<String> {
             let min: u32 = hm[3..5].parse().ok()?;
             let utc_secs = local_ymd_hm_to_utc_secs(y, m, d, h, min);
             let ms = u64::try_from(utc_secs).ok()? * 1000;
-            return Some(format!("DUE:{}", format_utc_timestamp(ms)));
+            return Some(format!("{prop_name}:{}", format_utc_timestamp(ms)));
         }
     }
-    Some(format!("DUE;VALUE=DATE:{compact}"))
+    Some(format!("{prop_name};VALUE=DATE:{compact}"))
+}
+
+fn format_due_line(due: &str, due_time: Option<&str>) -> Option<String> {
+    format_date_or_datetime_line("DUE", due, due_time)
+}
+
+fn format_dtstart_line(start: &str, start_time: Option<&str>) -> Option<String> {
+    format_date_or_datetime_line("DTSTART", start, start_time)
+}
+
+fn parse_ics_trigger_to_reminder(params: &[(String, String)], value: &str) -> Option<String> {
+    let val = value.trim();
+    let is_abs = params
+        .iter()
+        .any(|(k, v)| k == "VALUE" && v.eq_ignore_ascii_case("DATE-TIME"));
+    if is_abs || (val.len() >= 15 && (val.as_bytes()[8] == b'T' || val.as_bytes()[8] == b't')) {
+        let (date_opt, time_opt) = parse_due_property(&[], val);
+        if let (Some(d), Some(t)) = (date_opt, time_opt) {
+            return Some(format!("{d} {t}"));
+        }
+        return None;
+    }
+
+    let related_start = params
+        .iter()
+        .any(|(k, v)| k == "RELATED" && v.eq_ignore_ascii_case("START"));
+    let upper = val.to_ascii_uppercase();
+    if upper == "PT0S" || upper == "-PT0S" || upper == "P0D" || upper == "-P0D" {
+        return Some(if related_start {
+            "at-start".into()
+        } else {
+            "at-due".into()
+        });
+    }
+
+    let body = upper.strip_prefix('-')?;
+    let unit_str = if let Some(rest) = body.strip_prefix("PT") {
+        if let Some(m) = rest.strip_suffix('M').and_then(|s| s.parse::<u32>().ok()) {
+            format!("{m}m")
+        } else if let Some(h) = rest.strip_suffix('H').and_then(|s| s.parse::<u32>().ok()) {
+            format!("{h}h")
+        } else {
+            let s = rest.strip_suffix('S').and_then(|s| s.parse::<u32>().ok())?;
+            if s == 0 {
+                return Some(if related_start {
+                    "at-start".into()
+                } else {
+                    "at-due".into()
+                });
+            }
+            let mins = s.div_ceil(60);
+            format!("{mins}m")
+        }
+    } else {
+        let rest = body.strip_prefix('P')?;
+        if let Some(d) = rest.strip_suffix('D').and_then(|s| s.parse::<u32>().ok()) {
+            format!("{d}d")
+        } else {
+            let w = rest.strip_suffix('W').and_then(|s| s.parse::<u32>().ok())?;
+            format!("{w}w")
+        }
+    };
+
+    let candidate = if related_start {
+        format!("start-{unit_str}")
+    } else {
+        format!("-{unit_str}")
+    };
+    parse_reminder(&candidate).ok()
+}
+
+fn reminder_to_valarm_lines(reminder: &str, summary: &str) -> Option<Vec<String>> {
+    let norm = parse_reminder(reminder).ok()?;
+    let trigger_line = match norm.as_str() {
+        "at-due" => "TRIGGER:PT0S".to_string(),
+        "at-start" => "TRIGGER;RELATED=START:PT0S".to_string(),
+        other => {
+            if let Some(rest) = other.strip_prefix("start-") {
+                let dur = rel_str_to_ics_duration(rest)?;
+                format!("TRIGGER;RELATED=START:-{dur}")
+            } else if let Some(rest) = other.strip_prefix('-') {
+                let dur = rel_str_to_ics_duration(rest)?;
+                format!("TRIGGER:-{dur}")
+            } else if let Some((date, time)) = other.split_once(' ') {
+                let y: i64 = date.get(0..4)?.parse().ok()?;
+                let m: u32 = date.get(5..7)?.parse().ok()?;
+                let d: u32 = date.get(8..10)?.parse().ok()?;
+                let h: u32 = time.get(0..2)?.parse().ok()?;
+                let min: u32 = time.get(3..5)?.parse().ok()?;
+                let utc_secs = local_ymd_hm_to_utc_secs(y, m, d, h, min);
+                let ms = u64::try_from(utc_secs).ok()? * 1000;
+                format!("TRIGGER;VALUE=DATE-TIME:{}", format_utc_timestamp(ms))
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(vec![
+        "BEGIN:VALARM".into(),
+        "ACTION:DISPLAY".into(),
+        trigger_line,
+        format!("DESCRIPTION:{}", escape_ics_text(summary)),
+        "END:VALARM".into(),
+    ])
+}
+
+fn rel_str_to_ics_duration(raw: &str) -> Option<String> {
+    if let Some(n) = raw.strip_suffix('m').and_then(|s| s.parse::<u32>().ok()) {
+        Some(format!("PT{n}M"))
+    } else if let Some(n) = raw.strip_suffix('h').and_then(|s| s.parse::<u32>().ok()) {
+        Some(format!("PT{n}H"))
+    } else if let Some(n) = raw.strip_suffix('d').and_then(|s| s.parse::<u32>().ok()) {
+        Some(format!("P{n}D"))
+    } else {
+        raw.strip_suffix('w')
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| format!("P{n}W"))
+    }
+}
+
+fn is_geofence_or_custom_valarm(alarm_lines: &[String]) -> bool {
+    let mut has_time_trigger = false;
+    for l in alarm_lines {
+        if let Some((name, params, val)) = parse_ics_line(l) {
+            if name == "X-APPLE-STRUCTURED-LOCATION" || name == "X-APPLE-PROXIMITY" {
+                return true;
+            }
+            if name == "ACTION"
+                && !matches!(
+                    val.trim().to_ascii_uppercase().as_str(),
+                    "DISPLAY" | "AUDIO"
+                )
+            {
+                return true;
+            }
+            if name == "TRIGGER" && parse_ics_trigger_to_reminder(&params, &val).is_some() {
+                has_time_trigger = true;
+            }
+        }
+    }
+    !has_time_trigger
 }
 
 fn parse_due_property(
@@ -428,7 +570,14 @@ pub fn vtodo_to_task(ics: &str, fallback_origin: &str) -> Result<Task, String> {
     let mut tags: Vec<String> = Vec::new();
     let mut due: Option<String> = None;
     let mut due_time: Option<String> = None;
+    let mut start: Option<String> = None;
+    let mut start_time: Option<String> = None;
     let mut repeat: Option<String> = None;
+    let mut reminders: Vec<String> = Vec::new();
+    let mut parent_uid: Option<String> = None;
+    let mut location: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut percent_complete: Option<u8> = None;
     let mut created_at: Option<u64> = None;
     let mut completed_at: Option<u64> = None;
     let mut last_modified_ms: Option<u64> = None;
@@ -437,6 +586,8 @@ pub fn vtodo_to_task(ics: &str, fallback_origin: &str) -> Result<Task, String> {
     let mut origin: Option<String> = None;
     let mut order: Option<i64> = None;
     let mut apple_order: Option<i64> = None;
+    let mut in_valarm = false;
+    let mut cur_alarm_lines: Vec<String> = Vec::new();
 
     for line in &lines {
         let Some((name, params, value)) = parse_ics_line(line) else {
@@ -450,12 +601,33 @@ pub fn vtodo_to_task(ics: &str, fallback_origin: &str) -> Result<Task, String> {
                 continue;
             } else if in_vtodo {
                 sub_depth += 1;
+                if sub_depth == 1 && comp == "VALARM" {
+                    in_valarm = true;
+                    cur_alarm_lines.clear();
+                }
                 continue;
             }
         } else if name == "END" {
             let comp = value.trim().to_ascii_uppercase();
             if in_vtodo {
                 if sub_depth > 0 {
+                    if sub_depth == 1 && comp == "VALARM" && in_valarm {
+                        in_valarm = false;
+                        if !is_geofence_or_custom_valarm(&cur_alarm_lines) {
+                            for al in &cur_alarm_lines {
+                                if let Some((an, ap, av)) = parse_ics_line(al) {
+                                    if an == "TRIGGER" {
+                                        if let Some(rem) = parse_ics_trigger_to_reminder(&ap, &av) {
+                                            if !reminders.contains(&rem) {
+                                                reminders.push(rem);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cur_alarm_lines.clear();
+                    }
                     sub_depth -= 1;
                 } else if comp == "VTODO" {
                     break;
@@ -464,7 +636,13 @@ pub fn vtodo_to_task(ics: &str, fallback_origin: &str) -> Result<Task, String> {
             }
         }
 
-        if !in_vtodo || sub_depth > 0 {
+        if !in_vtodo {
+            continue;
+        }
+        if sub_depth > 0 {
+            if in_valarm {
+                cur_alarm_lines.push(line.clone());
+            }
             continue;
         }
 
@@ -488,8 +666,44 @@ pub fn vtodo_to_task(ics: &str, fallback_origin: &str) -> Result<Task, String> {
                 due = d;
                 due_time = t;
             }
+            "DTSTART" => {
+                let (d, t) = parse_due_property(&params, &value);
+                start = d;
+                start_time = t;
+            }
             "RRULE" => {
                 repeat = rrule_to_repeat(&value);
+            }
+            "RELATED-TO" => {
+                let reltype = params
+                    .iter()
+                    .find(|(k, _)| k == "RELTYPE")
+                    .map(|(_, v)| v.to_ascii_uppercase());
+                if reltype.is_none() || reltype.as_deref() == Some("PARENT") {
+                    let v = value.trim();
+                    if !v.is_empty() {
+                        parent_uid = Some(v.to_string());
+                    }
+                }
+            }
+            "LOCATION" => {
+                let loc = unescape_ics_text(&value).trim().to_string();
+                if !loc.is_empty() {
+                    location = Some(loc);
+                }
+            }
+            "URL" => {
+                let u = value.trim().to_string();
+                if !u.is_empty() {
+                    url = Some(u);
+                }
+            }
+            "PERCENT-COMPLETE" => {
+                if let Ok(pct) = value.trim().parse::<u8>() {
+                    if pct <= 100 {
+                        percent_complete = Some(pct);
+                    }
+                }
             }
             "CREATED" => created_at = parse_ics_timestamp_ms(&value),
             "COMPLETED" => {
@@ -548,6 +762,12 @@ pub fn vtodo_to_task(ics: &str, fallback_origin: &str) -> Result<Task, String> {
         (!slug.is_empty()).then_some(slug)
     });
 
+    let normalized_pct = match (status, percent_complete) {
+        (Status::Done, Some(100)) => None,
+        (Status::Todo, Some(0)) => None,
+        (_, pct) => pct,
+    };
+
     Ok(Task {
         id: 0,
         uid,
@@ -558,7 +778,14 @@ pub fn vtodo_to_task(ics: &str, fallback_origin: &str) -> Result<Task, String> {
         tags,
         due,
         due_time,
+        start,
+        start_time,
         repeat,
+        reminders,
+        parent_uid,
+        location,
+        url,
+        percent_complete: normalized_pct,
         created_at,
         completed_at,
         updated_at,
@@ -595,6 +822,8 @@ fn owned_vtodo_lines(task: &Task, include_rrule: bool) -> Vec<String> {
         let done_ts = task.completed_at.unwrap_or(stamp);
         out.push(format!("COMPLETED:{}", format_utc_timestamp(done_ts)));
         out.push("PERCENT-COMPLETE:100".into());
+    } else if let Some(pct) = task.percent_complete {
+        out.push(format!("PERCENT-COMPLETE:{}", pct.min(100)));
     }
     if !task.tags.is_empty() {
         let cats = task
@@ -604,6 +833,11 @@ fn owned_vtodo_lines(task: &Task, include_rrule: bool) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(",");
         out.push(format!("CATEGORIES:{cats}"));
+    }
+    if let Some(start) = &task.start {
+        if let Some(line) = format_dtstart_line(start, task.start_time.as_deref()) {
+            out.push(line);
+        }
     }
     if let Some(due) = &task.due {
         if let Some(line) = format_due_line(due, task.due_time.as_deref()) {
@@ -617,11 +851,25 @@ fn owned_vtodo_lines(task: &Task, include_rrule: bool) -> Vec<String> {
             }
         }
     }
+    if let Some(parent) = task.parent_uid.as_deref().filter(|s| !s.is_empty()) {
+        out.push(format!("RELATED-TO;RELTYPE=PARENT:{parent}"));
+    }
+    if let Some(loc) = task.location.as_deref().filter(|s| !s.is_empty()) {
+        out.push(format!("LOCATION:{}", escape_ics_text(loc)));
+    }
+    if let Some(u) = task.url.as_deref().filter(|s| !s.is_empty()) {
+        out.push(format!("URL:{u}"));
+    }
     if let Some(ord) = task.order {
         out.push(format!("X-ROKE-ORDER:{ord}"));
     }
     if let Some(orig) = task.origin.as_deref().filter(|s| !s.is_empty()) {
         out.push(format!("X-ROKE-ORIGIN:{orig}"));
+    }
+    for rem in &task.reminders {
+        if let Some(alarm_lines) = reminder_to_valarm_lines(rem, &task.title) {
+            out.extend(alarm_lines);
+        }
     }
     out
 }
@@ -662,9 +910,16 @@ pub fn patch_vtodo(existing_ics: &str, task: &Task) -> String {
             parse_ics_line(l).is_some_and(|(n, _, v)| n == "RRULE" && rrule_to_repeat(&v).is_none())
         });
 
+    let mut in_valarm = false;
+    let mut cur_alarm_buf: Vec<String> = Vec::new();
+
     for line in &unfolded {
-        let Some((name, _, value)) = parse_ics_line(line) else {
-            result_lines.push(line.clone());
+        let Some((name, params, value)) = parse_ics_line(line) else {
+            if in_valarm {
+                cur_alarm_buf.push(line.clone());
+            } else {
+                result_lines.push(line.clone());
+            }
             continue;
         };
 
@@ -677,15 +932,38 @@ pub fn patch_vtodo(existing_ics: &str, task: &Task) -> String {
                 continue;
             } else if in_vtodo {
                 sub_depth += 1;
-                result_lines.push(line.clone());
+                if sub_depth == 1 && comp == "VALARM" {
+                    in_valarm = true;
+                    cur_alarm_buf.clear();
+                    cur_alarm_buf.push(line.clone());
+                } else if in_valarm {
+                    cur_alarm_buf.push(line.clone());
+                } else {
+                    result_lines.push(line.clone());
+                }
                 continue;
             }
         } else if name == "END" {
             let comp = value.trim().to_ascii_uppercase();
             if in_vtodo {
                 if sub_depth > 0 {
+                    if sub_depth == 1 && comp == "VALARM" && in_valarm {
+                        cur_alarm_buf.push(line.clone());
+                        // Preserve geofence / non-standard VALARMs verbatim; standard time VALARMs
+                        // were already regenerated from `task.reminders` in `owned_vtodo_lines`.
+                        let inner = &cur_alarm_buf[1..cur_alarm_buf.len() - 1];
+                        if is_geofence_or_custom_valarm(inner) {
+                            result_lines.append(&mut cur_alarm_buf);
+                        } else {
+                            cur_alarm_buf.clear();
+                        }
+                        in_valarm = false;
+                    } else if in_valarm {
+                        cur_alarm_buf.push(line.clone());
+                    } else {
+                        result_lines.push(line.clone());
+                    }
                     sub_depth -= 1;
-                    result_lines.push(line.clone());
                     continue;
                 } else if comp == "VTODO" {
                     in_vtodo = false;
@@ -696,7 +974,17 @@ pub fn patch_vtodo(existing_ics: &str, task: &Task) -> String {
             }
         }
 
+        if in_valarm {
+            cur_alarm_buf.push(line.clone());
+            continue;
+        }
+
         if in_vtodo && sub_depth == 0 {
+            let is_parent_rel = name == "RELATED-TO"
+                && params
+                    .iter()
+                    .find(|(k, _)| k == "RELTYPE")
+                    .is_none_or(|(_, v)| v.eq_ignore_ascii_case("PARENT"));
             let is_owned = matches!(
                 name.as_str(),
                 "UID"
@@ -711,10 +999,14 @@ pub fn patch_vtodo(existing_ics: &str, task: &Task) -> String {
                     | "PERCENT-COMPLETE"
                     | "CATEGORIES"
                     | "DUE"
+                    | "DTSTART"
+                    | "LOCATION"
+                    | "URL"
                     | "X-ROKE-ORDER"
                     | "X-ROKE-ORIGIN"
                     | "X-ROKE-UPDATED-MS"
-            ) || (name == "RRULE" && !preserve_existing_rrule);
+            ) || is_parent_rel
+                || (name == "RRULE" && !preserve_existing_rrule);
             if is_owned {
                 continue;
             }
@@ -751,7 +1043,14 @@ mod tests {
             tags: vec!["errands".into(), "home".into()],
             due: Some("2026-12-01".into()),
             due_time: Some("14:30".into()),
+            start: Some("2026-11-28".into()),
+            start_time: Some("09:00".into()),
             repeat: Some("weekly".into()),
+            reminders: vec!["at-due".into(), "-15m".into()],
+            parent_uid: Some("parent-001".into()),
+            location: Some("Trader Joe's".into()),
+            url: Some("https://example.com/list".into()),
+            percent_complete: Some(50),
             created_at: Some(1_764_143_800_000),
             completed_at: None,
             updated_at: 1_764_143_900_456,
@@ -770,7 +1069,14 @@ mod tests {
         assert_eq!(parsed.tags, vec!["errands", "home"]);
         assert_eq!(parsed.due, Some("2026-12-01".into()));
         assert_eq!(parsed.due_time, Some("14:30".into()));
+        assert_eq!(parsed.start, Some("2026-11-28".into()));
+        assert_eq!(parsed.start_time, Some("09:00".into()));
         assert_eq!(parsed.repeat, Some("weekly".into()));
+        assert_eq!(parsed.reminders, vec!["at-due", "-15m"]);
+        assert_eq!(parsed.parent_uid.as_deref(), Some("parent-001"));
+        assert_eq!(parsed.location.as_deref(), Some("Trader Joe's"));
+        assert_eq!(parsed.url.as_deref(), Some("https://example.com/list"));
+        assert_eq!(parsed.percent_complete, Some(50));
         assert_eq!(parsed.created_at, Some(1_764_143_800_000));
         assert_eq!(parsed.updated_at, 1_764_143_900_456);
         assert_eq!(parsed.origin.as_deref(), Some("laptop"));

@@ -20,9 +20,9 @@ Switch between a filterable **Todo List** and a three-column **Kanban Board** wi
 
 - **Two views, one store** — Switch seamlessly between a **Todo List** (`All`, `To Do`, `In Progress`, `Done`) and a three-column **Kanban Board** (`Tab`, `gt`, `1`/`2`, or click the header tabs).
 - **Vim-first, mouse-friendly** — Navigate with `h`/`j`/`k`/`l`, `gg`/`G`, quick-add with `Q`, move cards across columns with `H`/`L` or `<`/`>`, reorder with `J`/`K`, sort with `O`, yank with `y`/`Y`, undo/redo with `u`/`Ctrl-R`, archive/restore with `A`/`V`, and search live with `/`. Click tabs, filters, checkboxes (`○`/`◐`/`✓`), double-click cards to edit, scroll with the wheel, and drag-and-drop cards to reorder or move across Kanban columns.
-- **Zero-clutter multi-tag filtering, natural due dates/times & recurrence** — Tag tasks (`work, personal`), set due dates and optional local times (`YYYY-MM-DD`, `today`, `tomorrow@14:30`, `+3d`, `+2w`, `fri 9:30am`, `eow`, `eom`) with local-time overdue highlighting and recurrence (`daily`, `weekdays`, `weekly`, `monthly`, `every 3d`), filter by multiple tags via clicks or the scrollable `t` picker, and toggle between `and` and `or`. Tags, due dates, and repeat rules tuck quietly into card bottom borders.
+- **Zero-clutter multi-tag filtering, natural dates, reminders & Tasks.org fields** — Tag tasks (`work, personal`), set due & start/hide-until dates with optional local times (`YYYY-MM-DD`, `today`, `tomorrow@14:30`, `+3d`, `+2w`, `fri 9:30am`, `eow`, `eom`), recurrence (`daily`, `weekdays`, `weekly`, `monthly`, `every 3d`), reminders (`at-due`, `at-start`, `-15m`, `-1h`, `-1d`, `start-15m`, `YYYY-MM-DD HH:MM`), subtasks (`parent_uid`), `location`, `url`, and `percent_complete` (`0..=100`). All fields round-trip cleanly with Tasks.org / CalDAV `VTODO`. Tags, dates, repeat rules, reminders, and progress tuck quietly into card borders.
 - **Plain JSONL storage, project-local boards/configs & live reload** — Stored in `$XDG_DATA_HOME/roke/todos.jsonl` (`~/.local/share/roke/todos.jsonl`), or automatically scoped to a project when `.roke.jsonl` or `.roke.toml` exists in the current or nearest parent directory (override anytime with `--global`). A Git repo can commit just `.roke.toml` pointing at a shared team remote tracker (caching locally in `$XDG_STATE_HOME/roke/boards/`), with zero `.roke.jsonl` merge conflicts. The TUI watches `todos.jsonl`, `config.toml`, and `.roke.toml` and reloads live.
-- **Interactive Markdown notes & checklists** — Task notes support full Markdown, show `[done/total]` checklist progress on cards, preview cleanly in-app with `v` (where you can toggle `- [ ]` / `- [x]` items directly with `Tab`/`Space` or click), and open in `nvim` / `$VISUAL` / `$EDITOR` via `n` in the TUI, `Ctrl-E` in the edit modal, or `roke notes <id>`.
+- **Full-task `$EDITOR` editing (YAML frontmatter + Markdown notes) & interactive checklists** — Press `n` in the TUI, `Ctrl-E` inside the edit modal, or run `roke edit <id> -e` / `roke notes <id>` to edit any task in `nvim` / `$VISUAL` / `$EDITOR` as a Markdown file with YAML frontmatter (`title`, `status`, `priority`, `tags`, `due`, `start`, `repeat`, `reminders`, `location`, `url`, `parent`, `progress`) above its Markdown body. Notes support full Markdown, show `[done/total]` checklist progress on cards, and preview in-app with `v` (where you can toggle `- [ ]` / `- [x]` items directly with `Tab`/`Space` or click).
 - **Scriptable CLI & built-in MCP server** — Manage tasks from scripts or AI agents via `roke add`/`list`/`edit`/`notes`/`move`/`done`/`rm`/`tags`/`stats`/`archive`/`unarchive`/`gc`/`sync`/`init`/`completions` (supporting multi-ID batch `move`/`done`/`rm`, `--json`, and theme-aware colours), or connect any MCP client directly with `roke mcp` (supports `--read-only`).
 - **TOML config, built-in theme presets & live reload** — Choose a built-in `[theme]` preset (`default`, `catppuccin`, `tokyo-night`, `gruvbox`, `nord`, `minimal`) or override any colour using ANSI-16 names, 256-color indices, or `#rrggbb` hex values, plus startup defaults (`default_view`, `default_filter`, `default_sort`). Edits to `config.toml` hot-reload in any open TUI.
 - **Conflict-free multi-backend parallel sync** — Two-way parallel background sync across **SSH** (`BatchMode=yes`, honoring `~/.ssh/config`), **CalDAV** (Tasks.org Cloud, Radicale, Baikal, Nextcloud, Fastmail, iCloud), **Microsoft To Do** (Microsoft Graph + OAuth2 Device Code), **Google Tasks** (Tasks API v1 + OAuth2 PKCE, preserving local-only metadata), **WebDAV** (`ETag`/`If-Match` CAS), and **local/Syncthing folders** (auto-merging `*.sync-conflict-*.jsonl`). Sync state and OAuth tokens live cleanly under `$XDG_STATE_HOME/roke` (`~/.local/state/roke`).
@@ -64,10 +64,11 @@ All subcommands accept `--file`, `--global`, `--all`, `--config`, `--json`, and 
 ```bash
 roke list --status todo --tag work --sort priority --verbose
 roke list --overdue --json
-roke add "Ship release" -d "Tag release and publish" -p high -t work,release --due +3d --repeat weekly --json
+roke add "Ship release" -d "Tag release and publish" -p high -t work,release --start today --due +3d --repeat weekly --remind -1h --location "Office" --url https://github.com/aethar01/roke --progress 25 --json
 roke add -Q "Weekly retro #team !med @fri ~weekly"   # quick-add shorthand
 roke edit 1 --add-tag urgent --priority high --due eow
-roke notes 1                             # open task Markdown notes in $EDITOR / nvim
+roke edit 1 -e                           # edit full task (YAML frontmatter + Markdown notes) in $EDITOR
+roke notes 1                             # open task (YAML frontmatter + Markdown notes) in $EDITOR / nvim
 roke notes 1 --print                     # print raw Markdown notes to stdout
 cat spec.md | roke notes 1 --stdin       # set Markdown notes from stdin
 roke move 1 2 in-progress                # move one or more tasks
@@ -117,7 +118,7 @@ Pass `["mcp", "--file", "/path/to/todos.jsonl"]` to point an agent at a project-
 | `Q` | Quick-add bar (`title #tag !high @due ~repeat`) |
 | `e` / `i` / `Enter` | Edit selected task |
 | `v` | Preview task & interactive Markdown checklists (`Tab`/`Space` or click to toggle) |
-| `n` | Edit task's Markdown notes in `$EDITOR` (`Ctrl-E` inside modal) |
+| `n` | Edit full task (YAML frontmatter + Markdown notes) in `$EDITOR` (`Ctrl-E` inside modal) |
 | `Space` | Toggle done (Todos) or cycle status (Kanban) |
 | `H` / `L` or `<` / `>` | Move task to previous / next column |
 | `J` / `K` | Reorder task down / up |

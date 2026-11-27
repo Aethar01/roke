@@ -1,8 +1,8 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
 use crate::model::{
     append_tasks_to_archive, archive_path_for, matches_search_query, now_millis, parse_due_spec,
-    parse_due_time, parse_repeat, parse_tags, sort_tasks, today_ymd, DueState, FileLock, Priority,
-    SortOrder, Status, Task, TaskStore,
+    parse_due_time, parse_reminders, parse_repeat, parse_tags, sort_tasks, today_ymd, DueState,
+    FileLock, Priority, SortOrder, Status, Task, TaskStore,
 };
 use crate::sync::{absorb_syncthing_conflicts, merge_stores, sync_all_peers, sync_state_dir_for};
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,14 @@ pub struct AddTaskInput {
     pub tags: Vec<String>,
     pub due: Option<String>,
     pub due_time: Option<String>,
+    pub start: Option<String>,
+    pub start_time: Option<String>,
     pub repeat: Option<String>,
+    pub reminders: Vec<String>,
+    pub parent_uid: Option<String>,
+    pub location: Option<String>,
+    pub url: Option<String>,
+    pub percent_complete: Option<u8>,
     pub origin: Option<String>,
 }
 
@@ -57,7 +64,14 @@ impl Default for AddTaskInput {
             tags: Vec::new(),
             due: None,
             due_time: None,
+            start: None,
+            start_time: None,
             repeat: None,
+            reminders: Vec::new(),
+            parent_uid: None,
+            location: None,
+            url: None,
+            percent_complete: None,
             origin: None,
         }
     }
@@ -74,7 +88,14 @@ pub struct UpdateTaskInput {
     pub remove_tags: Vec<String>,
     pub due: Option<Option<String>>,
     pub due_time: Option<Option<String>>,
+    pub start: Option<Option<String>>,
+    pub start_time: Option<Option<String>>,
     pub repeat: Option<Option<String>>,
+    pub reminders: Option<Vec<String>>,
+    pub parent_uid: Option<Option<String>>,
+    pub location: Option<Option<String>>,
+    pub url: Option<Option<String>>,
+    pub percent_complete: Option<Option<u8>>,
 }
 
 impl UpdateTaskInput {
@@ -88,7 +109,14 @@ impl UpdateTaskInput {
             && self.remove_tags.is_empty()
             && self.due.is_none()
             && self.due_time.is_none()
+            && self.start.is_none()
+            && self.start_time.is_none()
             && self.repeat.is_none()
+            && self.reminders.is_none()
+            && self.parent_uid.is_none()
+            && self.location.is_none()
+            && self.url.is_none()
+            && self.percent_complete.is_none()
     }
 }
 
@@ -273,6 +301,26 @@ pub fn get_task(path: &Path, cfg: &AppConfig, selector: &str) -> Result<Task, St
         .ok_or_else(|| format!("task not found: '{selector}'"))
 }
 
+fn resolve_parent_selector(
+    store: &TaskStore,
+    raw: &str,
+    self_uid: Option<&str>,
+) -> Result<String, String> {
+    let trimmed = raw.trim().trim_start_matches('#');
+    let resolved = if let Some(pid) = store.find_id(trimmed) {
+        store
+            .get(pid)
+            .map(|t| t.uid.clone())
+            .unwrap_or_else(|| trimmed.to_string())
+    } else {
+        trimmed.to_string()
+    };
+    if self_uid.is_some_and(|u| u == resolved) {
+        return Err("a task cannot be its own parent".into());
+    }
+    Ok(resolved)
+}
+
 pub fn add_task(path: &Path, cfg: &AppConfig, input: AddTaskInput) -> Result<Task, String> {
     let mut created = add_tasks_batch(path, cfg, vec![input])?;
     Ok(created.remove(0))
@@ -326,6 +374,26 @@ pub fn add_tasks_batch(
         {
             due_time = Some(parse_due_time(raw_time)?);
         }
+        let (start, mut start_time) = match input
+            .start
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => {
+                let (d, t) = parse_due_spec(raw)?;
+                (Some(d), t)
+            }
+            None => (None, None),
+        };
+        if let Some(raw_time) = input
+            .start_time
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            start_time = Some(parse_due_time(raw_time)?);
+        }
         let repeat = match input
             .repeat
             .as_deref()
@@ -334,6 +402,38 @@ pub fn add_tasks_batch(
         {
             Some(raw) => Some(parse_repeat(raw)?),
             None => None,
+        };
+        let reminders = if input.reminders.is_empty() {
+            Vec::new()
+        } else {
+            parse_reminders(&input.reminders)?
+        };
+        let parent_uid = match input
+            .parent_uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(resolve_parent_selector(&store, raw, None)?),
+            None => None,
+        };
+        let location = input
+            .location
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let url = input
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let percent_complete = match input.percent_complete {
+            Some(pct) if pct > 100 => {
+                return Err(format!("invalid progress '{pct}' (must be 0..=100)"));
+            }
+            other => other,
         };
         let origin = input
             .origin
@@ -352,7 +452,14 @@ pub fn add_tasks_batch(
         if let Some(task) = store.get_mut(id) {
             task.due = due;
             task.due_time = due_time;
+            task.start = start;
+            task.start_time = start_time;
             task.repeat = repeat;
+            task.reminders = reminders;
+            task.parent_uid = parent_uid;
+            task.location = location;
+            task.url = url;
+            task.percent_complete = percent_complete;
         }
         created_ids.push(id);
     }
@@ -379,6 +486,22 @@ pub fn update_task(
     let id = store
         .find_id(selector)
         .ok_or_else(|| format!("task not found: '{selector}'"))?;
+    let self_uid = store
+        .get(id)
+        .map(|t| t.uid.clone())
+        .ok_or_else(|| format!("task not found: '{selector}'"))?;
+
+    let resolved_parent = match input.parent_uid {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) if raw.trim().is_empty() => Some(None),
+        Some(Some(raw)) => Some(Some(resolve_parent_selector(
+            &store,
+            &raw,
+            Some(&self_uid),
+        )?)),
+    };
+
     let task = store
         .get_mut(id)
         .ok_or_else(|| format!("task not found: '{selector}'"))?;
@@ -441,12 +564,66 @@ pub fn update_task(
             Some(raw) => Some(parse_due_time(&raw)?),
         };
     }
+    if let Some(start_update) = input.start {
+        match start_update {
+            None => {
+                task.start = None;
+                task.start_time = None;
+            }
+            Some(raw) if raw.trim().is_empty() => {
+                task.start = None;
+                task.start_time = None;
+            }
+            Some(raw) => {
+                let (d, t) = parse_due_spec(&raw)?;
+                task.start = Some(d);
+                if t.is_some() {
+                    task.start_time = t;
+                }
+            }
+        }
+    }
+    if let Some(start_time_update) = input.start_time {
+        task.start_time = match start_time_update {
+            None => None,
+            Some(raw) if raw.trim().is_empty() => None,
+            Some(raw) => Some(parse_due_time(&raw)?),
+        };
+    }
     if let Some(repeat_update) = input.repeat {
         task.repeat = match repeat_update {
             None => None,
             Some(raw) if raw.trim().is_empty() => None,
             Some(raw) => Some(parse_repeat(&raw)?),
         };
+    }
+    if let Some(reminders) = input.reminders {
+        task.reminders = if reminders.is_empty() {
+            Vec::new()
+        } else {
+            parse_reminders(&reminders)?
+        };
+    }
+    if let Some(parent_update) = resolved_parent {
+        task.parent_uid = parent_update;
+    }
+    if let Some(loc_update) = input.location {
+        task.location = loc_update
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if let Some(url_update) = input.url {
+        task.url = url_update
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    if let Some(pct_update) = input.percent_complete {
+        match pct_update {
+            Some(pct) if pct > 100 => {
+                return Err(format!("invalid progress '{pct}' (must be 0..=100)"));
+            }
+            other => task.percent_complete = other,
+        }
     }
     if let Some(status) = input.status {
         if status == Status::Done && !was_done && task.repeat.is_some() {
@@ -723,9 +900,7 @@ mod tests {
                 priority: Priority::High,
                 tags: vec!["#agent".into(), "rust".into()],
                 due: Some("2026-12-01".into()),
-                due_time: None,
-                repeat: None,
-                origin: None,
+                ..AddTaskInput::default()
             },
         )
         .unwrap();
@@ -742,10 +917,7 @@ mod tests {
                 status: Status::InProgress,
                 priority: Priority::Low,
                 tags: vec!["personal".into()],
-                due: None,
-                due_time: None,
-                repeat: None,
-                origin: None,
+                ..AddTaskInput::default()
             },
         )
         .unwrap();
@@ -1024,6 +1196,85 @@ mod tests {
         assert_eq!(stats.completed_last_7_days, 1);
         assert_eq!(stats.top_tags[0].tag, "work");
         assert_eq!(stats.top_tags[0].count, 2);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn tasks_org_fields_add_update_and_parent_resolution() {
+        let path = temp_store_path("tasks_org_fields");
+        let cfg = AppConfig::default();
+
+        let parent = add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Parent epic".into(),
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+
+        let child = add_task(
+            &path,
+            &cfg,
+            AddTaskInput {
+                title: "Subtask item".into(),
+                start: Some("2026-12-01 09:00".into()),
+                due: Some("2026-12-05 17:00".into()),
+                reminders: vec!["-15m".into(), "at-due".into(), "start-1h".into()],
+                parent_uid: Some("1".into()),
+                location: Some("Home Office".into()),
+                url: Some("https://tasks.org".into()),
+                percent_complete: Some(40),
+                ..AddTaskInput::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(child.start.as_deref(), Some("2026-12-01"));
+        assert_eq!(child.start_time.as_deref(), Some("09:00"));
+        assert_eq!(child.reminders, vec!["-15m", "at-due", "start-1h"]);
+        assert_eq!(child.parent_uid.as_deref(), Some(parent.uid.as_str()));
+        assert_eq!(child.location.as_deref(), Some("Home Office"));
+        assert_eq!(child.url.as_deref(), Some("https://tasks.org"));
+        assert_eq!(child.percent_complete, Some(40));
+
+        // Self-parenting must fail
+        assert!(update_task(
+            &path,
+            &cfg,
+            "2",
+            UpdateTaskInput {
+                parent_uid: Some(Some("2".into())),
+                ..UpdateTaskInput::default()
+            }
+        )
+        .is_err());
+
+        // Clear fields cleanly
+        let cleared = update_task(
+            &path,
+            &cfg,
+            "2",
+            UpdateTaskInput {
+                start: Some(None),
+                reminders: Some(Vec::new()),
+                parent_uid: Some(None),
+                location: Some(None),
+                url: Some(None),
+                percent_complete: Some(None),
+                ..UpdateTaskInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cleared.start, None);
+        assert_eq!(cleared.start_time, None);
+        assert!(cleared.reminders.is_empty());
+        assert_eq!(cleared.parent_uid, None);
+        assert_eq!(cleared.location, None);
+        assert_eq!(cleared.url, None);
+        assert_eq!(cleared.percent_complete, None);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

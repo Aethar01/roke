@@ -5,8 +5,8 @@ use crate::editor;
 use crate::mcp::McpServer;
 use crate::model::{
     default_storage_path, find_local_board, parse_due_spec, parse_due_time, parse_quick_add,
-    parse_repeat, parse_tags, sort_tasks, today_ymd, DueState, Priority, SortOrder, Status, Task,
-    TaskStore, LOCAL_BOARD_FILENAME,
+    parse_reminder, parse_repeat, parse_tags, sort_tasks, today_ymd, DueState, Priority, SortOrder,
+    Status, Task, TaskStore, LOCAL_BOARD_FILENAME,
 };
 use crate::ops::{self, AddTaskInput, SyncReport, TagCount, TaskFilter, UpdateTaskInput};
 use crate::sync::{oauth, project_cache_board_path};
@@ -394,6 +394,17 @@ fn validate_due_arg(raw: &str) -> Result<String, String> {
     })
 }
 
+fn parse_progress_arg(raw: &str) -> Result<u8, String> {
+    let cleaned = raw.trim().trim_end_matches('%');
+    let pct: u8 = cleaned
+        .parse()
+        .map_err(|_| format!("invalid progress '{raw}' (expected integer 0..=100)"))?;
+    if pct > 100 {
+        return Err(format!("invalid progress '{raw}' (must be 0..=100)"));
+    }
+    Ok(pct)
+}
+
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Task title (omit when using --stdin)
@@ -429,9 +440,37 @@ pub struct AddArgs {
     #[arg(long = "due-time", value_parser = parse_due_time)]
     pub due_time: Option<String>,
 
+    /// Optional start / hide-until date (YYYY-MM-DD, today, tomorrow, +3d, or with time)
+    #[arg(long = "start", value_parser = validate_due_arg)]
+    pub start: Option<String>,
+
+    /// Optional local start time (HH:MM, 9am, 2:30pm)
+    #[arg(long = "start-time", value_parser = parse_due_time)]
+    pub start_time: Option<String>,
+
     /// Optional recurrence rule (daily, weekdays, weekly, monthly, every 3d/2w/2m)
     #[arg(long = "repeat", value_parser = parse_repeat)]
     pub repeat: Option<String>,
+
+    /// Reminder(s) (repeatable: at-due, at-start, -15m, -1h, -1d, start-15m, YYYY-MM-DD HH:MM)
+    #[arg(long = "remind", visible_alias = "reminder", value_parser = parse_reminder)]
+    pub reminders: Vec<String>,
+
+    /// Parent task numeric ID or UID (marks this task as a subtask)
+    #[arg(long = "parent")]
+    pub parent: Option<String>,
+
+    /// Optional location / place name
+    #[arg(long = "location")]
+    pub location: Option<String>,
+
+    /// Optional associated URL
+    #[arg(long = "url")]
+    pub url: Option<String>,
+
+    /// Optional completion progress (0..=100)
+    #[arg(long = "progress", value_parser = parse_progress_arg)]
+    pub progress: Option<u8>,
 
     /// Override task origin (defaults to local device_name)
     #[arg(long = "origin")]
@@ -495,6 +534,22 @@ pub struct EditArgs {
     #[arg(long = "clear-due-time")]
     pub clear_due_time: bool,
 
+    /// Set start / hide-until date (YYYY-MM-DD, today, tomorrow, +3d, or with time)
+    #[arg(long = "start", value_parser = validate_due_arg)]
+    pub start: Option<String>,
+
+    /// Clear the task's start date (and start time)
+    #[arg(long = "clear-start")]
+    pub clear_start: bool,
+
+    /// Set local start time (HH:MM, 9am, 2:30pm)
+    #[arg(long = "start-time", value_parser = parse_due_time)]
+    pub start_time: Option<String>,
+
+    /// Clear only the task's start time (keeps start date)
+    #[arg(long = "clear-start-time")]
+    pub clear_start_time: bool,
+
     /// Set recurrence rule (daily, weekdays, weekly, monthly, every 3d/2w/2m)
     #[arg(long = "repeat", value_parser = parse_repeat)]
     pub repeat: Option<String>,
@@ -503,7 +558,47 @@ pub struct EditArgs {
     #[arg(long = "clear-repeat")]
     pub clear_repeat: bool,
 
-    /// Open the task's Markdown notes in $EDITOR (nvim, etc.)
+    /// Replace reminders (repeatable: at-due, -15m, -1h, -1d, start-15m, YYYY-MM-DD HH:MM)
+    #[arg(long = "remind", visible_alias = "reminder", value_parser = parse_reminder)]
+    pub reminders: Vec<String>,
+
+    /// Clear all reminders
+    #[arg(long = "clear-reminders")]
+    pub clear_reminders: bool,
+
+    /// Set parent task numeric ID or UID (subtask)
+    #[arg(long = "parent")]
+    pub parent: Option<String>,
+
+    /// Clear the task's parent (promote to top-level task)
+    #[arg(long = "clear-parent")]
+    pub clear_parent: bool,
+
+    /// Set location / place name
+    #[arg(long = "location")]
+    pub location: Option<String>,
+
+    /// Clear the task's location
+    #[arg(long = "clear-location")]
+    pub clear_location: bool,
+
+    /// Set associated URL
+    #[arg(long = "url")]
+    pub url: Option<String>,
+
+    /// Clear the task's URL
+    #[arg(long = "clear-url")]
+    pub clear_url: bool,
+
+    /// Set completion progress (0..=100)
+    #[arg(long = "progress", value_parser = parse_progress_arg)]
+    pub progress: Option<u8>,
+
+    /// Clear completion progress
+    #[arg(long = "clear-progress")]
+    pub clear_progress: bool,
+
+    /// Open the task (YAML frontmatter + Markdown notes) in $EDITOR (nvim, etc.)
     #[arg(short = 'e', long = "editor")]
     pub open_editor: bool,
 }
@@ -546,9 +641,73 @@ struct StdinTaskSpec {
     #[serde(default)]
     due_time: Option<String>,
     #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
     repeat: Option<String>,
     #[serde(default)]
+    reminders: Vec<String>,
+    #[serde(default)]
+    parent_uid: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    percent_complete: Option<u8>,
+    #[serde(default)]
     origin: Option<String>,
+}
+
+fn update_input_from_doc_diff(orig: &Task, edited: &editor::TaskDocument) -> UpdateTaskInput {
+    let mut input = UpdateTaskInput::default();
+    if edited.title != orig.title {
+        input.title = Some(edited.title.clone());
+    }
+    if edited.description != orig.description {
+        input.description = Some(edited.description.clone());
+    }
+    if edited.status != orig.status {
+        input.status = Some(edited.status);
+    }
+    if edited.priority != orig.priority {
+        input.priority = Some(edited.priority);
+    }
+    if edited.tags != orig.tags {
+        input.tags = Some(edited.tags.clone());
+    }
+    if edited.due != orig.due {
+        input.due = Some(edited.due.clone());
+    }
+    if edited.due_time != orig.due_time {
+        input.due_time = Some(edited.due_time.clone());
+    }
+    if edited.start != orig.start {
+        input.start = Some(edited.start.clone());
+    }
+    if edited.start_time != orig.start_time {
+        input.start_time = Some(edited.start_time.clone());
+    }
+    if edited.repeat != orig.repeat {
+        input.repeat = Some(edited.repeat.clone());
+    }
+    if edited.reminders != orig.reminders {
+        input.reminders = Some(edited.reminders.clone());
+    }
+    if edited.parent_uid != orig.parent_uid {
+        input.parent_uid = Some(edited.parent_uid.clone());
+    }
+    if edited.location != orig.location {
+        input.location = Some(edited.location.clone());
+    }
+    if edited.url != orig.url {
+        input.url = Some(edited.url.clone());
+    }
+    if edited.percent_complete != orig.percent_complete {
+        input.percent_complete = Some(edited.percent_complete);
+    }
+    input
 }
 
 fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskInput>, String> {
@@ -594,7 +753,15 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
         };
         let due = spec.due.or_else(|| defaults.due.clone());
         let due_time = spec.due_time.or_else(|| defaults.due_time.clone());
+        let start = spec.start.or_else(|| defaults.start.clone());
+        let start_time = spec.start_time.or_else(|| defaults.start_time.clone());
         let repeat = spec.repeat.or_else(|| defaults.repeat.clone());
+        let mut reminders = defaults.reminders.clone();
+        reminders.extend(spec.reminders);
+        let parent_uid = spec.parent_uid.or_else(|| defaults.parent_uid.clone());
+        let location = spec.location.or_else(|| defaults.location.clone());
+        let url = spec.url.or_else(|| defaults.url.clone());
+        let percent_complete = spec.percent_complete.or(defaults.percent_complete);
         let origin = spec.origin.or_else(|| defaults.origin.clone());
         out.push(AddTaskInput {
             title: spec.title,
@@ -604,7 +771,14 @@ fn parse_stdin_tasks(raw: &str, defaults: &AddTaskInput) -> Result<Vec<AddTaskIn
             tags,
             due,
             due_time,
+            start,
+            start_time,
             repeat,
+            reminders,
+            parent_uid,
+            location,
+            url,
+            percent_complete,
             origin,
         });
     }
@@ -714,7 +888,14 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 tags: args.tags.iter().flat_map(|t| parse_tags(t)).collect(),
                 due: args.due.clone(),
                 due_time: args.due_time.clone(),
+                start: args.start.clone(),
+                start_time: args.start_time.clone(),
                 repeat: args.repeat.clone(),
+                reminders: args.reminders.clone(),
+                parent_uid: args.parent.clone(),
+                location: args.location.clone(),
+                url: args.url.clone(),
+                percent_complete: args.progress,
                 origin: args.origin.clone(),
             };
             if args.from_stdin {
@@ -776,27 +957,90 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
             }
         }
         SubCommand::Edit(args) => {
-            let mut description = args.description.clone();
+            let mut input = UpdateTaskInput::default();
+            let mut editor_existing: Option<Task> = None;
             if args.open_editor {
                 let existing = ops::get_task(&path, cfg, &args.selector)?;
-                let seed = description.as_deref().unwrap_or(&existing.description);
-                if let Some(updated_md) =
-                    editor::edit_markdown_in_editor(seed, &existing.title, cfg.editor.as_deref())?
-                {
-                    description = Some(updated_md);
-                } else if args.title.is_none()
-                    && args.status.is_none()
-                    && args.priority.is_none()
-                    && args.tags.is_none()
-                    && args.add_tags.is_empty()
-                    && args.remove_tags.is_empty()
-                    && args.due.is_none()
-                    && !args.clear_due
-                    && args.due_time.is_none()
-                    && !args.clear_due_time
-                    && args.repeat.is_none()
-                    && !args.clear_repeat
-                {
+                let doc = editor::TaskDocument::from_task(&existing);
+                if let Some(edited) = editor::edit_task_in_editor(&doc, cfg.editor.as_deref())? {
+                    input = update_input_from_doc_diff(&existing, &edited);
+                }
+                editor_existing = Some(existing);
+            }
+            if let Some(t) = &args.title {
+                input.title = Some(t.clone());
+            }
+            if let Some(d) = &args.description {
+                input.description = Some(d.clone());
+            }
+            if let Some(s) = args.status {
+                input.status = Some(s);
+            }
+            if let Some(p) = args.priority {
+                input.priority = Some(p);
+            }
+            if let Some(t) = args.tags.as_deref() {
+                input.tags = Some(parse_tags(t));
+            }
+            input.add_tags = args.add_tags.iter().flat_map(|t| parse_tags(t)).collect();
+            input.remove_tags = args
+                .remove_tags
+                .iter()
+                .flat_map(|t| parse_tags(t))
+                .collect();
+            if args.clear_due {
+                input.due = Some(None);
+            } else if let Some(d) = &args.due {
+                input.due = Some(Some(d.clone()));
+            }
+            if args.clear_due_time {
+                input.due_time = Some(None);
+            } else if let Some(dt) = &args.due_time {
+                input.due_time = Some(Some(dt.clone()));
+            }
+            if args.clear_start {
+                input.start = Some(None);
+            } else if let Some(st) = &args.start {
+                input.start = Some(Some(st.clone()));
+            }
+            if args.clear_start_time {
+                input.start_time = Some(None);
+            } else if let Some(stt) = &args.start_time {
+                input.start_time = Some(Some(stt.clone()));
+            }
+            if args.clear_repeat {
+                input.repeat = Some(None);
+            } else if let Some(r) = &args.repeat {
+                input.repeat = Some(Some(r.clone()));
+            }
+            if args.clear_reminders {
+                input.reminders = Some(Vec::new());
+            } else if !args.reminders.is_empty() {
+                input.reminders = Some(args.reminders.clone());
+            }
+            if args.clear_parent {
+                input.parent_uid = Some(None);
+            } else if let Some(p) = &args.parent {
+                input.parent_uid = Some(Some(p.clone()));
+            }
+            if args.clear_location {
+                input.location = Some(None);
+            } else if let Some(loc) = &args.location {
+                input.location = Some(Some(loc.clone()));
+            }
+            if args.clear_url {
+                input.url = Some(None);
+            } else if let Some(u) = &args.url {
+                input.url = Some(Some(u.clone()));
+            }
+            if args.clear_progress {
+                input.percent_complete = Some(None);
+            } else if let Some(pct) = args.progress {
+                input.percent_complete = Some(Some(pct));
+            }
+
+            if input.is_empty() {
+                if let Some(existing) = editor_existing {
                     if json {
                         print_json(&existing)?;
                     } else {
@@ -804,40 +1048,7 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                     }
                     return Ok(());
                 }
-            }
-            let due_update = if args.clear_due {
-                Some(None)
-            } else {
-                args.due.clone().map(Some)
-            };
-            let due_time_update = if args.clear_due_time {
-                Some(None)
-            } else {
-                args.due_time.clone().map(Some)
-            };
-            let repeat_update = if args.clear_repeat {
-                Some(None)
-            } else {
-                args.repeat.clone().map(Some)
-            };
-            let input = UpdateTaskInput {
-                title: args.title.clone(),
-                description,
-                status: args.status,
-                priority: args.priority,
-                tags: args.tags.as_deref().map(parse_tags),
-                add_tags: args.add_tags.iter().flat_map(|t| parse_tags(t)).collect(),
-                remove_tags: args
-                    .remove_tags
-                    .iter()
-                    .flat_map(|t| parse_tags(t))
-                    .collect(),
-                due: due_update,
-                due_time: due_time_update,
-                repeat: repeat_update,
-            };
-            if input.is_empty() {
-                return Err("no changes specified. Pass at least one of --title, --desc, --status, --priority, --tags, --add-tag, --rm-tag, --due, --clear-due, --due-time, --clear-due-time, --repeat, --clear-repeat, --editor.".into());
+                return Err("no changes specified. Pass at least one field flag (e.g. --title, --status, --due, --start, --remind, --location, --url, --parent, --progress) or --editor.".into());
             }
             let task = ops::update_task(&path, cfg, &args.selector, input)?;
             if json {
@@ -867,42 +1078,42 @@ pub fn run_subcommand(cli: &Cli, cmd: &SubCommand, cfg: &AppConfig) -> Result<()
                 return Ok(());
             }
 
-            let new_notes: Option<String> = if args.clear {
-                Some(String::new())
+            let update_input: Option<UpdateTaskInput> = if args.clear {
+                Some(UpdateTaskInput {
+                    description: Some(String::new()),
+                    ..UpdateTaskInput::default()
+                })
             } else if let Some(text) = &args.set {
-                Some(text.clone())
+                Some(UpdateTaskInput {
+                    description: Some(text.clone()),
+                    ..UpdateTaskInput::default()
+                })
             } else if args.from_stdin {
                 let mut buf = String::new();
                 io::stdin()
                     .read_to_string(&mut buf)
                     .map_err(|e| format!("failed to read stdin: {e}"))?;
-                Some(buf)
+                Some(UpdateTaskInput {
+                    description: Some(buf),
+                    ..UpdateTaskInput::default()
+                })
             } else {
-                editor::edit_markdown_in_editor(
-                    &existing.description,
-                    &existing.title,
-                    cfg.editor.as_deref(),
-                )?
+                let doc = editor::TaskDocument::from_task(&existing);
+                editor::edit_task_in_editor(&doc, cfg.editor.as_deref())?
+                    .map(|edited| update_input_from_doc_diff(&existing, &edited))
+                    .filter(|inp| !inp.is_empty())
             };
 
-            let Some(notes) = new_notes else {
+            let Some(input) = update_input else {
                 if json {
                     print_json(&existing)?;
                 } else {
-                    println!("{}", painter.muted("Notes unchanged."));
+                    println!("{}", painter.muted("Task unchanged."));
                 }
                 return Ok(());
             };
 
-            let updated = ops::update_task(
-                &path,
-                cfg,
-                &args.selector,
-                UpdateTaskInput {
-                    description: Some(notes),
-                    ..UpdateTaskInput::default()
-                },
-            )?;
+            let updated = ops::update_task(&path, cfg, &args.selector, input)?;
             if json {
                 print_json(&updated)?;
             } else {
@@ -1596,6 +1807,13 @@ impl Painter {
                 prio_color
             )
         ));
+        if let Some(start) = task.start_display() {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("start:   "),
+                self.subtle(&start)
+            ));
+        }
         if let Some(due) = task.due_display() {
             let today = today_ymd();
             let color = match task.due_state(&today) {
@@ -1614,6 +1832,41 @@ impl Painter {
                 "  {} {}\n",
                 self.muted("repeat:  "),
                 self.colored(&format!("↻ {rep}"), self.theme.subtle)
+            ));
+        }
+        if !task.reminders.is_empty() {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("remind:  "),
+                self.subtle(&task.reminders.join(", "))
+            ));
+        }
+        if let Some(pct) = task.percent_complete {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("progress:"),
+                self.colored(&format!("{pct}%"), self.theme.accent)
+            ));
+        }
+        if let Some(parent) = &task.parent_uid {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("parent:  "),
+                self.subtle(parent)
+            ));
+        }
+        if let Some(loc) = &task.location {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("location:"),
+                self.subtle(loc)
+            ));
+        }
+        if let Some(u) = &task.url {
+            out.push_str(&format!(
+                "  {} {}\n",
+                self.muted("url:     "),
+                self.colored(u, self.theme.accent)
             ));
         }
         if !eff_tags.is_empty() {
@@ -1702,7 +1955,14 @@ mod tests {
             tags: vec!["work".into()],
             due: None,
             due_time: None,
+            start: None,
+            start_time: None,
             repeat: None,
+            reminders: Vec::new(),
+            parent_uid: None,
+            location: None,
+            url: None,
+            percent_complete: None,
             created_at: Some(1),
             completed_at: None,
             updated_at: 1,

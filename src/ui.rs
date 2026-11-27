@@ -965,6 +965,9 @@ fn render_todo_card(
             Style::default().fg(theme.drag).add_modifier(Modifier::BOLD),
         ));
     }
+    if task.parent_uid.is_some() {
+        title_spans.push(Span::styled("↳ ", Style::default().fg(theme.muted)));
+    }
     title_spans.push(Span::styled(task.title.clone(), title_style));
     let mut lines = vec![Line::from(title_spans)];
 
@@ -1951,7 +1954,17 @@ fn render_notes_preview_modal(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut check_line_map: Vec<(usize, usize)> = Vec::new(); // (line_idx, check_idx)
-    if !eff_tags.is_empty() || task.due.is_some() || task.checklist_progress().is_some() {
+    let has_meta = !eff_tags.is_empty()
+        || task.due.is_some()
+        || task.start.is_some()
+        || task.repeat.is_some()
+        || !task.reminders.is_empty()
+        || task.percent_complete.is_some()
+        || task.parent_uid.is_some()
+        || task.location.is_some()
+        || task.url.is_some()
+        || task.checklist_progress().is_some();
+    if has_meta {
         let mut meta_spans: Vec<Span<'static>> = Vec::new();
         for (i, tag) in eff_tags.iter().enumerate() {
             if i > 0 {
@@ -1960,6 +1973,15 @@ fn render_notes_preview_modal(
             meta_spans.push(Span::styled(
                 format!("#{tag}"),
                 Style::default().fg(theme.accent),
+            ));
+        }
+        if let Some(start) = task.start_display() {
+            if !meta_spans.is_empty() {
+                meta_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
+            }
+            meta_spans.push(Span::styled(
+                format!("Start {start}"),
+                Style::default().fg(theme.subtle),
             ));
         }
         if let Some(due) = task.due_display() {
@@ -1977,6 +1999,24 @@ fn render_notes_preview_modal(
                 Style::default().fg(color),
             ));
         }
+        if let Some(rep) = &task.repeat {
+            if !meta_spans.is_empty() {
+                meta_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
+            }
+            meta_spans.push(Span::styled(
+                format!("↻ {rep}"),
+                Style::default().fg(theme.subtle),
+            ));
+        }
+        if let Some(pct) = task.percent_complete {
+            if !meta_spans.is_empty() {
+                meta_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
+            }
+            meta_spans.push(Span::styled(
+                format!("{pct}%"),
+                Style::default().fg(theme.accent),
+            ));
+        }
         if let Some((done, total)) = task.checklist_progress() {
             if !meta_spans.is_empty() {
                 meta_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
@@ -1990,7 +2030,48 @@ fn render_notes_preview_modal(
                 }),
             ));
         }
-        lines.push(Line::from(meta_spans));
+        if !meta_spans.is_empty() {
+            lines.push(Line::from(meta_spans));
+        }
+
+        let mut extra_spans: Vec<Span<'static>> = Vec::new();
+        if !task.reminders.is_empty() {
+            extra_spans.push(Span::styled(
+                format!("Remind {}", task.reminders.join(", ")),
+                Style::default().fg(theme.subtle),
+            ));
+        }
+        if let Some(parent_uid) = &task.parent_uid {
+            if !extra_spans.is_empty() {
+                extra_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
+            }
+            let label = app
+                .store
+                .tasks
+                .iter()
+                .find(|t| t.uid == *parent_uid)
+                .map(|p| format!("↳ #{} {}", p.id, p.title))
+                .unwrap_or_else(|| format!("↳ {parent_uid}"));
+            extra_spans.push(Span::styled(label, Style::default().fg(theme.subtle)));
+        }
+        if let Some(loc) = &task.location {
+            if !extra_spans.is_empty() {
+                extra_spans.push(Span::styled("  ·  ", Style::default().fg(theme.muted)));
+            }
+            extra_spans.push(Span::styled(
+                format!("Location: {loc}"),
+                Style::default().fg(theme.subtle),
+            ));
+        }
+        if !extra_spans.is_empty() {
+            lines.push(Line::from(extra_spans));
+        }
+        if let Some(u) = &task.url {
+            lines.push(Line::from(vec![
+                Span::styled("URL: ", Style::default().fg(theme.muted)),
+                Span::styled(u.clone(), Style::default().fg(theme.accent)),
+            ]));
+        }
         lines.push(Line::raw(""));
     }
 
@@ -2303,7 +2384,7 @@ fn render_help_modal(frame: &mut Frame, app: &mut App, scroll: u16) {
         help_row(
             &theme,
             "n",
-            format!("Edit Markdown notes in {}", app.editor_label),
+            format!("Edit task (frontmatter + notes) in {}", app.editor_label),
         ),
         help_row(&theme, "Space", "Toggle done / cycle status"),
         help_row(&theme, "H / L  < / >", "Move column left / right"),
@@ -2601,7 +2682,24 @@ fn tags_border_line<'a>(
 }
 
 fn due_border_line(theme: &Theme, task: &Task) -> Option<Line<'static>> {
-    if task.due.is_none() && task.repeat.is_none() {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(due) = task.due_display() {
+        parts.push(due);
+    } else if let Some(start) = task.start_display() {
+        parts.push(format!("start:{start}"));
+    }
+    if let Some(rep) = &task.repeat {
+        parts.push(format!("↻ {rep}"));
+    }
+    if !task.reminders.is_empty() {
+        parts.push("⏰".into());
+    }
+    if task.status != Status::Done {
+        if let Some(pct) = task.percent_complete.filter(|&p| p > 0) {
+            parts.push(format!("{pct}%"));
+        }
+    }
+    if parts.is_empty() {
         return None;
     }
     let today = today_ymd();
@@ -2612,14 +2710,10 @@ fn due_border_line(theme: &Theme, task: &Task) -> Option<Line<'static>> {
         Some(DueState::Today) => Style::default().fg(theme.in_progress),
         _ => Style::default().fg(theme.muted),
     };
-    let due_disp = task.due_display();
-    let text = match (due_disp.as_deref(), task.repeat.as_deref()) {
-        (Some(due), Some(rep)) => format!(" {due} ↻ {rep} "),
-        (Some(due), None) => format!(" {due} "),
-        (None, Some(rep)) => format!(" ↻ {rep} "),
-        (None, None) => return None,
-    };
-    Some(Line::from(Span::styled(text, style)))
+    Some(Line::from(Span::styled(
+        format!(" {} ", parts.join(" ")),
+        style,
+    )))
 }
 
 fn priority_tag_style(theme: &Theme, priority: Priority, selected: bool) -> Style {

@@ -332,6 +332,105 @@ pub(crate) fn parse_due_spec_from(
     Ok((parse_due_date_from(trimmed, base)?, None))
 }
 
+/// Validate and normalize a reminder trigger string:
+/// - `at-due` (0m before due)
+/// - `at-start` (0m before start)
+/// - `-15m`, `-1h`, `-2d`, `-1w` (relative before due)
+/// - `start-15m`, `start-1h`, `start-1d` (relative before start)
+/// - `YYYY-MM-DD HH:MM` or `tomorrow@09:00` (absolute local date + time)
+pub fn parse_reminder(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("reminder cannot be empty".into());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "at-due" | "due" | "0m" | "-0m" | "0" => return Ok("at-due".into()),
+        "at-start" | "start" => return Ok("at-start".into()),
+        _ => {}
+    }
+    if let Some(rest) = lower.strip_prefix("start-") {
+        if let Some(norm) = normalize_rel_duration(rest) {
+            return Ok(format!("start-{norm}"));
+        }
+    }
+    if let Some(rest) = lower.strip_prefix('-') {
+        if let Some(norm) = normalize_rel_duration(rest) {
+            return Ok(format!("-{norm}"));
+        }
+    }
+    if let Ok((date, Some(time))) = parse_due_spec(trimmed) {
+        return Ok(format!("{date} {time}"));
+    }
+    Err(format!(
+        "invalid reminder '{raw}' (expected: at-due, at-start, -15m/-1h/-1d/-1w, start-15m, or 'YYYY-MM-DD HH:MM')"
+    ))
+}
+
+fn normalize_rel_duration(raw: &str) -> Option<String> {
+    let compact = raw.trim().replace(' ', "");
+    if let Some(num) = compact
+        .strip_suffix("mins")
+        .or_else(|| compact.strip_suffix("min"))
+        .or_else(|| compact.strip_suffix('m'))
+    {
+        let n: u32 = num.parse().ok()?;
+        if n > 0 && n <= 525_600 {
+            return Some(format!("{n}m"));
+        }
+    }
+    if let Some(num) = compact
+        .strip_suffix("hours")
+        .or_else(|| compact.strip_suffix("hour"))
+        .or_else(|| compact.strip_suffix("hrs"))
+        .or_else(|| compact.strip_suffix("hr"))
+        .or_else(|| compact.strip_suffix('h'))
+    {
+        let n: u32 = num.parse().ok()?;
+        if n > 0 && n <= 8_760 {
+            return Some(format!("{n}h"));
+        }
+    }
+    if let Some(num) = compact
+        .strip_suffix("days")
+        .or_else(|| compact.strip_suffix("day"))
+        .or_else(|| compact.strip_suffix('d'))
+    {
+        let n: u32 = num.parse().ok()?;
+        if n > 0 && n <= 3_650 {
+            return Some(format!("{n}d"));
+        }
+    }
+    if let Some(num) = compact
+        .strip_suffix("weeks")
+        .or_else(|| compact.strip_suffix("week"))
+        .or_else(|| compact.strip_suffix('w'))
+    {
+        let n: u32 = num.parse().ok()?;
+        if n > 0 && n <= 520 {
+            return Some(format!("{n}w"));
+        }
+    }
+    None
+}
+
+pub fn parse_reminders(input: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for raw in input {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let norm = parse_reminder(trimmed)?;
+            if !out.contains(&norm) {
+                out.push(norm);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Validate and normalize a due date (`YYYY-MM-DD`, `today`, `tomorrow`, `+3d`, `+2w`, `+1m`, `mon`..`sun`, `eow`, `eom`).
 pub fn parse_due_date(raw: &str) -> Result<String, String> {
     parse_due_date_from(raw, local_today_ymd_tuple())
@@ -771,7 +870,21 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reminders: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent_complete: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -804,15 +917,21 @@ impl Task {
         };
     }
 
-    /// Update status and keep `completed_at` in sync (`Some(now)` on Done, `None` otherwise).
+    /// Update status and keep `completed_at` and `percent_complete` consistent.
     pub fn set_status(&mut self, status: Status) {
         self.status = status;
         if status == Status::Done {
             if self.completed_at.is_none() {
                 self.completed_at = Some(now_millis());
             }
+            if self.percent_complete.is_some() {
+                self.percent_complete = Some(100);
+            }
         } else {
             self.completed_at = None;
+            if self.percent_complete == Some(100) {
+                self.percent_complete = None;
+            }
         }
     }
 
@@ -822,6 +941,15 @@ impl Task {
         match self.due_time.as_deref() {
             Some(t) if !t.is_empty() => Some(format!("{due} {t}")),
             _ => Some(due.to_string()),
+        }
+    }
+
+    /// Formatted start label combining `start` and optional `start_time` (e.g. `2026-12-01 09:00`).
+    pub fn start_display(&self) -> Option<String> {
+        let start = self.start.as_deref()?;
+        match self.start_time.as_deref() {
+            Some(t) if !t.is_empty() => Some(format!("{start} {t}")),
+            _ => Some(start.to_string()),
         }
     }
 
@@ -1047,6 +1175,32 @@ pub fn matches_search_query(task: &Task, eff_tags: &[String], query: &str) -> bo
                 "none" => task.repeat.is_none(),
                 other => task.repeat.as_deref().is_some_and(|r| r.contains(other)),
             }
+        } else if let Some(val) = tok.strip_prefix("start:") {
+            match val {
+                "any" | "set" => task.start.is_some(),
+                "none" => task.start.is_none(),
+                "today" => {
+                    let today = today_cache.get_or_insert_with(today_ymd);
+                    task.start.as_deref() == Some(today.as_str())
+                }
+                "future" | "deferred" => {
+                    let today = today_cache.get_or_insert_with(today_ymd);
+                    task.start.as_deref().is_some_and(|s| s > today.as_str())
+                }
+                other => task.start.as_deref().is_some_and(|s| s.contains(other)),
+            }
+        } else if let Some(val) = tok
+            .strip_prefix("loc:")
+            .or_else(|| tok.strip_prefix("location:"))
+        {
+            match val {
+                "any" | "set" => task.location.is_some(),
+                "none" => task.location.is_none(),
+                other => task
+                    .location
+                    .as_deref()
+                    .is_some_and(|l| l.to_lowercase().contains(other)),
+            }
         } else if let Some(tag_q) = tok.strip_prefix('#') {
             !tag_q.is_empty() && eff_tags.iter().any(|t| t.contains(tag_q))
         } else if negate && Status::parse(&tok).is_ok() {
@@ -1163,7 +1317,14 @@ impl TaskStore {
             tags,
             due: None,
             due_time: None,
+            start: None,
+            start_time: None,
             repeat: None,
+            reminders: Vec::new(),
+            parent_uid: None,
+            location: None,
+            url: None,
+            percent_complete: None,
             created_at: Some(now),
             completed_at: (status == Status::Done).then_some(now),
             updated_at: now,

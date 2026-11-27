@@ -1,5 +1,5 @@
 use crate::config::{normalize_device_tag, AppConfig, SyncConfig};
-use crate::editor::editor_display_name;
+use crate::editor::{editor_display_name, TaskDocument};
 use crate::model::{
     append_tasks_to_archive, archive_path_for, file_stamp, format_tags, matches_search_query,
     now_millis, parse_due_spec, parse_quick_add, parse_repeat, parse_tags, sort_task_refs,
@@ -532,6 +532,13 @@ pub struct TaskForm {
     pub repeat: TextInput,
     pub status: Status,
     pub priority: Priority,
+    pub start: Option<String>,
+    pub start_time: Option<String>,
+    pub reminders: Vec<String>,
+    pub parent_uid: Option<String>,
+    pub location: Option<String>,
+    pub url: Option<String>,
+    pub percent_complete: Option<u8>,
     pub active_field: FormField,
     pub error: Option<String>,
 }
@@ -547,6 +554,13 @@ impl TaskForm {
             repeat: TextInput::new(""),
             status: default_status,
             priority: Priority::Medium,
+            start: None,
+            start_time: None,
+            reminders: Vec::new(),
+            parent_uid: None,
+            location: None,
+            url: None,
+            percent_complete: None,
             active_field: FormField::Title,
             error: None,
         }
@@ -562,6 +576,13 @@ impl TaskForm {
             repeat: TextInput::new(task.repeat.clone().unwrap_or_default()),
             status: task.status,
             priority: task.priority,
+            start: task.start.clone(),
+            start_time: task.start_time.clone(),
+            reminders: task.reminders.clone(),
+            parent_uid: task.parent_uid.clone(),
+            location: task.location.clone(),
+            url: task.url.clone(),
+            percent_complete: task.percent_complete,
             active_field: FormField::Title,
             error: None,
         }
@@ -599,6 +620,7 @@ pub enum PendingEditor {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Mode {
     Normal,
     Search,
@@ -2026,20 +2048,63 @@ impl App {
         }
     }
 
-    pub fn editor_initial_content(&self, target: PendingEditor) -> Option<(String, String)> {
+    fn resolve_parent_uid(
+        &self,
+        raw: Option<&str>,
+        self_uid: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let cleaned = raw.trim_start_matches('#');
+        let resolved = if let Some(pid) = self.store.find_id(cleaned) {
+            self.store
+                .get(pid)
+                .map(|t| t.uid.clone())
+                .unwrap_or_else(|| cleaned.to_string())
+        } else {
+            cleaned.to_string()
+        };
+        if self_uid.is_some_and(|u| u == resolved) {
+            return Err("A task cannot be its own parent".into());
+        }
+        Ok(Some(resolved))
+    }
+
+    pub fn editor_initial_document(&self, target: PendingEditor) -> Option<TaskDocument> {
         match target {
-            PendingEditor::Task(id) => self
-                .store
-                .get(id)
-                .map(|t| (t.description.clone(), t.title.clone())),
+            PendingEditor::Task(id) => self.store.get(id).map(TaskDocument::from_task),
             PendingEditor::Modal => {
                 if let Mode::TaskModal(form) = &self.mode {
-                    let title = if form.title.value.trim().is_empty() {
-                        "task".to_string()
+                    let (due, due_time) = if form.due.value.trim().is_empty() {
+                        (None, None)
+                    } else if let Ok((d, t)) = parse_due_spec(form.due.value.trim()) {
+                        (Some(d), t)
                     } else {
-                        form.title.value.clone()
+                        (None, None)
                     };
-                    Some((form.description.value.clone(), title))
+                    let repeat = if form.repeat.value.trim().is_empty() {
+                        None
+                    } else {
+                        parse_repeat(form.repeat.value.trim()).ok()
+                    };
+                    Some(TaskDocument {
+                        title: form.title.value.clone(),
+                        description: form.description.value.clone(),
+                        status: form.status,
+                        priority: form.priority,
+                        tags: parse_tags(&form.tags.value),
+                        due,
+                        due_time,
+                        start: form.start.clone(),
+                        start_time: form.start_time.clone(),
+                        repeat,
+                        reminders: form.reminders.clone(),
+                        parent_uid: form.parent_uid.clone(),
+                        location: form.location.clone(),
+                        url: form.url.clone(),
+                        percent_complete: form.percent_complete,
+                    })
                 } else {
                     None
                 }
@@ -2050,33 +2115,66 @@ impl App {
     pub fn apply_editor_result(
         &mut self,
         target: PendingEditor,
-        result: Result<Option<String>, String>,
+        result: Result<Option<TaskDocument>, String>,
     ) {
         match result {
             Err(err) => {
                 self.set_message(format!("Editor error: {err}"));
             }
             Ok(None) => {
-                self.set_message("Notes unchanged");
+                self.set_message("Task unchanged");
             }
-            Ok(Some(markdown)) => match target {
+            Ok(Some(mut doc)) => match target {
                 PendingEditor::Task(id) => {
-                    if self.store.get(id).is_some() {
-                        self.push_undo();
-                        if let Some(task) = self.store.get_mut(id) {
-                            task.description = markdown;
-                            task.touch();
-                        }
-                        self.persist();
-                        self.set_message("Notes updated");
-                    } else {
+                    let Some(self_uid) = self.store.get(id).map(|t| t.uid.clone()) else {
                         self.set_message("Task no longer exists");
+                        return;
+                    };
+                    match self.resolve_parent_uid(doc.parent_uid.as_deref(), Some(&self_uid)) {
+                        Ok(resolved) => doc.parent_uid = resolved,
+                        Err(err) => {
+                            self.set_message(err);
+                            return;
+                        }
                     }
+                    self.push_undo();
+                    if let Some(task) = self.store.get_mut(id) {
+                        let was_done = task.status == Status::Done;
+                        let target_status = doc.status;
+                        doc.apply_to_task(task);
+                        if target_status == Status::Done && !was_done && task.repeat.is_some() {
+                            task.complete_if_recurring();
+                        }
+                        task.touch();
+                    }
+                    self.persist();
+                    self.clamp_selections();
+                    self.select_task_by_id(id);
+                    self.set_message("Task updated");
                 }
                 PendingEditor::Modal => {
                     if let Mode::TaskModal(form) = &mut self.mode {
-                        form.description = TextInput::new(markdown);
-                        self.set_message("Notes updated in form");
+                        form.title = TextInput::new(doc.title);
+                        form.description = TextInput::new(doc.description);
+                        form.tags = TextInput::new(format_tags(&doc.tags));
+                        let due_disp = match (&doc.due, &doc.due_time) {
+                            (Some(d), Some(t)) => format!("{d} {t}"),
+                            (Some(d), None) => d.clone(),
+                            (None, _) => String::new(),
+                        };
+                        form.due = TextInput::new(due_disp);
+                        form.repeat = TextInput::new(doc.repeat.unwrap_or_default());
+                        form.status = doc.status;
+                        form.priority = doc.priority;
+                        form.start = doc.start;
+                        form.start_time = doc.start_time;
+                        form.reminders = doc.reminders;
+                        form.parent_uid = doc.parent_uid;
+                        form.location = doc.location;
+                        form.url = doc.url;
+                        form.percent_complete = doc.percent_complete;
+                        form.error = None;
+                        self.set_message("Task updated in form");
                     }
                 }
             },
@@ -2219,6 +2317,12 @@ impl App {
         } else {
             Some(parse_repeat(repeat_raw)?)
         };
+        let self_uid = form
+            .editing_id
+            .and_then(|id| self.store.get(id))
+            .map(|t| t.uid.clone());
+        let parent_uid =
+            self.resolve_parent_uid(form.parent_uid.as_deref(), self_uid.as_deref())?;
         self.push_undo();
 
         let target_id = if let Some(id) = form.editing_id {
@@ -2230,7 +2334,14 @@ impl App {
                 task.tags = tags;
                 task.due = due;
                 task.due_time = due_time;
+                task.start = form.start.clone();
+                task.start_time = form.start_time.clone();
                 task.repeat = repeat;
+                task.reminders = form.reminders.clone();
+                task.parent_uid = parent_uid;
+                task.location = form.location.clone();
+                task.url = form.url.clone();
+                task.percent_complete = form.percent_complete;
                 task.touch();
             }
             self.set_message("Task updated");
@@ -2248,7 +2359,14 @@ impl App {
             if let Some(task) = self.store.get_mut(id) {
                 task.due = due;
                 task.due_time = due_time;
+                task.start = form.start.clone();
+                task.start_time = form.start_time.clone();
                 task.repeat = repeat;
+                task.reminders = form.reminders.clone();
+                task.parent_uid = parent_uid;
+                task.location = form.location.clone();
+                task.url = form.url.clone();
+                task.percent_complete = form.percent_complete;
             }
             self.set_message("Task added");
             id
@@ -2971,8 +3089,12 @@ impl App {
         let Some(task) = self.store.get(task_id) else {
             return;
         };
-        if let Some(url) =
-            extract_first_url(&task.title).or_else(|| extract_first_url(&task.description))
+        if let Some(url) = task
+            .url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| extract_first_url(&task.title))
+            .or_else(|| extract_first_url(&task.description))
         {
             self.set_message(format!("Opening {url}"));
             self.pending_open_url = Some(url);
@@ -4651,22 +4773,24 @@ default_sort = "priority"
     fn notes_editor_shortcuts_and_multiline_markdown_render() {
         let mut app = sample_app();
 
-        // Press 'n' in Normal mode to request opening selected task notes in $EDITOR
+        // Press 'n' in Normal mode to request opening selected task (frontmatter + notes) in $EDITOR
         app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.pending_editor, Some(PendingEditor::Task(1)));
         let target = app.pending_editor.take().unwrap();
-        let (initial, title) = app.editor_initial_content(target).unwrap();
-        assert_eq!(initial, "First task");
-        assert_eq!(title, "Alpha");
+        let mut doc = app.editor_initial_document(target).unwrap();
+        assert_eq!(doc.description, "First task");
+        assert_eq!(doc.title, "Alpha");
 
-        app.apply_editor_result(
-            target,
-            Ok(Some("# Alpha Notes\n- [ ] Step 1\n- [x] Step 2".into())),
-        );
+        doc.description = "# Alpha Notes\n- [ ] Step 1\n- [x] Step 2".into();
+        doc.location = Some("Desk".into());
+        doc.reminders = vec!["-15m".into()];
+        app.apply_editor_result(target, Ok(Some(doc)));
         assert_eq!(
             app.store.get(1).unwrap().description,
             "# Alpha Notes\n- [ ] Step 1\n- [x] Step 2"
         );
+        assert_eq!(app.store.get(1).unwrap().location.as_deref(), Some("Desk"));
+        assert_eq!(app.store.get(1).unwrap().reminders, vec!["-15m"]);
         assert_eq!(app.store.get(1).unwrap().checklist_progress(), Some((1, 2)));
 
         // Open read-only Markdown notes preview with 'v' and toggle checklist interactively
@@ -4705,13 +4829,16 @@ default_sort = "priority"
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Normal));
 
-        // Press 'e' then Ctrl-E inside modal to open modal notes in $EDITOR
+        // Press 'e' then Ctrl-E inside modal to open task (frontmatter + notes) in $EDITOR
         app.handle_key(key(KeyCode::Char('e')));
         assert!(matches!(app.mode, Mode::TaskModal(_)));
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert_eq!(app.pending_editor, Some(PendingEditor::Modal));
         let modal_target = app.pending_editor.take().unwrap();
-        app.apply_editor_result(modal_target, Ok(Some("# Updated\nMore lines".into())));
+        let mut modal_doc = app.editor_initial_document(modal_target).unwrap();
+        modal_doc.description = "# Updated\nMore lines".into();
+        modal_doc.url = Some("https://example.com".into());
+        app.apply_editor_result(modal_target, Ok(Some(modal_doc)));
 
         // Render modal + both views with multi-line Markdown without panic
         let backend = TestBackend::new(80, 24);

@@ -385,7 +385,14 @@ fn tasks_caldav_equal(a: &Task, b: &Task) -> bool {
         && a.tags == b.tags
         && a.due == b.due
         && a.due_time == b.due_time
+        && a.start == b.start
+        && a.start_time == b.start_time
         && a.repeat == b.repeat
+        && a.reminders == b.reminders
+        && a.parent_uid == b.parent_uid
+        && a.location == b.location
+        && a.url == b.url
+        && a.percent_complete == b.percent_complete
         && a.order == b.order
         && a.origin == b.origin
         && (a.completed_at.map(|ms| ms / 1000) == b.completed_at.map(|ms| ms / 1000))
